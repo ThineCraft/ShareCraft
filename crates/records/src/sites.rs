@@ -859,6 +859,31 @@ pub(crate) async fn purge_site_rows(
     .execute(&mut *conn)
     .await?;
     sqlx::query(
+        "delete from source_held where entry_id in (select id from nodes where site_id = $1) \
+            or library_id in (select id from nodes where site_id = $1 and kind = 'library')",
+    )
+    .bind(site.0)
+    .execute(&mut *conn)
+    .await?;
+    // Their connections go, so the rows of uploads still open go too: the sweep cannot reach
+    // the bucket any more. What they named is logged (a count only) for an operator to clear,
+    // or for the store's lifecycle rule.
+    let open = sqlx::query(
+        "delete from source_multipart where node_id in (select id from nodes where site_id = $1) \
+            or library_id in (select id from nodes where site_id = $1 and kind = 'library')",
+    )
+    .bind(site.0)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if open > 0 {
+        eprintln!(
+            "sharecraft-server: a purged site's libraries left {open} incomplete multipart \
+             upload(s) in their buckets; a lifecycle rule that aborts incomplete uploads removes \
+             them"
+        );
+    }
+    sqlx::query(
         "delete from source_items where library_id in \
              (select id from nodes where site_id = $1 and kind = 'library')",
     )

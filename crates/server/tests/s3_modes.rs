@@ -33,7 +33,7 @@ const PREFIX: &str = "team-modes/";
 
 const NOT_WRITABLE: &str = "This access key may read the bucket but not write to it. Connect the library read-only, or use a key that may write.";
 const WRITE_BLOCKED: &str = "This library is read-only until its storage accepts changes again. Its files can still be opened.";
-const ACTION_UNAVAILABLE: &str = "This cannot be done yet in a library stored in S3. Uploading files, saving and making folders work; renaming, moving, copying and deleting come later.";
+const ACTION_UNAVAILABLE: &str = "This cannot be done yet in a library stored in S3.";
 const WRITES_PENDING: &str =
     "Some changes are still being saved to the storage. Wait for them, or discard them, first.";
 const ADMIN_ONLY: &str = "Only an administrator may let people change the files in a bucket.";
@@ -226,6 +226,17 @@ impl Env {
         .await
     }
 
+    /// A new blank file in `parent`, as `user`: still unavailable in a bucket.
+    async fn blank(&self, user: &TestUser, parent: NodeId) -> (StatusCode, Value) {
+        self.call(
+            user,
+            Method::POST,
+            "/api/docs",
+            Some(json!({ "parent": parent.0.to_string(), "name": "Notes" })),
+        )
+        .await
+    }
+
     async fn upload(&self, user: &TestUser, parent: NodeId) -> (StatusCode, Value) {
         let response = self
             .server
@@ -259,6 +270,7 @@ impl Env {
             path,
             blob,
             base_tag: None,
+            seen_revision: None,
             by: self.admin.id,
             flush: false,
             now,
@@ -525,16 +537,19 @@ async fn switching_modes_changes_what_the_guard_answers_at_once() {
     let docs = env.child(library, "docs").await;
     let file = env.child(docs, "a.txt").await;
 
-    let refused = env.rename(&env.owner, file).await;
+    let refused = env.blank(&env.owner, docs).await;
     assert_error(
         &refused,
         StatusCode::CONFLICT,
         "source_action_unavailable",
         ACTION_UNAVAILABLE,
     );
-    // A new folder goes through in a read-and-write library (since Task 6).
+    // A new folder goes through in a read-and-write library (since Task 6), and a rename
+    // (since slice 2).
     let through = env.make_folder(&env.owner, docs).await;
     assert_eq!(through.0, StatusCode::CREATED, "{}", through.1);
+    let through = env.rename(&env.owner, file).await;
+    assert_eq!(through.0, StatusCode::OK, "{}", through.1);
 
     let (status, answer) = env
         .patch(&env.owner, library, json!({ "mode": "read_only" }))
@@ -552,7 +567,7 @@ async fn switching_modes_changes_what_the_guard_answers_at_once() {
         .patch(&env.admin, library, json!({ "mode": "read_write" }))
         .await;
     assert_eq!(status, StatusCode::OK, "{answer}");
-    let refused = env.rename(&env.owner, file).await;
+    let refused = env.blank(&env.owner, docs).await;
     assert_eq!(refused.1["error"], "source_action_unavailable");
 }
 
@@ -573,6 +588,7 @@ async fn a_blocked_library_answers_source_write_blocked_and_still_reads() {
     for answer in [
         env.make_folder(&env.owner, docs).await,
         env.upload(&env.owner, docs).await,
+        env.rename(&env.owner, file).await,
     ] {
         assert_error(
             &answer,
@@ -582,7 +598,7 @@ async fn a_blocked_library_answers_source_write_blocked_and_still_reads() {
         );
     }
     // A refused action stays refused as unavailable, whatever the state.
-    let refused = env.rename(&env.owner, file).await;
+    let refused = env.blank(&env.owner, docs).await;
     assert_eq!(refused.1["error"], "source_action_unavailable");
 
     let response = env

@@ -37,8 +37,8 @@ use common::fake_share::FakeShare;
 use common::{FileClient, TestServer, TestUser, spawn_server_config, start_fake_github};
 use protocol::{FileServerMsg, SeatState};
 use records::{
-    NewSource, NodeKind, Principal, S3_ENDPOINTS, S3Place, SHARE_ROOTS, SealedRow, SourceKind,
-    SourceMode, Tri, Versioning, s3_location,
+    NewPendingWrite, NewSource, NodeKind, Principal, S3_ENDPOINTS, S3Place, SHARE_ROOTS, SealedRow,
+    SourceKind, SourceMode, Tri, Versioning, s3_location,
 };
 use reqwest::header::CONTENT_RANGE;
 use reqwest::{Method, StatusCode};
@@ -725,8 +725,8 @@ enum Act {
 /// What a read-and-write S3 library does with a row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum S3rw {
-    /// Slice 1 lets it through and the change is staged for the bucket: it answers as in an
-    /// ordinary library.
+    /// Let through: the change is staged for the bucket (slice 1) or made in it during the
+    /// request (renames and moves, slice 2). It answers as in an ordinary library.
     Succeeds,
     /// Refused with this code (for a bulk request, its one item).
     Refused(&'static str),
@@ -772,24 +772,25 @@ const ROWS: &[Row] = &[
     row(Act::StartNewVersion, "POST /api/uploads", 201, Succeeds),
     row(Act::Chunk, "PUT /api/uploads/{id}", 200, Succeeds),
     row(Act::Finish, "POST /api/uploads/{id}/finish", 201, Succeeds),
-    row(Act::Rename, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
-    row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    // Renames, moves and copies inside the library go through the bucket (slice 2); copies into
+    // it go through ShareCraft, their files staged for the worker; moves into or between
+    // libraries stay unavailable.
+    row(Act::Rename, "PATCH /api/nodes/{id}", 200, Succeeds),
+    row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200, Succeeds),
     row(Act::MoveIn, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
     row(Act::MoveOut, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
-    row(Act::CopyIn, "POST /api/nodes/{id}/copy", 201, UNAVAILABLE),
-    row(
-        Act::CopyWithin,
-        "POST /api/nodes/{id}/copy",
-        201,
-        UNAVAILABLE,
-    ),
-    row(Act::Delete, "DELETE /api/nodes/{id}", 204, UNAVAILABLE),
+    row(Act::CopyIn, "POST /api/nodes/{id}/copy", 201, Succeeds),
+    row(Act::CopyWithin, "POST /api/nodes/{id}/copy", 201, Succeeds),
+    // Deletes move the objects into the library's holding folder (slice 2). The binned files
+    // of the fixture were put in the bin by the listing, which holds nothing of them: they
+    // cannot come back into the library.
+    row(Act::Delete, "DELETE /api/nodes/{id}", 204, Succeeds),
     row(Act::Restore, "POST /api/bin/{id}/restore", 200, UNAVAILABLE),
-    row(Act::BulkMove, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkMove, "POST /api/bulk", 200, Succeeds),
     row(Act::BulkMoveIn, "POST /api/bulk", 200, UNAVAILABLE),
     row(Act::BulkMoveOut, "POST /api/bulk", 200, UNAVAILABLE),
-    row(Act::BulkCopyIn, "POST /api/bulk", 200, UNAVAILABLE),
-    row(Act::BulkDelete, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkCopyIn, "POST /api/bulk", 200, Succeeds),
+    row(Act::BulkDelete, "POST /api/bulk", 200, Succeeds),
     row(Act::BulkRestore, "POST /api/bulk", 200, UNAVAILABLE),
     row(
         Act::FromTemplate,
@@ -813,14 +814,17 @@ const ROWS: &[Row] = &[
         403,
         READ_ONLY,
     ),
-    row(Act::RenameFolder, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
-    row(Act::RenameLibrary, "PATCH /api/nodes/{id}", 200, READ_ONLY),
+    // Through the bucket like a file's rename, but a save below it waits to be written: the
+    // test seeds a failed one of read-me.txt that waits a day, so the answer does not hang on
+    // how long the rows above take.
     row(
-        Act::DeleteFolder,
-        "DELETE /api/nodes/{id}",
-        204,
-        UNAVAILABLE,
+        Act::RenameFolder,
+        "PATCH /api/nodes/{id}",
+        200,
+        Refused("source_item_saving"),
     ),
+    row(Act::RenameLibrary, "PATCH /api/nodes/{id}", 200, READ_ONLY),
+    row(Act::DeleteFolder, "DELETE /api/nodes/{id}", 204, Succeeds),
     row(Act::DeleteLibrary, "DELETE /api/nodes/{id}", 204, READ_ONLY),
 ];
 
@@ -1443,12 +1447,20 @@ impl Env {
             Act::CopyIn => (
                 Method::POST,
                 format!("/api/nodes/{}/copy", fx.item("copy-in.txt")),
-                json!({ "parent": fx.docs }),
+                // A name of its own: a copy into a bucket never takes a taken name.
+                json!({
+                    "parent": fx.docs,
+                    "name": format!("copy-in-{}.txt", Uuid::new_v4().simple()),
+                }),
             ),
             Act::CopyWithin => (
                 Method::POST,
                 format!("/api/nodes/{}/copy", fx.item("copy-me.txt")),
-                json!({ "parent": fx.other }),
+                // A name of its own: a copy never takes a taken name, and each person copies.
+                json!({
+                    "parent": fx.other,
+                    "name": format!("copy-{}.txt", Uuid::new_v4().simple()),
+                }),
             ),
             Act::Delete => (
                 Method::DELETE,
@@ -1720,7 +1732,10 @@ async fn every_write_route_is_refused_in_an_s3_library() {
 }
 
 /// The `message` of `409 source_action_unavailable`, word for word.
-const UNAVAILABLE_MESSAGE: &str = "This cannot be done yet in a library stored in S3. Uploading files, saving and making folders work; renaming, moving, copying and deleting come later.";
+const UNAVAILABLE_MESSAGE: &str = "This cannot be done yet in a library stored in S3.";
+
+/// The `message` of `409 source_item_saving`, word for word.
+const ITEM_SAVING_MESSAGE: &str = "This is still being saved to the storage. Try again when saving has finished, or discard the save that failed.";
 
 /// The table against a read-and-write S3 library, for its owner and for an administrator: a
 /// `Refused` row answers its code (with its message), and a `Succeeds` row answers as in an
@@ -1736,6 +1751,39 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
         .set_source_mode(NodeId(fx.library.parse().unwrap()), SourceMode::ReadWrite)
         .await
         .unwrap();
+    // A save of read-me.txt (no row touches it) that failed and waits a day, so `docs` has a
+    // save waiting below it for the RenameFolder row whatever the worker has written by then.
+    {
+        let db = env.server.records_db();
+        let node = NodeId(fx.item("read-me.txt").parse().unwrap());
+        let item = db.source_item_of(node).await.unwrap().expect("tracked");
+        let blob = BlobRef::of(b"a save that waits");
+        let now = OffsetDateTime::now_utc();
+        db.pin_cached(&blob, now).await.unwrap();
+        db.stage_write(&NewPendingWrite {
+            node,
+            library: NodeId(fx.library.parse().unwrap()),
+            path: &item.repository_path,
+            blob,
+            base_tag: item.blob_sha.as_deref(),
+            seen_revision: None,
+            by: env.olive.id,
+            flush: false,
+            now,
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.fail_write(
+                node,
+                &blob.sha256,
+                "held for the RenameFolder row",
+                now + time::Duration::days(1),
+            )
+            .await
+            .unwrap()
+        );
+    }
     for (user, who) in [
         (&env.olive, "s3 read-write owner"),
         (&env.admin, "s3 read-write administrator"),
@@ -1762,24 +1810,101 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
                 row.act
             );
             assert_eq!(body["error"], code, "{:?} as {who}: {body}", row.act);
-            let message = if code == "source_read_only" {
-                MESSAGE
-            } else {
-                UNAVAILABLE_MESSAGE
+            let message = match code {
+                "source_read_only" => MESSAGE,
+                "source_item_saving" => ITEM_SAVING_MESSAGE,
+                _ => UNAVAILABLE_MESSAGE,
             };
             assert_eq!(body["message"], message, "{:?} as {who}: {body}", row.act);
         }
+        // The deletes put their items in the bin, holding their objects: restored through the
+        // bucket, so the next person deletes them again.
+        for entry in [
+            fx.item("delete-me.txt"),
+            fx.item("bulk-delete.txt"),
+            fx.doomed.as_str(),
+        ] {
+            let (status, body) = env
+                .call(
+                    user,
+                    Method::POST,
+                    &format!("/api/bin/{entry}/restore"),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "restore as {who}: {body}");
+            assert!(body["renamed"].is_null(), "restore as {who}: {body}");
+        }
+        // The bulk copy names no name: its original takes a new one, so the next person's copy
+        // is not refused as taken.
+        let (status, body) = env
+            .call(
+                user,
+                Method::PATCH,
+                &format!("/api/nodes/{}", fx.item("bulk-copy-in.txt")),
+                Some(json!({
+                    "name": format!("bulk-copy-in-{}.txt", Uuid::new_v4().simple()),
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "rename as {who}: {body}");
     }
-    // Nothing but the uploads, new folders and saves reached the bucket (the finished sessions'
-    // files go to the library's top).
+    // Nothing but the uploads, new folders and saves, the copies into the library, the renames,
+    // moves and copies inside it, and the deletes into its holding folder and the restores out
+    // of it reached the bucket (the finished sessions' files go to the library's top).
+    let deleted = [
+        "docs/delete-me.txt",
+        "docs/bulk-delete.txt",
+        "doomed/inside.txt",
+    ];
+    // The restored folder got a marker, which the next person's delete held with it.
+    let held = |key: &str| {
+        key.starts_with(".sharecraft-bin/")
+            && (key.ends_with("/doomed/") || deleted.iter().any(|path| key.ends_with(path)))
+    };
     for (method, key, _) in env.s3.writes() {
+        if method == "COPY" {
+            assert!(
+                [
+                    "docs/renamed.txt",
+                    "other/move-me.txt",
+                    "other/bulk-move.txt"
+                ]
+                .contains(&key.as_str())
+                    || key.starts_with("other/copy-")
+                    || deleted.contains(&key.as_str())
+                    || key == "doomed/"
+                    || held(&key),
+                "{key}"
+            );
+            continue;
+        }
+        if method == "DELETE" {
+            assert!(
+                [
+                    "docs/rename-me.txt",
+                    "docs/move-me.txt",
+                    "docs/bulk-move.txt"
+                ]
+                .contains(&key.as_str())
+                    || deleted.contains(&key.as_str())
+                    || key == "doomed/"
+                    || held(&key),
+                "{key}"
+            );
+            continue;
+        }
         assert_eq!(method, "PUT", "{key}");
         assert!(
             key.starts_with("docs/uploaded-")
                 || key.starts_with("finish-")
                 || key.starts_with("docs/New folder ")
                 || key == "docs/replace-me.txt"
-                || key == "docs/sheet.xlsx",
+                || key == "docs/sheet.xlsx"
+                || key.starts_with("docs/copy-in-")
+                || key.starts_with("docs/bulk-copy-in")
+                // The restored folder's marker: it had none.
+                || key == "doomed/",
             "{key}"
         );
     }

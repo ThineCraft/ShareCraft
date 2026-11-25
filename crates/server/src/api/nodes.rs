@@ -28,7 +28,10 @@ use super::{ApiError, JsonBody, parse_id, recheck_below, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::room::AccessChange;
-use crate::source_write::{Place, Store, create_folder, writable_place};
+use crate::source_write::{
+    Place, Store, copy_across, copy_within, create_folder, delete_to_holding, rename_or_move,
+    restore_from_holding, writable_place,
+};
 use crate::tree::{self, TreeOp};
 
 /// Children listed when the request names no limit.
@@ -90,27 +93,53 @@ pub(crate) async fn require_not_connected_for(
     }
 }
 
-/// [`require_not_connected_for`] for a route that acts on `node` itself (renames, moves or
-/// deletes it): a connected library node itself keeps `409 source_read_only` in every mode.
-async fn require_item_not_connected_for(
+/// Where a rename of `id`, or a move of it into `parent` (or, with no `parent`, a delete of
+/// it), by `user` is made: `Ok(None)` in the
+/// ordinary tree (a `parent` in a connected library is refused as [`require_not_connected_for`]
+/// refuses it), `Ok(Some(library))` in the bucket of the read-and-write S3 library `id` is in
+/// (see [`rename_or_move`]). Refused inside a connected library: what [`writable_place`] tells
+/// someone who cannot see `id` (`404`) and a library that is not read and write (`409
+/// source_read_only`); `409 source_write_blocked` while its writes are blocked; a library node
+/// itself `409 source_read_only`; a `parent` anywhere but that same library `409
+/// source_action_unavailable` (moves between libraries stay refused).
+pub(crate) async fn restructure_place(
     db: &Db,
     user: UserId,
-    node: NodeId,
-) -> Result<(), ApiError> {
-    let library = match writable_place(db, user, node).await {
-        Ok(Place::Ordinary) => return Ok(()),
-        Ok(Place::External(Store::S3(target))) => Some(target.library),
-        Err(ApiError::SourceWriteBlocked) => db
-            .source_library_of(node)
-            .await
-            .map_err(|e| ApiError::unavailable(&e))?,
+    id: NodeId,
+    parent: Option<NodeId>,
+) -> Result<Option<NodeId>, ApiError> {
+    let library = match writable_place(db, user, id).await {
+        Ok(Place::Ordinary) => {
+            if let Some(parent) = parent {
+                require_not_connected_for(db, user, parent).await?;
+            }
+            return Ok(None);
+        }
+        Ok(Place::External(Store::S3(target))) => target.library,
+        Err(ApiError::SourceWriteBlocked) => {
+            let library = db
+                .source_library_of(id)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?;
+            return Err(if library == Some(id) {
+                ApiError::SourceReadOnly
+            } else {
+                ApiError::SourceWriteBlocked
+            });
+        }
         Err(e) => return Err(e),
     };
-    if library == Some(node) {
-        Err(ApiError::SourceReadOnly)
-    } else {
-        Err(ApiError::SourceActionUnavailable)
+    if library == id {
+        return Err(ApiError::SourceReadOnly);
     }
+    if let Some(parent) = parent {
+        match writable_place(db, user, parent).await {
+            Ok(Place::External(Store::S3(target))) if target.library == library => {}
+            Err(ApiError::NotFound) => return Err(ApiError::NotFound),
+            _ => return Err(ApiError::SourceActionUnavailable),
+        }
+    }
+    Ok(Some(library))
 }
 
 /// `access` to a file of a connected library, as its editor's seat gets it: without `add`,
@@ -166,24 +195,55 @@ pub(crate) async fn seat_access(db: &Db, doc: DocId, access: Option<Access>) -> 
     }
 }
 
-/// [`delete_one`] for a request: refused when the item is in a connected library.
+/// [`delete_one`] for a request. Inside a read-and-write S3 library the item's objects go to
+/// the library's holding folder first (see [`delete_to_holding`]); in any other connected
+/// library it is refused, as [`restructure_place`] refuses a rename (`source_read_only`,
+/// `source_write_blocked`, and a library node itself `source_read_only`).
 pub(crate) async fn delete_checked(
     state: &AppState,
     actor: &User,
     id: NodeId,
 ) -> Result<(), ApiError> {
-    require_item_not_connected_for(state.db(), actor.id, id).await?;
+    if restructure_place(state.db(), actor.id, id, None)
+        .await?
+        .is_some()
+    {
+        delete_to_holding(state, actor, id).await?;
+        return Ok(());
+    }
     delete_one(state, actor, id).await
 }
 
-/// A restore from the recycle bin for a request: refused when the entry would go back into a
-/// connected library (it is judged by where it was, which is where it returns).
+/// A restore from the recycle bin for a request. An entry whose objects a read-and-write S3
+/// library holds comes back through its bucket (see [`restore_from_holding`]); any other entry
+/// is refused when it would go back into a connected library (it is judged by where it was,
+/// which is where it returns), so an entry the listing put in the bin, whose objects are gone,
+/// stays there.
 pub(crate) async fn restore_checked(
     state: &AppState,
     actor: &User,
     id: NodeId,
 ) -> Result<tree::Applied, ApiError> {
-    require_not_connected_for(state.db(), actor.id, id).await?;
+    let db = state.db();
+    let held = db
+        .held(id)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .is_some();
+    if held {
+        let restored = restore_from_holding(state, actor, id).await?;
+        let node = db
+            .node(restored.node)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?
+            .ok_or(ApiError::NotFound)?;
+        return Ok(tree::Applied {
+            node,
+            deleted: Vec::new(),
+            renamed: restored.renamed.map(|from| (restored.node, from)),
+        });
+    }
+    require_not_connected_for(db, actor.id, id).await?;
     Ok(tree::apply(state, actor, TreeOp::Restore { id }).await?)
 }
 
@@ -198,6 +258,10 @@ pub(crate) struct NodeOut {
     site: String,
     /// Whether the node takes its access from a scope above it.
     inherits: bool,
+    /// After a rename or move in a bucket: the originals that could not be deleted, which the
+    /// next listing shows as new files. Absent when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    left_behind: Option<u64>,
 }
 
 impl From<Node> for NodeOut {
@@ -209,6 +273,7 @@ impl From<Node> for NodeOut {
             parent: node.parent.map(|p| p.0.to_string()),
             site: node.site.0.to_string(),
             inherits: !node.unique_scope,
+            left_behind: None,
         }
     }
 }
@@ -703,6 +768,11 @@ pub(crate) struct NodeChange {
 /// file's new name must keep its editor's extension, and a file no editor opens may not take
 /// one (`422 wrong_extension`); the file policies of the library it is in, or goes into, hold
 /// (`422 blocked_file_type {extension}`, `413 file_too_large {limit}`).
+///
+/// In a read-and-write S3 library the bucket is changed first and the tree second, under the
+/// library's source lock (see [`rename_or_move`]); the answer then carries `left_behind` when
+/// originals could not be deleted. Moves into, out of or between connected libraries stay
+/// refused (see [`restructure_place`]).
 pub(crate) async fn change(
     State(state): State<AppState>,
     signed: Signed,
@@ -716,11 +786,18 @@ pub(crate) async fn change(
     }
     let actor = signed.session.user;
     // Both the item and where it would go: nothing is renamed if the move would be refused.
-    require_item_not_connected_for(state.db(), actor.id, id).await?;
-    if let Some(parent) = parent {
-        require_not_connected_for(state.db(), actor.id, parent).await?;
-    }
-    let node = to_completion(async move {
+    let in_bucket = restructure_place(state.db(), actor.id, id, parent).await?;
+    let (node, left_behind) = to_completion(async move {
+        if in_bucket.is_some() {
+            let done = rename_or_move(&state, &actor, id, change.name.as_deref(), parent).await?;
+            let node = state
+                .db()
+                .node(done.node)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?
+                .ok_or(ApiError::NotFound)?;
+            return Ok((node, done.left_behind));
+        }
         let mut node = None;
         if let Some(name) = change.name {
             let renamed = tree::apply(&state, &actor, TreeOp::Rename { id, name })
@@ -738,10 +815,12 @@ pub(crate) async fn change(
         if let Some(parent) = parent {
             node = Some(move_one(&state, &actor, id, parent).await?);
         }
-        node.ok_or(ApiError::InvalidRequest)
+        Ok((node.ok_or(ApiError::InvalidRequest)?, 0))
     })
     .await?;
-    Ok(Json(NodeOut::from(node)))
+    let mut out = NodeOut::from(node);
+    out.left_behind = (left_behind > 0).then_some(left_behind);
+    Ok(Json(out))
 }
 
 /// Moves `id` into `parent` for `actor`, then rechecks the open documents below it whatever
@@ -797,16 +876,109 @@ pub(crate) async fn copy(
     let id = node_id(&id)?;
     let parent = node_id(&body.parent)?;
     let actor = signed.session.user;
-    // Into a connected library: refused. Out of one: an ordinary copy.
-    require_not_connected_for(state.db(), actor.id, parent).await?;
     let copied =
-        to_completion(async move { copy_one(&state, &actor, id, parent, body.name).await }).await?;
+        to_completion(async move { copy_checked(&state, &actor, id, parent, body.name).await })
+            .await?;
     Ok((StatusCode::CREATED, Json(copied)).into_response())
 }
 
+/// How a copy is made (see [`copy_place`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyRoute {
+    /// An ordinary copy in the tree ([`copy_one`]).
+    Ordinary,
+    /// Inside one read-and-write S3 library, in its bucket ([`copy_within`]).
+    Within,
+    /// Between libraries through ShareCraft: out of an S3 library, or into a read-and-write S3
+    /// library ([`copy_across`]).
+    Across,
+}
+
+/// How a copy of `id` into `parent` by `user` is made: inside one read-and-write S3 library in
+/// its bucket; into a read-and-write S3 library from anywhere else, or out of an S3 library
+/// (either mode) into an ordinary place, through ShareCraft; anything else as an ordinary
+/// copy (a copy out of a GitHub library is one; out of a file share it is refused there, see
+/// [`require_share_copyable_for`]). Refused as [`writable_place`] judges `parent`: `404`,
+/// `409 source_read_only` into any other connected library, `409 source_write_blocked` into
+/// one whose writes are blocked.
+pub(crate) async fn copy_place(
+    db: &Db,
+    user: UserId,
+    id: NodeId,
+    parent: NodeId,
+) -> Result<CopyRoute, ApiError> {
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    match writable_place(db, user, parent).await? {
+        Place::External(Store::S3(target)) => match writable_place(db, user, id).await {
+            Ok(Place::External(Store::S3(source))) if source.library == target.library => {
+                Ok(CopyRoute::Within)
+            }
+            Err(ApiError::NotFound) => Err(ApiError::NotFound),
+            _ => Ok(CopyRoute::Across),
+        },
+        Place::Ordinary => {
+            let Some(library) = db.source_library_of(id).await.map_err(unavailable)? else {
+                return Ok(CopyRoute::Ordinary);
+            };
+            match db.source_of(library).await.map_err(unavailable)? {
+                Some((config, _)) if config.kind == SourceKind::S3 => Ok(CopyRoute::Across),
+                _ => Ok(CopyRoute::Ordinary),
+            }
+        }
+    }
+}
+
+/// Copies `id` into `parent` for `actor`, named `name` or as it is, wherever it is: as
+/// [`copy_place`] routes it, in a bucket ([`copy_within`]), between libraries
+/// ([`copy_across`]) or as an ordinary copy ([`copy_one`]). Run inside [`to_completion`].
+pub(crate) async fn copy_checked(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+    parent: NodeId,
+    name: Option<String>,
+) -> Result<Copied, ApiError> {
+    let route = copy_place(state.db(), actor.id, id, parent).await?;
+    let copy = match route {
+        CopyRoute::Ordinary => return copy_one(state, actor, id, parent, name).await,
+        CopyRoute::Within => copy_within(state, actor, id, parent, name.as_deref()).await?,
+        CopyRoute::Across => copy_across(state, actor, id, parent, name.as_deref()).await?,
+    };
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let node = db
+        .node(copy)
+        .await
+        .map_err(unavailable)?
+        .ok_or(ApiError::NotFound)?;
+    // A copy into an ordinary place is named as the ordinary copy names it: cleaned and
+    // numbered, and said so as it says so. Into a bucket the name is never changed.
+    let renamed = if route == CopyRoute::Across {
+        let asked = match name.as_deref() {
+            Some(name) => name.trim().to_owned(),
+            None => db
+                .node(id)
+                .await
+                .map_err(unavailable)?
+                .map_or_else(String::new, |original| original.name),
+        };
+        (asked != node.name).then(|| RenamedOut {
+            from: asked,
+            to: node.name.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(Copied {
+        node: NodeOut::from(node),
+        renamed,
+    })
+}
+
 /// Copies `id` into `parent` for `actor`, named `name` or as it is. Run inside
-/// [`to_completion`]. The caller refuses a copy into a connected library first (see
-/// [`require_not_connected_for`]); a copy out of one is an ordinary copy.
+/// [`to_completion`]. The caller routes a copy into a connected library or out of an S3
+/// library elsewhere first (see [`copy_place`]); a copy out of a GitHub library is an ordinary
+/// copy.
 pub(crate) async fn copy_one(
     state: &AppState,
     actor: &User,
@@ -825,8 +997,9 @@ pub(crate) async fn copy_one(
     Ok(Copied::from(applied))
 }
 
-/// Refuses Phase 1 copies out of file-share and S3 libraries, while preserving GitHub's existing
-/// copy behavior. Access is checked before the source kind is disclosed.
+/// Refuses copies out of file-share libraries, while preserving GitHub's existing copy behavior
+/// (copies out of S3 libraries go through [`copy_across`]). Access is checked before the source
+/// kind is disclosed.
 async fn require_share_copyable_for(db: &Db, user: UserId, node: NodeId) -> Result<(), ApiError> {
     let Some(library) = db
         .source_library_of(node)
@@ -842,7 +1015,7 @@ async fn require_share_copyable_for(db: &Db, user: UserId, node: NodeId) -> Resu
     else {
         return Ok(());
     };
-    if !matches!(source.kind, SourceKind::Share | SourceKind::S3) {
+    if source.kind != SourceKind::Share {
         return Ok(());
     }
     if db

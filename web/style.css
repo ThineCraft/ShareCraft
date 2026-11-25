@@ -141,6 +141,9 @@ select{padding-right:var(--space-2)}
 .share{padding:var(--space-4) var(--space-4);border-top:1px solid var(--line)}
 .share h2{font-size:var(--text-sm);margin:0 0 var(--space-2)}
 .msg:empty,.problem:empty{padding:0}
+/* Nothing to say takes no room: an empty message (still in the page, so a screen reader announces it when it fills) leaves the flow and the gap of a .stack, and a .row whose children are all hidden is not drawn. */
+.msg:empty{position:absolute;width:1px;height:1px;margin:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+.row:not(:has(>:not([hidden]))){display:none}
 /* the frame around an editor (file.html): the bar, one banner line, the editor filling the rest */
 body.full{padding:0;height:100vh;height:100dvh;overflow:hidden}
 .frame.full{max-width:none;height:100%;border:0;border-radius:0;display:flex;flex-direction:column}

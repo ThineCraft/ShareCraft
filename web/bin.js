@@ -26,6 +26,7 @@ import {
   siteChrome,
 } from './common.js';
 import { fileIcon, relativeTime } from './files.js';
+import { sourceWriteErrorText } from './source-panel.js';
 import {
   BIN_DAYS,
   binKind,
@@ -494,7 +495,7 @@ async function restoreEntries(list) {
     for (const entry of list) {
       const result = await api('POST', `/bin/${seg(entry.id)}/restore`);
       if (result.ok) restored.push({ entry, node: result.data.node, renamed: result.data.renamed });
-      else failed.push({ entry, error: result.error });
+      else failed.push({ entry, error: result.error, data: result.data });
     }
     // Where each went: the same place, unless a folder it was in is gone.
     const placeNames = new Map();
@@ -568,7 +569,7 @@ async function removeEntries(list) {
     for (const entry of list) {
       const result = await api('DELETE', `/bin/${seg(entry.id)}`);
       if (result.ok) done.push(entry);
-      else failed.push({ entry, error: result.error });
+      else failed.push({ entry, error: result.error, data: result.data });
     }
   } finally {
     busy = false;
@@ -587,8 +588,13 @@ async function removeEntries(list) {
   await refresh(rowAfter(done.map((entry) => entry.id)));
 }
 
+/** A refusal in plain words: a bucket's own sentence (a blocked library, a held change) or the general one. */
+function errorText(code, data) {
+  return sourceWriteErrorText(code, data) || messageFor(code);
+}
+
 function reportFailures(verb, failed) {
-  const lines = failed.slice(0, 3).map(({ entry, error: code }) => `${entry.name}: ${messageFor(code)}`);
+  const lines = failed.slice(0, 3).map(({ entry, error: code, data }) => `${entry.name}: ${errorText(code, data)}`);
   if (failed.length > 3) lines.push(`and ${failed.length - 3} more.`);
   const head = failed.length === 1 ? `“${failed[0].entry.name}” could not be ${verb}.` : `${failed.length} items could not be ${verb}.`;
   note([head, ...lines].join(' '), true);
@@ -631,7 +637,7 @@ async function emptyBin() {
     for (const entry of all) {
       const result = await api('DELETE', `/bin/${seg(entry.id)}`);
       if (result.ok) done += 1;
-      else failed.push({ name: entry.name, text: messageFor(result.error) });
+      else failed.push({ name: entry.name, text: errorText(result.error, result.data) });
     }
   } finally {
     button.disabled = false;

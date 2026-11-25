@@ -10,6 +10,15 @@
 //! logged by `writes()` with a condition word and never a header value. Any other write method
 //! is answered `501 NotImplemented`.
 //!
+//! Copy and multipart: a `PUT` carrying `x-amz-copy-source` is a `CopyObject` (never stored as
+//! an ordinary `PUT`): it honours `x-amz-copy-source-if-match` and the destination's
+//! `If-None-Match` and `If-Match`, and keeps the source's content hash. `POST ?uploads`
+//! creates an upload, `PUT ?partNumber=&uploadId=` stores a part (its hash checked like any
+//! `PUT`), `POST ?uploadId=` completes (conditions honoured; every part but the last must be at
+//! least [`FakeS3::min_part_bytes`], 5 MiB unless lowered) and `DELETE ?uploadId=` aborts.
+//! `writes()` also logs `("COPY", to, condition)`, `("PART", key, number)`,
+//! `("COMPLETE", key, condition)` and `("ABORT", key, "")`; creating an upload is not logged.
+//!
 //! It stops accepting connections when dropped.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -70,12 +79,24 @@ pub struct Stored {
     pub sha256: Option<String>,
 }
 
+/// A multipart upload that has been started and not completed or aborted.
+struct Upload {
+    key: String,
+    sha256: Option<String>,
+    parts: BTreeMap<u16, (Vec<u8>, String)>,
+}
+
 #[derive(Default)]
 struct Bucket {
     objects: BTreeMap<String, Object>,
     versioning: Option<&'static str>,
     versions_made: u64,
+    uploads: BTreeMap<String, Upload>,
+    uploads_made: u64,
 }
+
+/// S3's smallest part but the last: 5 MiB.
+const MIN_PART: u64 = 5 * 1024 * 1024;
 
 struct Model {
     buckets: BTreeMap<String, Bucket>,
@@ -105,8 +126,43 @@ struct Model {
     read_only: bool,
     deny_writes_after: Option<usize>,
     lose_answer: bool,
+    lose_complete_answer: bool,
     writes: Vec<(String, String, String)>,
     last_write_body_len: Option<usize>,
+    error_in_200: bool,
+    fail_parts: HashSet<u16>,
+    min_part: u64,
+    claimed_sizes: HashMap<String, u64>,
+    fail_copies: HashMap<String, (u16, String)>,
+    pause_delete: Option<Paused>,
+    pause_put: Option<Paused>,
+    pause_put_answer: Option<Paused>,
+}
+
+/// A request held before it is answered (see [`FakeS3::pause_next_delete`]).
+#[derive(Clone)]
+pub struct Paused {
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl Paused {
+    fn new() -> Paused {
+        Paused {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Waits until the request has arrived (and is held).
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the held request go on.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl Default for Model {
@@ -139,8 +195,17 @@ impl Default for Model {
             read_only: false,
             deny_writes_after: None,
             lose_answer: false,
+            lose_complete_answer: false,
             writes: Vec::new(),
             last_write_body_len: None,
+            error_in_200: false,
+            fail_parts: HashSet::new(),
+            min_part: MIN_PART,
+            claimed_sizes: HashMap::new(),
+            fail_copies: HashMap::new(),
+            pause_delete: None,
+            pause_put: None,
+            pause_put_answer: None,
         }
     }
 }
@@ -369,10 +434,83 @@ impl FakeS3 {
         self.model().lose_answer = true;
     }
 
+    /// The next multipart completion is carried out, and then answered `503 SlowDown`.
+    pub fn lose_complete_answer(&self) {
+        self.model().lose_complete_answer = true;
+    }
+
     /// Every `PUT` and `DELETE` received, in order: method, key and a condition word (`none`,
     /// `absent` for `If-None-Match` or `match` for `If-Match`). Never a header value.
     pub fn writes(&self) -> Vec<(String, String, String)> {
         self.model().writes.clone()
+    }
+
+    /// The next copy or completion is answered `200` with an `<Error>` body (`InternalError`)
+    /// and changes nothing.
+    pub fn error_in_200_next(&self) {
+        self.model().error_in_200 = true;
+    }
+
+    /// Listings and `HEAD` say `key` holds `size` bytes, whatever it really holds: an object
+    /// too large to store in a test.
+    pub fn claim_size(&self, key: &str, size: u64) {
+        self.model().claimed_sizes.insert(key.to_owned(), size);
+    }
+
+    /// The next copy to `key` is answered with `status` and an error body carrying `code`, and
+    /// changes nothing. Other requests are answered as usual.
+    pub fn fail_copy_to(&self, key: &str, status: u16, code: &str) {
+        self.model()
+            .fail_copies
+            .insert(key.to_owned(), (status, code.to_owned()));
+    }
+
+    /// The next `DELETE` of an object (not an abort) is held before anything is done or logged,
+    /// until the answer's [`Paused::release`]: a step stopped between its copies and its
+    /// deletes.
+    pub fn pause_next_delete(&self) -> Paused {
+        let paused = Paused {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        self.model().pause_delete = Some(paused.clone());
+        paused
+    }
+
+    /// The next content `PUT` (an object's or a part's, not a copy) is held before anything is
+    /// done or logged, until the answer's [`Paused::release`]: a transfer under way.
+    pub fn pause_next_put(&self) -> Paused {
+        let paused = Paused::new();
+        self.model().pause_put = Some(paused.clone());
+        paused
+    }
+
+    /// The next content `PUT` (an object's or a part's, not a copy) is carried out and logged,
+    /// and its answer held until the answer's [`Paused::release`]: content that has landed
+    /// before the writer has heard so.
+    pub fn pause_after_next_put(&self) -> Paused {
+        let paused = Paused::new();
+        self.model().pause_put_answer = Some(paused.clone());
+        paused
+    }
+
+    /// Every `PUT` of part number `n` is answered `500 InternalError`.
+    pub fn fail_part(&self, n: u16) {
+        self.model().fail_parts.insert(n);
+    }
+
+    /// Completion requires every part but the last to hold at least `bytes` (5 MiB at first).
+    pub fn min_part_bytes(&self, bytes: u64) {
+        self.model().min_part = bytes;
+    }
+
+    /// The multipart uploads started and not yet completed or aborted: key and upload id.
+    pub fn open_multiparts(&self) -> Vec<(String, String)> {
+        self.model()
+            .buckets
+            .values()
+            .flat_map(|b| b.uploads.iter().map(|(id, u)| (u.key.clone(), id.clone())))
+            .collect()
     }
 
     /// The length of the body of the last `PUT` received.
@@ -643,7 +781,30 @@ fn address(model: &Model, host: &str, path: &str) -> Option<(String, String)> {
     }
 }
 
+/// [`answer`], with a content `PUT` held before it ([`FakeS3::pause_next_put`]) or its answer
+/// held after it ([`FakeS3::pause_after_next_put`]).
 async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Response {
+    let content_put =
+        request.method() == Method::PUT && !request.headers().contains_key("x-amz-copy-source");
+    let (before, after) = if content_put {
+        let mut m = model.lock().unwrap();
+        (m.pause_put.take(), m.pause_put_answer.take())
+    } else {
+        (None, None)
+    };
+    if let Some(paused) = before {
+        paused.reached.notify_one();
+        paused.release.notified().await;
+    }
+    let response = answer(State(model), request).await;
+    if let Some(paused) = after {
+        paused.reached.notify_one();
+        paused.release.notified().await;
+    }
+    response
+}
+
+async fn answer(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, 16 << 20)
         .await
@@ -665,6 +826,15 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
+    let paused = if method == Method::DELETE && !has("uploadId") {
+        model.lock().unwrap().pause_delete.take()
+    } else {
+        None
+    };
+    if let Some(paused) = paused {
+        paused.reached.notify_one();
+        paused.release.notified().await;
+    }
 
     let mut wait = None;
     let response = {
@@ -696,7 +866,11 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
             _ => "write",
         };
         *m.counts.entry(kind.to_owned()).or_default() += 1;
-        if kind == "write" && matches!(method, Method::PUT | Method::DELETE) {
+        let copying = method == Method::PUT && parts.headers.contains_key("x-amz-copy-source");
+        let part_number = (method == Method::PUT && !copying)
+            .then(|| param("partNumber"))
+            .flatten();
+        if kind == "write" && matches!(method, Method::PUT | Method::DELETE | Method::POST) {
             let condition = if parts.headers.contains_key(header::IF_NONE_MATCH) {
                 "absent"
             } else if parts.headers.contains_key(header::IF_MATCH) {
@@ -704,9 +878,23 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
             } else {
                 "none"
             };
-            m.writes
-                .push((method.to_string(), key.clone(), condition.to_owned()));
-            if method == Method::PUT {
+            let entry = if copying {
+                Some(("COPY".to_owned(), condition.to_owned()))
+            } else if let Some(number) = &part_number {
+                Some(("PART".to_owned(), number.clone()))
+            } else if method == Method::POST && has("uploadId") {
+                Some(("COMPLETE".to_owned(), condition.to_owned()))
+            } else if method == Method::DELETE && has("uploadId") {
+                Some(("ABORT".to_owned(), String::new()))
+            } else if method == Method::POST {
+                None
+            } else {
+                Some((method.to_string(), condition.to_owned()))
+            };
+            if let Some((word, detail)) = entry {
+                m.writes.push((word, key.clone(), detail));
+            }
+            if method == Method::PUT && !copying {
                 m.last_write_body_len = Some(body.len());
             }
         }
@@ -723,6 +911,9 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
             return error(503, "SlowDown");
         }
         if let Some((status, code)) = m.fail_next.take() {
+            return error(status, &code);
+        }
+        if copying && let Some((status, code)) = m.fail_copies.remove(&key) {
             return error(status, &code);
         }
         if kind == "list"
@@ -753,7 +944,8 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         {
             return error(403, code);
         }
-        if kind == "write" && !matches!(method, Method::PUT | Method::DELETE) {
+        let multipart_post = method == Method::POST && (has("uploads") || has("uploadId"));
+        if kind == "write" && !matches!(method, Method::PUT | Method::DELETE) && !multipart_post {
             return error(501, "NotImplemented");
         }
         let denied = m.denied.iter().any(|(b, p)| {
@@ -767,6 +959,7 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         let repeat_token = m.repeat_token;
         let without_token = m.truncated_without_token;
         let stray = m.stray_key.clone();
+        let claimed = m.claimed_sizes.clone();
         let no_versioning = m.no_versioning_api;
         let replacement = if kind == "head" {
             m.change_before_get
@@ -786,9 +979,28 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         let hung = m.hung.contains(&key);
         let truncated = m.truncated.get(&key).copied();
         let read_only = m.read_only || m.deny_writes_after.is_some_and(|n| m.writes.len() > n);
+        let copy_source = if copying {
+            Some(copy_source_of(&m, &parts.headers))
+        } else {
+            None
+        };
+        let wants_200_error = kind == "write"
+            && (copying || (method == Method::POST && has("uploadId")))
+            && std::mem::take(&mut m.error_in_200);
         let write_flags = Flags {
             ignore_conditions: m.ignore_conditions,
-            lose_answer: kind == "write" && std::mem::take(&mut m.lose_answer),
+            lose_answer: kind == "write"
+                && (std::mem::take(&mut m.lose_answer)
+                    || (method == Method::POST
+                        && has("uploadId")
+                        && std::mem::take(&mut m.lose_complete_answer))),
+            error_in_200: wants_200_error,
+            fail_part: part_number
+                .as_deref()
+                .and_then(|n| n.parse::<u16>().ok())
+                .is_some_and(|n| m.fail_parts.contains(&n)),
+            min_part: m.min_part,
+            copy_source,
         };
         let Some(b) = m.buckets.get_mut(&bucket) else {
             return error(404, "NoSuchBucket");
@@ -800,7 +1012,15 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
             if read_only {
                 return error(403, "AccessDenied");
             }
-            return write(b, &key, &method, &parts.headers, body.to_vec(), write_flags);
+            return write(
+                b,
+                &key,
+                &method,
+                &parts.headers,
+                &query,
+                body.to_vec(),
+                write_flags,
+            );
         }
         match kind {
             "versioning" => {
@@ -825,6 +1045,7 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
                 repeat_token,
                 without_token,
                 stray.as_deref(),
+                &claimed,
             ),
             _ => {
                 let Some(object) = b.objects.get(&key).cloned() else {
@@ -841,7 +1062,17 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
                     };
                     store(b, &key, bytes, now_s(), opts);
                 }
-                object_answer(&object, kind == "head", &parts.headers, hung, truncated)
+                let claimed = (kind == "head")
+                    .then(|| claimed.get(&key).copied())
+                    .flatten();
+                object_answer(
+                    &object,
+                    kind == "head",
+                    &parts.headers,
+                    hung,
+                    truncated,
+                    claimed,
+                )
             }
         }
     };
@@ -854,18 +1085,101 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
 struct Flags {
     ignore_conditions: bool,
     lose_answer: bool,
+    /// Answer the copy or completion `200` with an `<Error>` body.
+    error_in_200: bool,
+    /// The part being put is to fail.
+    fail_part: bool,
+    min_part: u64,
+    /// For a copy: the source object, or the error that names why there is none.
+    copy_source: Option<Result<Object, (u16, &'static str)>>,
 }
 
-/// A `PUT` or `DELETE` of `key`.
+/// The object a copy names in `x-amz-copy-source` (`/bucket/key`, the key percent-encoded).
+fn copy_source_of(m: &Model, headers: &HeaderMap) -> Result<Object, (u16, &'static str)> {
+    let value = headers
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+        .ok_or((400, "InvalidArgument"))?;
+    let value = value.strip_prefix('/').unwrap_or(value);
+    let (bucket, key) = value.split_once('/').ok_or((400, "InvalidArgument"))?;
+    let key = s3_xml::percent_decode(key).map_err(|_| (400, "InvalidArgument"))?;
+    m.buckets
+        .get(bucket)
+        .ok_or((404, "NoSuchBucket"))?
+        .objects
+        .get(&key)
+        .cloned()
+        .ok_or((404, "NoSuchKey"))
+}
+
+/// A `200` whose body is an `<Error>`, as S3 sends when a copy or completion fails after it
+/// has begun to answer.
+fn error_in_200() -> Response {
+    xml(
+        "<Error><Code>InternalError</Code><Message>We encountered an internal error. \
+         Please try again.</Message><RequestId>FAKE</RequestId></Error>"
+            .to_owned(),
+    )
+}
+
+/// Whether the destination's conditions refuse the write.
+fn refused_by_conditions(existing: Option<&Object>, headers: &HeaderMap) -> bool {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    (text("if-none-match") == Some("*") && existing.is_some())
+        || text("if-match").is_some_and(|wanted| existing.is_none_or(|o| o.etag != wanted))
+}
+
+/// A `PUT`, `POST` or `DELETE` of `key`: an ordinary write, a copy or a multipart call.
 fn write(
     b: &mut Bucket,
     key: &str,
     method: &Method,
     headers: &HeaderMap,
+    query: &[(String, String)],
     bytes: Vec<u8>,
-    flags: Flags,
+    mut flags: Flags,
 ) -> Response {
     let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let param = |name: &str| {
+        query
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    if *method == Method::POST {
+        return if param("uploads").is_some() {
+            create_upload(b, key, headers)
+        } else if let Some(id) = param("uploadId") {
+            complete_upload(b, key, id, headers, &bytes, &flags)
+        } else {
+            error(501, "NotImplemented")
+        };
+    }
+    if *method == Method::DELETE
+        && let Some(id) = param("uploadId")
+    {
+        return if b.uploads.remove(id).is_some() {
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap()
+        } else {
+            error(404, "NoSuchUpload")
+        };
+    }
+    if *method == Method::PUT && param("partNumber").is_some() {
+        return put_part(
+            b,
+            key,
+            param("partNumber"),
+            param("uploadId"),
+            bytes,
+            &flags,
+        );
+    }
+    if let Some(source) = flags.copy_source.take() {
+        return copy_object(b, key, headers, source, &flags);
+    }
     if *method == Method::DELETE {
         b.objects.remove(key);
         if flags.lose_answer {
@@ -921,6 +1235,7 @@ fn list(
     repeat_token: bool,
     without_token: bool,
     stray: Option<&str>,
+    claimed: &HashMap<String, u64>,
 ) -> Response {
     if param("list-type").as_deref() != Some("2") {
         return error(400, "InvalidArgument");
@@ -990,7 +1305,10 @@ fn list(
             url_listing_encode(key),
             iso_date(object.modified_s),
             s3_xml::escape(&object.etag),
-            object.bytes.len(),
+            claimed
+                .get(key)
+                .copied()
+                .unwrap_or(object.bytes.len() as u64),
             object.class.as_deref().unwrap_or("STANDARD"),
         ));
     }
@@ -1019,6 +1337,7 @@ fn object_answer(
     headers: &HeaderMap,
     hung: bool,
     truncated: Option<usize>,
+    claimed: Option<u64>,
 ) -> Response {
     let archived = matches!(object.class.as_deref(), Some("GLACIER" | "DEEP_ARCHIVE"))
         && object.restored != Some(true);
@@ -1052,9 +1371,10 @@ fn object_answer(
         Some((a, b)) => object.bytes[a..=b].to_vec(),
         None => object.bytes.clone(),
     };
+    let length = claimed.unwrap_or(bytes.len() as u64);
     let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .header(header::CONTENT_LENGTH, length.to_string())
         .header(header::ETAG, object.etag.clone())
         .header(header::LAST_MODIFIED, http_date(object.modified_s))
         .header(header::ACCEPT_RANGES, "bytes");
@@ -1100,4 +1420,203 @@ fn object_answer(
         return builder.body(Body::from_stream(stream)).unwrap();
     }
     builder.body(Body::from(bytes)).unwrap()
+}
+
+/// `POST ?uploads`: starts an upload and answers its id.
+fn create_upload(b: &mut Bucket, key: &str, headers: &HeaderMap) -> Response {
+    b.uploads_made += 1;
+    let id = format!("upload-{}", b.uploads_made);
+    let sha256 = headers
+        .get("x-amz-meta-sharecraft-sha256")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    b.uploads.insert(
+        id.clone(),
+        Upload {
+            key: key.to_owned(),
+            sha256,
+            parts: BTreeMap::new(),
+        },
+    );
+    xml(format!(
+        "<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>fake</Bucket><Key>{}</Key><UploadId>{}</UploadId>\
+         </InitiateMultipartUploadResult>",
+        s3_xml::escape(key),
+        s3_xml::escape(&id),
+    ))
+}
+
+/// `PUT ?partNumber=&uploadId=`: stores a part (its hash was checked with the request).
+fn put_part(
+    b: &mut Bucket,
+    key: &str,
+    number: Option<&str>,
+    upload_id: Option<&str>,
+    bytes: Vec<u8>,
+    flags: &Flags,
+) -> Response {
+    let Some(number) = number
+        .and_then(|n| n.parse::<u16>().ok())
+        .filter(|n| (1..=10_000).contains(n))
+    else {
+        return error(400, "InvalidArgument");
+    };
+    let Some(upload) = upload_id
+        .and_then(|id| b.uploads.get_mut(id))
+        .filter(|u| u.key == key)
+    else {
+        return error(404, "NoSuchUpload");
+    };
+    if flags.fail_part {
+        return error(500, "InternalError");
+    }
+    let etag = etag_of(&bytes);
+    upload.parts.insert(number, (bytes, etag.clone()));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::ETAG, etag)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// `POST ?uploadId=`: puts the parts together under the destination's conditions.
+fn complete_upload(
+    b: &mut Bucket,
+    key: &str,
+    id: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    flags: &Flags,
+) -> Response {
+    if !b.uploads.get(id).is_some_and(|u| u.key == key) {
+        return error(404, "NoSuchUpload");
+    }
+    if flags.error_in_200 {
+        return error_in_200();
+    }
+    let Some(root) = std::str::from_utf8(body)
+        .ok()
+        .and_then(|text| s3_xml::parse(text).ok())
+        .filter(|root| root.name == "CompleteMultipartUpload")
+    else {
+        return error(400, "MalformedXML");
+    };
+    let mut wanted: Vec<(u16, String)> = Vec::new();
+    for part in root.children.iter().filter(|c| c.name == "Part") {
+        let field = |name: &str| part.children.iter().find(|c| c.name == name);
+        let number = field("PartNumber").and_then(|n| n.text.trim().parse::<u16>().ok());
+        let (Some(number), Some(etag)) = (number, field("ETag")) else {
+            return error(400, "MalformedXML");
+        };
+        wanted.push((number, etag.text.trim().to_owned()));
+    }
+    if wanted.is_empty() {
+        return error(400, "MalformedXML");
+    }
+    if wanted.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return error(400, "InvalidPartOrder");
+    }
+    let Some(upload) = b.uploads.get(id) else {
+        return error(404, "NoSuchUpload");
+    };
+    let mut joined = Vec::new();
+    for (index, (number, etag)) in wanted.iter().enumerate() {
+        let Some((bytes, stored)) = upload.parts.get(number) else {
+            return error(400, "InvalidPart");
+        };
+        if stored != etag {
+            return error(400, "InvalidPart");
+        }
+        let last = index + 1 == wanted.len();
+        if !last && (bytes.len() as u64) < flags.min_part {
+            return error(400, "EntityTooSmall");
+        }
+        joined.extend_from_slice(bytes);
+    }
+    if !flags.ignore_conditions && refused_by_conditions(b.objects.get(key), headers) {
+        return error(412, "PreconditionFailed");
+    }
+    let sha256 = upload.sha256.clone();
+    let etag = format!(
+        "\"{}-{}\"",
+        &s3_sign::sha256_hex(&joined)[..32],
+        wanted.len()
+    );
+    b.uploads.remove(id);
+    store(
+        b,
+        key,
+        joined,
+        now_s(),
+        Opts {
+            etag: Some(etag.clone()),
+            ..Opts::default()
+        },
+    );
+    if let Some(object) = b.objects.get_mut(key) {
+        object.sha256 = sha256;
+    }
+    if flags.lose_answer {
+        return error(503, "SlowDown");
+    }
+    xml(format!(
+        "<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>fake</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
+        s3_xml::escape(key),
+        s3_xml::escape(&etag),
+    ))
+}
+
+/// `CopyObject`: a `PUT` carrying `x-amz-copy-source`.
+fn copy_object(
+    b: &mut Bucket,
+    key: &str,
+    headers: &HeaderMap,
+    source: Result<Object, (u16, &'static str)>,
+    flags: &Flags,
+) -> Response {
+    let source = match source {
+        Ok(source) => source,
+        Err((status, code)) => return error(status, code),
+    };
+    if flags.error_in_200 {
+        return error_in_200();
+    }
+    if let Some(wanted) = headers
+        .get("x-amz-copy-source-if-match")
+        .and_then(|v| v.to_str().ok())
+        && wanted != source.etag
+    {
+        return error(412, "PreconditionFailed");
+    }
+    if !flags.ignore_conditions && refused_by_conditions(b.objects.get(key), headers) {
+        return error(412, "PreconditionFailed");
+    }
+    store(
+        b,
+        key,
+        source.bytes.clone(),
+        now_s(),
+        Opts {
+            etag: Some(source.etag.clone()),
+            class: source.class.clone(),
+            restored: None,
+        },
+    );
+    let modified = match b.objects.get_mut(key) {
+        Some(object) => {
+            object.sha256 = source.sha256.clone();
+            object.modified_s
+        }
+        None => now_s(),
+    };
+    if flags.lose_answer {
+        return error(503, "SlowDown");
+    }
+    xml(format!(
+        "<CopyObjectResult><ETag>{}</ETag><LastModified>{}</LastModified></CopyObjectResult>",
+        s3_xml::escape(&source.etag),
+        iso_date(modified),
+    ))
 }

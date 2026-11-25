@@ -138,11 +138,15 @@
     <legend>What people can do</legend>
     <label class="check"><input type="radio" name="s3-mode" value="read_only" checked> Read only</label>
     <label class="check"><input type="radio" name="s3-mode" value="read_write"> Read and write</label>
-    <small id="s3-mode-note" class="meta">What people add and change here is saved in the bucket, and your provider may charge for each change.</small>
+    <small id="s3-mode-note" class="meta">ShareCraft only reads from the bucket.</small>
    </fieldset>
    <p class="meta" id="s3-hint">Files stay in the bucket: ShareCraft reads one when someone opens it. Your storage provider may charge for the requests and downloads ShareCraft makes. A read-only library needs a key that may only read this bucket.</p>
   </div>
   <p id="new-library-error" role="alert" class="msg" tabindex="-1"></p>
+  <div id="new-library-done" role="status" hidden>
+   <p id="new-library-note" class="meta"></p>
+   <p><a id="new-library-open" class="button" href="#" aria-describedby="new-library-note">Open the library</a></p>
+  </div>
   <div class="row" id="s3-readonly-row" hidden>
    <button type="button" id="s3-readonly-instead" class="plain">Connect read-only instead</button>
   </div>

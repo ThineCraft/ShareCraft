@@ -92,12 +92,18 @@ impl PendingState {
 pub struct NewPendingWrite<'a> {
     pub node: NodeId,
     pub library: NodeId,
-    /// The path below the library's place, as `source_items.repository_path` writes it.
+    /// The path below the library's place, as `source_items.repository_path` writes it. A
+    /// tracked node's own tracking row overrides it, and a new file's folder is its tracked
+    /// parent's (see [`Db::stage_write`]).
     pub path: &'a str,
     /// The new content, pinned in the cache by the caller.
     pub blob: BlobRef,
     /// The tag the change is based on; `None`: the file is new and must not exist.
     pub base_tag: Option<&'a str>,
+    /// The revision the change was made on, when the caller read one (an editor's save): a
+    /// tracked node still at that revision is based on its tracking row's tag instead of
+    /// `base_tag`, which a move may have changed since without changing the content.
+    pub seen_revision: Option<&'a str>,
     pub by: UserId,
     /// Write without waiting for the throttle.
     pub flush: bool,
@@ -121,6 +127,40 @@ pub struct PendingWrite {
     pub flush: bool,
     pub first_staged_at: OffsetDateTime,
     pub staged_at: OffsetDateTime,
+}
+
+/// What a library holds in its holding folder for a deleted bin entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    pub entry: NodeId,
+    pub library: NodeId,
+    /// Library-relative; ends with `/`.
+    pub root: String,
+    pub objects: u64,
+    pub held_at: OffsetDateTime,
+    pub retry_at: Option<OffsetDateTime>,
+}
+
+/// A multipart upload started and not yet completed or aborted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenMultipart {
+    pub library: NodeId,
+    pub node: NodeId,
+    pub key: String,
+    pub upload_id: String,
+    pub started_at: OffsetDateTime,
+}
+
+fn held_from_row(row: &PgRow) -> Result<Held, sqlx::Error> {
+    let objects: i64 = row.try_get("objects")?;
+    Ok(Held {
+        entry: NodeId(row.try_get("entry_id")?),
+        library: NodeId(row.try_get("library_id")?),
+        root: row.try_get("root")?,
+        objects: u64::try_from(objects).map_err(|e| sqlx::Error::Decode(e.into()))?,
+        held_at: row.try_get("held_at")?,
+        retry_at: row.try_get("retry_at")?,
+    })
 }
 
 const COLUMNS: &str = "node_id, library_id, path, sha256, size, revision, base_tag, by_user, \
@@ -195,11 +235,13 @@ impl Db {
             return Ok(false);
         }
         if mode == SourceMode::ReadOnly {
-            let pending: i64 =
-                sqlx::query_scalar("select count(*) from source_writes where library_id = $1")
-                    .bind(library.0)
-                    .fetch_one(&mut *tx)
-                    .await?;
+            let pending: i64 = sqlx::query_scalar(
+                "select (select count(*) from source_writes where library_id = $1) \
+                      + (select count(*) from source_multipart where library_id = $1)",
+            )
+            .bind(library.0)
+            .fetch_one(&mut *tx)
+            .await?;
             if pending > 0 {
                 return Err(AccessError::WritesPending);
             }
@@ -266,6 +308,18 @@ impl Db {
     /// its mode judged in the same transaction as the insert, so a switch to read-only cannot
     /// slip between: a library that is read-only (or has no connection) refuses with
     /// `LibraryReadOnly`, and a switch that wins the lock first is seen here.
+    ///
+    /// Where the change goes is read here, under locks, not trusted from the caller, so a save
+    /// racing a move inside the store lands where the file is now. A node in the recycle bin (or
+    /// gone) refuses with `NotFound`; its `nodes` row is locked `FOR SHARE`, so a delete either
+    /// waits for this stage (and finds its row) or is seen. A tracked node's tracking row is
+    /// locked `FOR UPDATE` and gives the path: [`Db::move_source_items`] and
+    /// [`Db::retag_source_item`] lock it first too, so a move either finished (and its path and
+    /// tag are read here) or waits and then moves this row along. A new file whose parent folder
+    /// is tracked takes that folder's path (its row locked `FOR SHARE`) with the last segment of
+    /// `w.path`. For a new row, `w.base_tag` is replaced by the tracking row's tag when the row
+    /// is still at `w.seen_revision`. Locks are taken in the order tracking row, then pending
+    /// row, as every transaction that touches both does.
     pub async fn stage_write(&self, w: &NewPendingWrite<'_>) -> Result<String, AccessError> {
         let revision = new_external_revision();
         let mut tx = self.pool().begin().await?;
@@ -281,6 +335,56 @@ impl Db {
             .bind(w.blob.hex())
             .fetch_one(&mut *tx)
             .await?;
+        let live: Option<bool> =
+            sqlx::query_scalar("select deleted_at is null from nodes where id = $1 for share")
+                .bind(w.node.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if live != Some(true) {
+            return Err(AccessError::NotFound);
+        }
+        let item: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "select repository_path, blob_sha, revision from source_items \
+             where node_id = $1 and library_id = $2 for update",
+        )
+        .bind(w.node.0)
+        .bind(w.library.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let tracked = item.is_some();
+        let (path, base_tag) = match item {
+            Some((repository_path, tag, current)) => {
+                let unchanged = w
+                    .seen_revision
+                    .is_some_and(|seen| current.as_deref() == Some(seen));
+                let base = if unchanged {
+                    tag
+                } else {
+                    w.base_tag.map(str::to_owned)
+                };
+                (repository_path, base)
+            }
+            None => {
+                let folder: Option<String> = sqlx::query_scalar(
+                    "select p.repository_path from nodes n \
+                     join source_items p on p.node_id = n.parent_id \
+                     where n.id = $1 and p.library_id = $2 and p.blob_sha is null \
+                     for share of p",
+                )
+                .bind(w.node.0)
+                .bind(w.library.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let path = match folder {
+                    Some(folder) => {
+                        let name = w.path.rsplit('/').next().unwrap_or(w.path);
+                        format!("{}/{name}", folder.trim_end_matches('/'))
+                    }
+                    None => w.path.to_owned(),
+                };
+                (path, w.base_tag.map(str::to_owned))
+            }
+        };
         sqlx::query(
             "insert into source_writes \
                  (node_id, library_id, path, sha256, size, revision, base_tag, by_user, state, \
@@ -290,18 +394,20 @@ impl Db {
                  sha256 = excluded.sha256, size = excluded.size, revision = excluded.revision, \
                  by_user = excluded.by_user, staged_at = excluded.staged_at, \
                  flush = source_writes.flush or excluded.flush, \
+                 path = case when $11 then excluded.path else source_writes.path end, \
                  state = 'scanning', error = null, attempts = 0, next_try_at = null",
         )
         .bind(w.node.0)
         .bind(w.library.0)
-        .bind(w.path)
+        .bind(&path)
         .bind(w.blob.hex())
         .bind(column(w.blob.size))
         .bind(&revision)
-        .bind(w.base_tag)
+        .bind(base_tag.as_deref())
         .bind(w.by.0)
         .bind(w.flush)
         .bind(w.now)
+        .bind(tracked)
         .execute(&mut *tx)
         .await?;
         sqlx::query("update source_items set revision = $2 where node_id = $1")
@@ -401,6 +507,11 @@ impl Db {
         modified: OffsetDateTime,
     ) -> Result<bool, DbError> {
         let mut tx = self.pool().begin().await?;
+        // The tracking row first, then the pending row: the order [`Db::stage_write`] takes.
+        sqlx::query("select 1 from source_items where node_id = $1 for update")
+            .bind(node.0)
+            .fetch_optional(&mut *tx)
+            .await?;
         let row: Option<(Uuid, String, String, String)> = sqlx::query_as(
             "select library_id, path, sha256, revision from source_writes \
              where node_id = $1 for update",
@@ -520,13 +631,18 @@ impl Db {
     }
 
     /// Asks for the pending write of `node` not to wait for the throttle (a session ended, or
-    /// the person closed the file). A retry time still holds it back, so `_now` is not used.
-    /// Whether there is a row.
+    /// the room emptied): a row that is not failed loses its retry time and is due at once; a
+    /// failed one keeps its retry time. `_now` is not used. Whether there is a row.
     pub async fn flush_write(&self, node: NodeId, _now: OffsetDateTime) -> Result<bool, DbError> {
-        let done = sqlx::query("update source_writes set flush = true where node_id = $1")
-            .bind(node.0)
-            .execute(self.pool())
-            .await?;
+        // A row that is not failed is due at once; a failed one keeps its retry time.
+        let done = sqlx::query(
+            "update source_writes set flush = true, \
+             next_try_at = case when state = 'failed' then next_try_at else null end \
+             where node_id = $1",
+        )
+        .bind(node.0)
+        .execute(self.pool())
+        .await?;
         Ok(done.rows_affected() > 0)
     }
 
@@ -535,6 +651,11 @@ impl Db {
     /// store's again). Whether it was withdrawn.
     pub async fn drop_write(&self, node: NodeId, sha256: &[u8; 32]) -> Result<bool, DbError> {
         let mut tx = self.pool().begin().await?;
+        // The tracking row first, then the pending row: the order [`Db::stage_write`] takes.
+        sqlx::query("select 1 from source_items where node_id = $1 for update")
+            .bind(node.0)
+            .fetch_optional(&mut *tx)
+            .await?;
         let done = sqlx::query("delete from source_writes where node_id = $1 and sha256 = $2")
             .bind(node.0)
             .bind(hex(sha256))
@@ -570,6 +691,29 @@ impl Db {
         Ok(done.rows_affected() > 0)
     }
 
+    /// Records on the pending write of `node`, if it is still the one first staged at
+    /// `first_staged_at` (not withdrawn and staged again since), that the store now holds
+    /// `tag`: its content was written but the finish could not be recorded yet. The next
+    /// attempt recognises its own content whatever the base; a newer stage of the same row is
+    /// then based on what was written, as [`Db::finish_write`] would have made it. Whether the
+    /// row was found.
+    pub async fn rebase_write(
+        &self,
+        node: NodeId,
+        first_staged_at: OffsetDateTime,
+        tag: &str,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update source_writes set base_tag = $3 where node_id = $1 and first_staged_at = $2",
+        )
+        .bind(node.0)
+        .bind(first_staged_at)
+        .bind(tag)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Puts off the pending write of `node` holding the content `sha256` until `until`, without
     /// counting an attempt or recording an error (its content is still being scanned, or a
     /// listing holds its library). Whether the row still holds that content.
@@ -601,6 +745,302 @@ impl Db {
         .fetch_all(self.pool())
         .await?;
         Ok(ids.into_iter().map(NodeId).collect())
+    }
+
+    /// Records that the objects of the bin entry `entry` are held under `root` of `library`
+    /// (`objects` of them), replacing an earlier record of the entry.
+    pub async fn hold_record(
+        &self,
+        entry: NodeId,
+        library: NodeId,
+        root: &str,
+        objects: u64,
+        now: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "insert into source_held (entry_id, library_id, root, objects, held_at, retry_at) \
+             values ($1, $2, $3, $4, $5, null) \
+             on conflict (entry_id) do update set library_id = excluded.library_id, \
+                 root = excluded.root, objects = excluded.objects, \
+                 held_at = excluded.held_at, retry_at = null",
+        )
+        .bind(entry.0)
+        .bind(library.0)
+        .bind(root)
+        .bind(column(objects))
+        .bind(now)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// The hold of the bin entry `entry`, whatever its retry time holds.
+    pub async fn held(&self, entry: NodeId) -> Result<Option<Held>, DbError> {
+        let row = sqlx::query(
+            "select entry_id, library_id, root, objects, held_at, retry_at from source_held \
+             where entry_id = $1",
+        )
+        .bind(entry.0)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.as_ref().map(held_from_row).transpose()?)
+    }
+
+    /// The bin entries `library` holds objects for, oldest hold first.
+    pub async fn held_entries_of(&self, library: NodeId) -> Result<Vec<NodeId>, DbError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select entry_id from source_held where library_id = $1 order by held_at, entry_id",
+        )
+        .bind(library.0)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
+    }
+
+    /// The S3 libraries connected read and write whose writes are not blocked, by id.
+    pub async fn writable_s3_libraries(&self) -> Result<Vec<NodeId>, DbError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select library_id from library_sources \
+             where kind = 's3' and mode = 'read_write' and write_state <> 'blocked' \
+             order by library_id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
+    }
+
+    /// Forgets the hold of `entry`. Whether there was one.
+    pub async fn forget_held(&self, entry: NodeId) -> Result<bool, DbError> {
+        let done = sqlx::query("delete from source_held where entry_id = $1")
+            .bind(entry.0)
+            .execute(self.pool())
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Puts off the next try at releasing the hold of `entry` until `until`. Whether there is
+    /// a hold.
+    pub async fn defer_held(&self, entry: NodeId, until: OffsetDateTime) -> Result<bool, DbError> {
+        let done = sqlx::query("update source_held set retry_at = $2 where entry_id = $1")
+            .bind(entry.0)
+            .bind(until)
+            .execute(self.pool())
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Records that a multipart upload `upload_id` of `key` (for `node`) was started in
+    /// `library`.
+    pub async fn note_multipart(
+        &self,
+        library: NodeId,
+        node: NodeId,
+        key: &str,
+        upload_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "insert into source_multipart (library_id, upload_id, node_id, key, started_at) \
+             values ($1, $2, $3, $4, $5) \
+             on conflict (library_id, upload_id) do update set \
+                 node_id = excluded.node_id, key = excluded.key, started_at = excluded.started_at",
+        )
+        .bind(library.0)
+        .bind(upload_id)
+        .bind(node.0)
+        .bind(key)
+        .bind(now)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Forgets the multipart upload `upload_id` (completed or aborted). Whether there was one.
+    pub async fn forget_multipart(
+        &self,
+        library: NodeId,
+        upload_id: &str,
+    ) -> Result<bool, DbError> {
+        let done =
+            sqlx::query("delete from source_multipart where library_id = $1 and upload_id = $2")
+                .bind(library.0)
+                .bind(upload_id)
+                .execute(self.pool())
+                .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// At most `limit` multipart uploads started before `before`, oldest first.
+    pub async fn stale_multiparts(
+        &self,
+        before: OffsetDateTime,
+        limit: i64,
+    ) -> Result<Vec<OpenMultipart>, DbError> {
+        let rows: Vec<(Uuid, Uuid, String, String, OffsetDateTime)> = sqlx::query_as(
+            "select library_id, node_id, key, upload_id, started_at from source_multipart \
+             where started_at < $1 order by started_at, library_id, upload_id limit $2",
+        )
+        .bind(before)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(library, node, key, upload_id, started_at)| OpenMultipart {
+                    library: NodeId(library),
+                    node: NodeId(node),
+                    key,
+                    upload_id,
+                    started_at,
+                },
+            )
+            .collect())
+    }
+
+    /// How many pending writes of `library` are for `repository_path`, or for anything below it
+    /// when it ends with `/`. The match is literal.
+    pub async fn writes_below(
+        &self,
+        library: NodeId,
+        repository_path: &str,
+    ) -> Result<u64, DbError> {
+        let folder = repository_path.ends_with('/');
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from source_writes where library_id = $1 \
+               and (path = $2 or ($3 and left(path, char_length($2)) = $2))",
+        )
+        .bind(library.0)
+        .bind(repository_path)
+        .bind(folder)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Moves the tracked item `from` of `library` to `to` (both repository paths), and
+    /// everything below it when `from` ends with `/`, in one transaction. Answers how many
+    /// rows changed. Both the repository path and the shown path are rewritten; a shown path
+    /// that does not start with `from` (a case-collision suffix keeps its own tail, so a path
+    /// that does not share the prefix is left as it is). A target already taken is a `DbError`
+    /// and nothing changes.
+    ///
+    /// The pending writes at or below `from` move along in the same transaction (tracked or a
+    /// new file's), after the tracking rows are locked: a save staged while the store's objects
+    /// were being moved is written at the new place. Their base tags are left to
+    /// [`Db::retag_source_item`].
+    pub async fn move_source_items(
+        &self,
+        library: NodeId,
+        from: &str,
+        to: &str,
+    ) -> Result<u64, DbError> {
+        let folder = from.ends_with('/');
+        let mut tx = self.pool().begin().await?;
+        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "select node_id, repository_path, path from source_items \
+             where library_id = $1 \
+               and (repository_path = $2 \
+                    or ($3 and left(repository_path, char_length($2)) = $2)) \
+             order by repository_path for update",
+        )
+        .bind(library.0)
+        .bind(from)
+        .bind(folder)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query(
+            "update source_writes \
+             set path = $4 || substr(path, char_length($2) + 1) \
+             where library_id = $1 \
+               and (path = $2 or ($3 and left(path, char_length($2)) = $2))",
+        )
+        .bind(library.0)
+        .bind(from)
+        .bind(folder)
+        .bind(to)
+        .execute(&mut *tx)
+        .await?;
+        let rebased = |text: &str| -> Option<String> {
+            text.strip_prefix(from).map(|rest| format!("{to}{rest}"))
+        };
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut temps = Vec::with_capacity(rows.len());
+        let mut repository = Vec::with_capacity(rows.len());
+        let mut shown = Vec::with_capacity(rows.len());
+        for (node, old_repository, old_path) in &rows {
+            ids.push(*node);
+            temps.push(format!("\u{1}moving/{node}"));
+            repository.push(rebased(old_repository).unwrap_or_else(|| old_repository.clone()));
+            shown.push(rebased(old_path).unwrap_or_else(|| old_path.clone()));
+        }
+        // Two steps, so rows trading places inside the subtree never meet halfway: the unique
+        // keys are not deferrable. A target taken by a row outside fails the second step, and
+        // the transaction is dropped unfinished.
+        sqlx::query(
+            "update source_items i set repository_path = t.temp, path = t.temp \
+             from unnest($2::uuid[], $3::text[]) as t(id, temp) \
+             where i.library_id = $1 and i.node_id = t.id",
+        )
+        .bind(library.0)
+        .bind(&ids)
+        .bind(&temps)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "update source_items i set repository_path = t.repository, path = t.shown \
+             from unnest($2::uuid[], $3::text[], $4::text[]) as t(id, repository, shown) \
+             where i.library_id = $1 and i.node_id = t.id",
+        )
+        .bind(library.0)
+        .bind(&ids)
+        .bind(&repository)
+        .bind(&shown)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(u64::try_from(rows.len()).unwrap_or(0))
+    }
+
+    /// Records what the store holds for the tracked `node` after ShareCraft moved it inside the
+    /// store: the copy's tag `new_tag`, `size` and modification time, only if `old_tag` is still
+    /// current. The content is the same, so the revision, the content read and its time are
+    /// kept (an editor's base stays valid); the object version read is forgotten, since the
+    /// copy is another object. A pending write of `node` based on `old_tag` is based on
+    /// `new_tag` from now on, in the same transaction: it was made on the same content. Whether
+    /// it changed.
+    pub async fn retag_source_item(
+        &self,
+        node: NodeId,
+        old_tag: &str,
+        new_tag: &str,
+        size: u64,
+        modified: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool().begin().await?;
+        let done = sqlx::query(
+            "update source_items set blob_sha = $3, size = $4, modified_at = $5, \
+                 version_id = null, missing_since = null \
+             where node_id = $1 and blob_sha = $2",
+        )
+        .bind(node.0)
+        .bind(old_tag)
+        .bind(new_tag)
+        .bind(column(size))
+        .bind(modified)
+        .execute(&mut *tx)
+        .await?;
+        if done.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query("update source_writes set base_tag = $3 where node_id = $1 and base_tag = $2")
+            .bind(node.0)
+            .bind(old_tag)
+            .bind(new_tag)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// The tracking row of `node` in its connected library, if it has one.

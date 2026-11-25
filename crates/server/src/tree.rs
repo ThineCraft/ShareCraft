@@ -686,7 +686,10 @@ pub(crate) async fn purge_quarantined(
 
 /// Purges, as the server, every recycle bin entry deleted [`records::BIN_DAYS`] days or more
 /// before `now`, whatever its stage: one entry per tree turn, commit and transaction. Answers
-/// how many it purged; a failure is logged and the entry left for the next sweep.
+/// how many it purged; a failure is logged and the entry left for the next sweep. An entry whose
+/// objects a bucket holds has them deleted first (see
+/// [`crate::source_write::release_held`]); one the bucket could not be asked for is skipped until
+/// its retry time.
 pub async fn purge_due(state: &AppState, now: OffsetDateTime) -> usize {
     let due = match state.db().due_for_purge(now).await {
         Ok(due) => due,
@@ -697,6 +700,25 @@ pub async fn purge_due(state: &AppState, now: OffsetDateTime) -> usize {
     };
     let mut purged = 0;
     for id in due {
+        // What a bucket holds for the entry goes first. While the bucket cannot be reached the
+        // entry waits for its retry time, so an offline bucket is asked once an hour, not at
+        // every sweep.
+        match state.db().held(id).await {
+            Ok(Some(held)) if held.retry_at.is_some_and(|at| at > now) => continue,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("sharecraft-server: database failure: {e}");
+                continue;
+            }
+        }
+        match crate::source_write::release_held(state, id, now).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                eprintln!("sharecraft-server: could not purge node {}: {e:?}", id.0);
+                continue;
+            }
+        }
         let state = state.clone();
         let done = tokio::spawn(async move {
             let _turn = state.tree_lock().lock().await;
@@ -953,6 +975,23 @@ async fn plan_purge_site(
         purge_site: Some(id),
         ..Plan::default()
     })
+}
+
+/// Purges the recycle bin entry `id`, with everything deleted with it, as the server and at any
+/// stage: for something the server itself made and must take back (a copy between libraries
+/// that failed part way), so its bytes are freed and nothing the person did not delete stays
+/// in the bin.
+///
+/// # Errors
+/// `NotFound` unless `id` is in the bin; `OutOfStep` while the tree needs repair; otherwise the
+/// Git or database error.
+pub(crate) async fn purge_now(state: &AppState, id: NodeId) -> Result<(), AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let plan = plan_purge(state, None, id).await?;
+    let done = commit(state, None, plan).await?;
+    erase_released(state, done).await;
+    Ok(())
 }
 
 /// Purges, as the server, every deleted site whose purge a stop interrupted, then every site

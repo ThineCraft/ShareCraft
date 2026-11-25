@@ -59,7 +59,16 @@ const SOURCE_WRITES_PENDING: &str =
     "Some changes are still being saved to the storage. Wait for them, or discard them, first.";
 
 /// The `message` of `409 source_action_unavailable`.
-const SOURCE_ACTION_UNAVAILABLE: &str = "This cannot be done yet in a library stored in S3. Uploading files, saving and making folders work; renaming, moving, copying and deleting come later.";
+const SOURCE_ACTION_UNAVAILABLE: &str = "This cannot be done yet in a library stored in S3.";
+
+/// The `message` of `409 source_item_saving`.
+const SOURCE_ITEM_SAVING: &str = "This is still being saved to the storage. Try again when saving has finished, or discard the save that failed.";
+
+/// The `message` of `409 source_too_large_to_move`.
+const SOURCE_TOO_LARGE_TO_MOVE: &str = "Files over 5 GiB in S3 storage cannot be renamed, moved, copied or deleted from ShareCraft yet.";
+
+/// The `message` of `409 source_changed`.
+const SOURCE_CHANGED: &str = "This changed in the storage since ShareCraft last looked. ShareCraft is checking it again; try again in a minute.";
 
 /// The `message` of `409 source_write_blocked`.
 const SOURCE_WRITE_BLOCKED: &str = "This library is read-only until its storage accepts changes again. Its files can still be opened.";
@@ -445,11 +454,29 @@ pub(crate) enum ApiError {
     /// 409: changes to the library's store are accepted but not yet written, so it is not
     /// disconnected or made read-only yet.
     SourceWritesPending,
-    /// 409: a read-and-write S3 library does not take this action yet (rename, move, copy in,
-    /// delete, restore, a blank file, a file from a template).
+    /// 409: a read-and-write S3 library does not take this action yet (a blank file, a file
+    /// from a template, a move between libraries, and what later slices bring).
     SourceActionUnavailable,
+    /// 409: a folder holds more objects in the bucket than one rename, move, copy or delete
+    /// touches; the answer's `count` says how many it holds.
+    SourceTooManyObjects(u64),
+    /// 409: the item, or something inside the folder, has a change not yet written to the
+    /// bucket (saving or failed).
+    SourceItemSaving,
+    /// 409: an object is larger than one copy in the bucket moves (5 GiB).
+    SourceTooLargeToMove,
+    /// 409: the bucket no longer holds what ShareCraft recorded; a listing is woken.
+    SourceChanged,
     /// 409: the read-and-write library is read-only until its storage accepts changes again.
     SourceWriteBlocked,
+    /// A copy into a read-and-write S3 library that stopped part way: `made` files and folders
+    /// were made (and their files staged, so they are written), the rest were not. Answered with
+    /// the status and code of what stopped it, and `made`.
+    SourceCopyIncomplete {
+        made: u64,
+        status: StatusCode,
+        code: &'static str,
+    },
     /// 422: the write probe found that the access key may read the bucket but not write to it.
     S3NotWritable,
     /// 403: only an administrator may make a library read and write.
@@ -584,7 +611,7 @@ impl ApiError {
         self.status_and_code().1
     }
 
-    fn status_and_code(self) -> (StatusCode, &'static str) {
+    pub(crate) fn status_and_code(self) -> (StatusCode, &'static str) {
         match self {
             ApiError::BadRequest => (StatusCode::BAD_REQUEST, "bad_request"),
             ApiError::NotSignedIn => (StatusCode::UNAUTHORIZED, "not_signed_in"),
@@ -645,6 +672,11 @@ impl ApiError {
             ApiError::SourceActionUnavailable => {
                 (StatusCode::CONFLICT, "source_action_unavailable")
             }
+            ApiError::SourceTooManyObjects(_) => (StatusCode::CONFLICT, "source_too_many_objects"),
+            ApiError::SourceItemSaving => (StatusCode::CONFLICT, "source_item_saving"),
+            ApiError::SourceTooLargeToMove => (StatusCode::CONFLICT, "source_too_large_to_move"),
+            ApiError::SourceChanged => (StatusCode::CONFLICT, "source_changed"),
+            ApiError::SourceCopyIncomplete { status, code, .. } => (status, code),
             ApiError::SourceWriteBlocked => (StatusCode::CONFLICT, "source_write_blocked"),
             ApiError::S3NotWritable => (StatusCode::UNPROCESSABLE_ENTITY, "s3_not_writable"),
             ApiError::ReadWriteAdminOnly => (StatusCode::FORBIDDEN, "read_write_admin_only"),
@@ -990,6 +1022,21 @@ impl IntoResponse for ApiError {
             ApiError::SourceWriteBlocked => {
                 json!({ "error": code, "message": SOURCE_WRITE_BLOCKED })
             }
+            ApiError::SourceTooManyObjects(count) => json!({
+                "error": code,
+                "count": count,
+                "message": crate::source_write::too_many_sentence(count),
+            }),
+            ApiError::SourceItemSaving => json!({ "error": code, "message": SOURCE_ITEM_SAVING }),
+            ApiError::SourceTooLargeToMove => {
+                json!({ "error": code, "message": SOURCE_TOO_LARGE_TO_MOVE })
+            }
+            ApiError::SourceChanged => json!({ "error": code, "message": SOURCE_CHANGED }),
+            ApiError::SourceCopyIncomplete { made, .. } => json!({
+                "error": code,
+                "made": made,
+                "message": copy_incomplete_message(made),
+            }),
             ApiError::S3NotWritable => json!({ "error": code, "message": S3_NOT_WRITABLE }),
             ApiError::ReadWriteAdminOnly => {
                 json!({ "error": code, "message": READ_WRITE_ADMIN_ONLY })
@@ -1012,7 +1059,7 @@ impl IntoResponse for ApiError {
             }),
             ApiError::SourceBusy => json!({
                 "error": code,
-                "message": "A sync is running; try again in a moment.",
+                "message": "ShareCraft is busy with this library's storage. Try again in a moment.",
             }),
             ApiError::BranchNotFound => json!({
                 "error": code,
@@ -1028,7 +1075,21 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// The plain sentence for a file over the limit of one write to S3 storage: `limit` is said
+/// The plain sentence for a copy into S3 storage that stopped after `made` items.
+fn copy_incomplete_message(made: u64) -> String {
+    if made == 1 {
+        return "The copy stopped part way: 1 item was copied and is being saved to the storage; \
+                the rest were not copied."
+            .to_owned();
+    }
+    format!(
+        "The copy stopped part way: {} items were copied and are being saved to the storage; \
+         the rest were not copied.",
+        crate::source_write::thousands(made)
+    )
+}
+
+/// The plain sentence for a file over the limit of a write to S3 storage: `limit` is said
 /// in the largest unit that holds it exactly (`512 MiB`, `2 KiB`, or bytes).
 fn source_file_too_large_message(limit: u64) -> String {
     const KIB: u64 = 1024;
@@ -1043,7 +1104,7 @@ fn source_file_too_large_message(limit: u64) -> String {
     } else {
         format!("{limit} bytes")
     };
-    format!("Files over {words} cannot be saved to S3 storage yet.")
+    format!("Files over {words} cannot be saved to this S3 storage.")
 }
 
 /// The plain sentence for a failed probe of a bucket. Never the store's own text.
@@ -1163,15 +1224,15 @@ mod tests {
         use super::source_file_too_large_message as words;
         assert_eq!(
             words(512 * 1024 * 1024),
-            "Files over 512 MiB cannot be saved to S3 storage yet."
+            "Files over 512 MiB cannot be saved to this S3 storage."
         );
         assert_eq!(
             words(2048),
-            "Files over 2 KiB cannot be saved to S3 storage yet."
+            "Files over 2 KiB cannot be saved to this S3 storage."
         );
         assert_eq!(
             words(10),
-            "Files over 10 bytes cannot be saved to S3 storage yet."
+            "Files over 10 bytes cannot be saved to this S3 storage."
         );
     }
 

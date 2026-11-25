@@ -429,7 +429,7 @@ pub(crate) async fn start(
             let (name, editor, from) = clean_upload_name(&asked)?;
             renamed = from;
             // Into a bucket the name must make a key the bucket takes and the listing shows,
-            // and the file must fit one write.
+            // and the file must be within the bucket's write limit.
             let external = matches!(place, Place::External(_));
             if external {
                 external_path(&state, parent, &name).await?;
@@ -631,8 +631,8 @@ async fn place_asked(
     Some(writable_place(state.db(), user, node).await)
 }
 
-/// `413 source_file_too_large` when a file of `size` bytes does not fit one write to a bucket:
-/// the limit is said in words.
+/// `413 source_file_too_large` when a file of `size` bytes is over the write limit of a bucket
+/// (see [`write_limit`]): the limit is said in words.
 async fn refuse_over_limit(state: &AppState, size: u64) -> Result<(), ApiError> {
     let limit = write_limit(state)
         .await

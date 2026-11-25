@@ -47,7 +47,6 @@ const JPEG: &[u8] = include_bytes!("fixtures/images/gradient.jpg");
 const BUDGET_MESSAGE: &str = "This library has used its request budget for the month. Files opened before still open; a library owner can raise the budget.";
 const ARCHIVED_MESSAGE: &str =
     "This file is in archive storage and must be restored there before it can be opened.";
-const COPY_MESSAGE: &str = "Files in this library are read from outside storage when opened and cannot be copied here yet. Download the file instead.";
 
 struct Env {
     server: TestServer,
@@ -569,7 +568,7 @@ async fn a_person_without_access_gets_404_and_the_store_is_not_contacted() {
 }
 
 #[tokio::test]
-async fn copying_an_s3_file_is_refused_and_copying_out_of_github_still_works() {
+async fn copying_out_of_s3_and_out_of_github_works() {
     let env = Env::new(&[("folder/file.txt", b"copy")]).await;
     let item = env.item("folder/file.txt").await;
     let folder = env
@@ -580,22 +579,8 @@ async fn copying_an_s3_file_is_refused_and_copying_out_of_github_still_works() {
         .unwrap()
         .parent
         .unwrap();
-    for node in [item.node, folder] {
-        let (status, body) = body_json(
-            env.server
-                .http(Some(&env.admin))
-                .post(env.server.url(&format!("/api/nodes/{}/copy", node.0)))
-                .json(&json!({ "parent": env.ordinary.0.to_string() }))
-                .send()
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body["error"], "source_copy_unavailable");
-        assert_eq!(body["message"], COPY_MESSAGE, "{body}");
-    }
-    let (_, body) = body_json(
+    // Out of S3, in bulk and alone: ordinary copies of the bytes (see `s3_copy.rs`).
+    let (status, body) = body_json(
         env.server
             .http(Some(&env.admin))
             .post(env.server.url("/api/bulk"))
@@ -609,7 +594,19 @@ async fn copying_an_s3_file_is_refused_and_copying_out_of_github_still_works() {
             .unwrap(),
     )
     .await;
-    assert_eq!(body[0]["error"], "source_copy_unavailable");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["ok"], true, "{body}");
+    let (status, body) = body_json(
+        env.server
+            .http(Some(&env.admin))
+            .post(env.server.url(&format!("/api/nodes/{}/copy", folder.0)))
+            .json(&json!({ "parent": env.ordinary.0.to_string() }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 
     let github = start_fake_github("copy-owner", "copy-repo").await;
     github.commit("main", &[("github.txt", b"github".to_vec())]);

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   sourceAccess,
   sourceControlsEnabled,
@@ -26,6 +27,10 @@ import {
   readWriteAdminOnlyText,
   sourceWriteErrorText,
   mayResolve,
+  leftBehindText,
+  moveStaysInLibrary,
+  moveAcrossLibrariesText,
+  blockedText,
 } from './source-panel.js';
 
 test('shouldReload follows a changed commit or a completed update', () => {
@@ -258,9 +263,11 @@ test('validPrefix accepts an empty or plain folder and refuses unsafe ones', () 
 const WRITABLE = { kind: 's3', state: 'ok', mode: 'read_write', write_state: 'ok', last_checked_at: '2026-11-17T14:20:00Z' };
 const NONE = { add: false, folder: false, rename: false, move: false, remove: false, copy: false };
 
-test('sourceActions allows adding and folders only in a writable, unblocked S3 library', () => {
-  assert.deepEqual(sourceActions('connected', WRITABLE), { ...NONE, add: true, folder: true });
-  assert.deepEqual(sourceActions('connected', { ...WRITABLE, state: 'syncing' }), { ...NONE, add: true, folder: true });
+const ALL = { add: true, folder: true, rename: true, move: true, remove: true, copy: true };
+
+test('sourceActions allows add, folder, rename, move, remove and copy in a writable, unblocked S3 library', () => {
+  assert.deepEqual(sourceActions('connected', WRITABLE), ALL);
+  assert.deepEqual(sourceActions('connected', { ...WRITABLE, state: 'syncing' }), ALL);
 });
 
 test('sourceActions refuses everything in read-only, blocked, GitHub, share and unknown sources', () => {
@@ -289,7 +296,7 @@ test('sourceSummary for a writable library says changes are saved to the bucket'
 test('sourceSummary for a blocked writable library says read-only until fixed and why', () => {
   const blocked = { ...WRITABLE, write_state: 'blocked', write_error: 'The storage refused a save: the key may not write.' };
   assert.deepEqual(sourceSummary(blocked, NOW), {
-    headline: 'Read-only until fixed: the storage refused a change.',
+    headline: 'Read-only until fixed.',
     detail: 'The storage refused a save: the key may not write.',
     tone: 'attention',
   });
@@ -297,6 +304,19 @@ test('sourceSummary for a blocked writable library says read-only until fixed an
     sourceSummary({ ...blocked, write_error: null }, NOW).detail,
     'Nothing more is known. Try again from the library settings.',
   );
+});
+
+test('the blocked text names the refusal once', () => {
+  const blocked = { ...WRITABLE, write_state: 'blocked', write_error: 'The storage refused a change with this access key.' };
+  const summary = sourceSummary(blocked, NOW);
+  const banner = `${summary.headline} ${summary.detail}`;
+  assert.equal(banner, 'Read-only until fixed. The storage refused a change with this access key.');
+  assert.equal(blockedText(blocked), banner);
+  assert.equal(
+    blockedText({ ...blocked, write_error: null }),
+    'Read-only until fixed. Nothing more is known. Try again from the library settings.',
+  );
+  for (const text of [banner, blockedText(blocked)]) assert.equal(text.match(/refused/g).length, 1);
 });
 
 test('a read-only S3 library keeps its read-only wording', () => {
@@ -338,14 +358,9 @@ test('discardQuestion asks differently for a new file', () => {
 });
 
 test('the write error texts are plain sentences', () => {
-  assert.equal(
-    sourceActionUnavailableText(),
-    'This change is not available in a library stored in S3 yet. You can add files and folders.',
-  );
-  assert.equal(
-    sourceFileTooLargeText(512 * 1024 * 1024),
-    'This file is larger than the 512.0 MB a library stored in S3 takes. Nothing was stored.',
-  );
+  assert.equal(sourceActionUnavailableText(), 'This cannot be done yet in a library stored in S3.');
+  assert.equal(sourceFileTooLargeText(512 * 1024 * 1024), 'Files over 512 MiB cannot be saved to this S3 storage.');
+  assert.equal(sourceFileTooLargeText(5 * 1024 ** 3), 'Files over 5 GiB cannot be saved to this S3 storage.');
   assert.equal(sourceFileTooLargeText(undefined), 'This file is larger than a library stored in S3 takes. Nothing was stored.');
   assert.equal(
     sourceWriteBlockedText(),
@@ -368,6 +383,55 @@ test('sourceWriteErrorText maps the new codes and leaves others empty', () => {
     'Some changes are still being saved to the bucket. Wait until they are saved or discarded, then try again.',
   );
   assert.equal(sourceWriteErrorText('not_found'), '');
+});
+
+test('sourceWriteErrorText knows the structure codes and shows the server message', () => {
+  const sayings = {
+    source_too_many_objects:
+      'This folder holds 1,500 objects in the bucket. ShareCraft renames, moves, copies or deletes at most 1,000 at a time.',
+    source_item_saving:
+      'This is still being saved to the storage. Try again when saving has finished, or discard the save that failed.',
+    source_too_large_to_move:
+      'Files over 5 GiB in S3 storage cannot be renamed, moved, copied or deleted from ShareCraft yet.',
+    source_changed:
+      'This changed in the storage since ShareCraft last looked. ShareCraft is checking it again; try again in a minute.',
+    source_copy_incomplete:
+      'The copy stopped part way: 2 items were copied and are being saved to the storage; the rest were not copied.',
+  };
+  for (const [code, message] of Object.entries(sayings)) {
+    assert.equal(sourceWriteErrorText(code, { error: code, message }), message, code);
+    // Without a server message the page still says something plain.
+    assert.notEqual(sourceWriteErrorText(code, {}), '', code);
+    assert.notEqual(sourceWriteErrorText(code), '', code);
+  }
+  assert.equal(sourceWriteErrorText('source_too_many_objects', { count: 1500 }), sayings.source_too_many_objects);
+  assert.equal(
+    sourceWriteErrorText('source_action_unavailable', { message: 'This cannot be done yet in a library stored in S3.' }),
+    'This cannot be done yet in a library stored in S3.',
+  );
+  const archived = 'This file is in archive storage and must be restored there before it can be opened.';
+  assert.equal(sourceWriteErrorText('source_unavailable', { reason: 'archived', message: archived }), archived);
+  // Other reasons of source_unavailable are not this module's to word.
+  assert.equal(sourceWriteErrorText('source_unavailable', { reason: 'gone', message: 'x' }), '');
+});
+
+test('left_behind has its own sentence', () => {
+  const text = (n) =>
+    `Done. ${n} of the original objects could not be removed from the bucket; they will show up as separate files until someone removes them.`;
+  assert.equal(leftBehindText({ left_behind: 3 }), text(3));
+  assert.equal(sourceWriteErrorText('left_behind', { left_behind: 2 }), text(2));
+  assert.equal(leftBehindText({ left_behind: 0 }), '');
+  assert.equal(leftBehindText({}), '');
+  assert.equal(leftBehindText(null), '');
+});
+
+test('a move stays inside its S3 library, and says why when it would leave', () => {
+  assert.equal(moveStaysInLibrary(WRITABLE, 'lib1', [{ id: 's' }, { id: 'lib1' }, { id: 'f' }]), true);
+  assert.equal(moveStaysInLibrary(WRITABLE, 'lib1', [{ id: 's' }, { id: 'lib2' }]), false);
+  assert.equal(moveStaysInLibrary(WRITABLE, 'lib1', []), false);
+  assert.equal(moveStaysInLibrary(null, 'lib1', [{ id: 'lib2' }]), true);
+  assert.equal(moveStaysInLibrary({ repository: 'o/r' }, 'lib1', [{ id: 'lib2' }]), true);
+  assert.match(moveAcrossLibrariesText(), /between libraries/);
 });
 
 test('modeSwitchText offers only the switch the person may make', () => {
@@ -393,6 +457,15 @@ test('overwriteNote shows for conditional no or unknown and for nothing else', (
   assert.equal(overwriteNote('unknown'), overwriteNote('no'));
   assert.equal(overwriteNote(undefined), '');
   assert.equal(overwriteNote(null), '');
+});
+
+test('the new-library note is read with the link that takes the focus', () => {
+  // The note is revealed by un-hiding a status region, which a screen reader may not announce,
+  // and the focus then moves to the link: the link names the note as its description.
+  const html = readFileSync(new URL('./site.html', import.meta.url), 'utf8');
+  const link = html.match(/<a [^>]*id="new-library-open"[^>]*>/)?.[0] ?? '';
+  assert.match(link, /aria-describedby="new-library-note"/);
+  assert.match(html, /<p id="new-library-note"/);
 });
 
 test('mayResolve is true only when the server said the person may Retry or Discard', () => {

@@ -33,7 +33,7 @@ import { relativeTime } from './files.js';
 import { libraryCardModel, libraryIcon, ownerChip, recentAcrossLibraries, recentIcon } from './site-home.js';
 import { checklistModel, readWelcome, showChecklist, unsetParts, unsetText, writeWelcome } from './new-site.js';
 import { settle, settleAll } from './skeleton.js';
-import { sourceWriteErrorText, validBucket, validPrefix, validRepository } from './source-panel.js';
+import { overwriteNote, sourceWriteErrorText, validBucket, validPrefix, validRepository } from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -317,9 +317,18 @@ async function showS3LibraryFields() {
 /** Only an administrator is offered the choice of read and write; others connect read-only. */
 function showS3ModeChoice() {
   $('s3-mode-set').hidden = !(me.is_admin === true && s3LibraryChosen());
+  showS3ModeNote();
+}
+
+/** The charge sentence is said only while Read and write is chosen; Read only says what it does. */
+function showS3ModeNote() {
+  $('s3-mode-note').textContent = s3Mode() === 'read_write'
+    ? 'What people add and change here is saved in the bucket, and your provider may charge for each change.'
+    : 'ShareCraft only reads from the bucket.';
 }
 
 const s3Mode = () => (me.is_admin === true ? document.querySelector('input[name="s3-mode"]:checked')?.value : null) ?? 'read_only';
+for (const choice of document.querySelectorAll('input[name="s3-mode"]')) choice.addEventListener('change', showS3ModeNote);
 
 /** The sentence for a refused S3 library, in place. */
 function s3ErrorText(result) {
@@ -431,7 +440,20 @@ async function createS3Library(name, say) {
   delete body.secret_access_key;
   updateSubmitState();
   if (result.ok) {
-    location.assign(pageFor('library', result.data.id));
+    // A storage that cannot refuse a conflicting save is told to the person before they go on.
+    const note = body.mode === 'read_write' && result.data?.source?.conditional !== 'yes'
+      ? overwriteNote(result.data?.source?.conditional)
+      : '';
+    if (note === '') {
+      location.assign(pageFor('library', result.data.id));
+      return;
+    }
+    $('new-library-note').textContent = `The library was created. ${note}`;
+    $('new-library-open').href = pageFor('library', result.data.id);
+    $('new-library-done').hidden = false;
+    $('new-library-submit').hidden = true;
+    $('new-library-cancel').hidden = true;
+    $('new-library-open').focus();
     return;
   }
   const field = result.data?.reason === 'prefix' ? prefixField : result.data?.reason === 'bucket' ? bucketField : null;
@@ -443,6 +465,7 @@ async function createS3Library(name, say) {
 $('s3-readonly-instead').addEventListener('click', () => {
   document.querySelector('input[name="s3-mode"][value="read_only"]').checked = true;
   $('s3-readonly-row').hidden = true;
+  showS3ModeNote();
   showMessage($('new-library-error'), 'Read only is chosen. Retype the secret access key, then create the library.');
   $('s3-secret').focus();
 });
@@ -467,6 +490,9 @@ function newLibraryCard() {
     $('s3-readonly-row').hidden = true;
     showS3ModeChoice();
     showMessage($('new-library-error'), '');
+    $('new-library-done').hidden = true;
+    $('new-library-submit').hidden = false;
+    $('new-library-cancel').hidden = false;
     openDialog($('new-library-dialog'), $('library-name'), button);
   });
   newLibraryButton = button;

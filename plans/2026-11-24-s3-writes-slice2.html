@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S3 writes slice 2</title>
+<style>
+:root{--bg:#fff;--fg:#1d1d1f;--muted:#5f6368;--line:#d9dce1;--band:#f3f5f8;--head:#e8ecf2;--accent:#0b57d0;--card:#fafbfc;--code:#eef1f5}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e8eaed;--muted:#a0a6ad;--line:#33373d;--band:#1f2228;--head:#262a31;--accent:#8ab4f8;--card:#1b1e23;--code:#23272e}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:900px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.6rem;margin:0 0 4px}h2{font-size:1.25rem;margin:36px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
+h3{font-size:1.08rem;margin:0 0 8px}h4{font-size:.98rem;margin:14px 0 6px}
+p{margin:0 0 12px}p.sub{color:var(--muted);margin:0 0 16px}
+a{color:var(--accent)}
+.scroll{position:relative;overflow-x:auto;margin:0 0 16px}
+table{border-collapse:collapse;width:100%;min-width:520px}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{background:var(--head)}
+tbody tr:nth-child(even){background:var(--band)}
+ul,ol{padding-left:1.3em;margin:0 0 12px}li{margin-bottom:5px}
+ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:var(--band);border-radius:4px}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:var(--code);padding:1px 4px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:10px 12px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}
+pre code{background:none;padding:0;font-size:inherit;overflow-wrap:normal}
+.task{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:14px 16px 6px;margin:20px 0}
+.note{border-left:4px solid var(--accent);background:var(--card);padding:10px 14px;margin:0 0 14px}
+.note p:last-child{margin:0}
+.small{font-size:.9rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+<h1>Editable S3 storage, slice 2: task cards</h1>
+<p class="sub">Implementation plan, 24 November 2026. Branch <code>s3-writes-2</code> in <code>H:\Source\repos\ThineCraft\ShareCraft-s3w</code>, cut from main 7255f63 (slice 1 merged). The scope is <a href="2026-11-24-s3-editable-scope.html">2026-11-24-s3-editable-scope.html</a>; its "Slice 2" rows are binding. Slice 1's plan is <a href="2026-11-24-s3-writes-slice1.html">2026-11-24-s3-writes-slice1.html</a>. Nothing below is built yet.</p>
+
+<div class="note">
+<p><b>What slice 2 adds.</b> Slice 2 adds:</p>
+<ul>
+<li>rename and move;</li>
+<li>delete into a hidden holding folder in the bucket, with Restore, Purge and the 93-day sweep;</li>
+<li>copy, on the server side inside a bucket and between libraries;</li>
+<li>multipart uploads for files over 512 MiB;</li>
+<li>the warning for stores that ignore conditional writes;</li>
+<li>five small things left over from slice 1.</li>
+</ul>
+<p>It keeps slice 1's shape: shared rules go in <code>source_write.rs</code> and <code>records</code>, and every bucket change goes in <code>s3_write.rs</code>. The old S3 plan's Phase 2 cards (<a href="2026-11-18-s3-surfacing.html">2026-11-18-s3-surfacing.html</a>, Tasks 20 to 27) sometimes disagree with today's code. Where they do, the cards below follow the code.</p>
+</div>
+
+<h2>Contents</h2>
+<div class="scroll"><table>
+<thead><tr><th>Task</th><th>What it builds</th><th>Needs</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Records: holding and multipart tables, moving tracked paths</td><td>-</td></tr>
+<tr><td>2</td><td>Client: copy and multipart calls, the fake's copy and multipart half, the quiet 404</td><td>-</td></tr>
+<tr><td>3</td><td>Bucket moves: move, copy, hold, unhold, delete held, sweep the holding folder</td><td>2</td></tr>
+<tr><td>4</td><td>Rename and move in an S3 library</td><td>1, 3</td></tr>
+<tr><td>5</td><td>Delete, Restore, Purge and the 93-day sweep</td><td>1, 3</td></tr>
+<tr><td>6</td><td>Copy inside an S3 library</td><td>3, 4</td></tr>
+<tr><td>7</td><td>Copy between libraries</td><td>6</td></tr>
+<tr><td>8</td><td>Multipart uploads over 512 MiB, and cancelling abandoned ones</td><td>1, 2, 5</td></tr>
+<tr><td>9</td><td>Editor saves reach the bucket when the last person leaves</td><td>-</td></tr>
+<tr><td>10</td><td>Pages</td><td>4 to 9</td></tr>
+<tr><td>11</td><td>Whole-slice review and one fix wave</td><td>1 to 10</td></tr>
+<tr><td>12</td><td>Live check on the owner's R2 bucket (controller)</td><td>11, owner's yes</td></tr>
+<tr><td>13</td><td>The records: BUILDING, scope, sequencing</td><td>12</td></tr>
+</tbody></table></div>
+
+<h2>Rulings already made</h2>
+<ul class="band">
+<li><b>Structure changes are synchronous.</b> Rename, move, delete, restore and copy inside a bucket run in the request, under the library's source lock, bucket first and tree second, the way slice 1's <code>create_folder</code> does. They do not go through <code>source_writes</code>. Cost if wrong: a 1,000-object folder holds the request for a minute or two; a queue can replace it later.</li>
+<li><b>At most 1,000 objects in one step</b> (<code>MOVE_MAX_OBJECTS</code>). A folder holding more is refused before anything is changed, with the count. Folder marker objects count.</li>
+<li><b>Copies before deletes.</b> Every move and hold copies every object first. A failed copy deletes the copies it already made and changes nothing else. A failed delete after all copies succeeded still finishes the tree change: the originals left behind are reported as "left behind" and come back as new files at the next listing. Nothing is ever lost; at worst something is duplicated.</li>
+<li><b>Never move or hold content that changed outside.</b> Before each file is copied, a HEAD checks it against the tag ShareCraft recorded, and the copy carries <code>x-amz-copy-source-if-match</code> on that ETag. A mismatch refuses the whole step (<code>WriteError::Changed</code>) and wakes a listing.</li>
+<li><b>Files over 5 GiB.</b> CopyObject stops at 5 GiB, and slice 2 does not build part-by-part copy. Such objects cannot be renamed, moved, copied or deleted from ShareCraft (<code>source_too_large_to_move</code>). Uploads to S3 are capped at 5 GiB for the same reason, so everything ShareCraft writes can be moved.</li>
+<li><b>Busy files.</b> A file with a pending write (saving or failed), or a folder with such a file anywhere inside it, cannot be renamed, moved, deleted or copied from (<code>source_item_saving</code>). The person waits, or discards the failed save. Repathing queued writes is not built.</li>
+<li><b>Names.</b> A name taken ignoring case is refused (<code>name_taken</code>), not numbered, for rename, move and copy. Slice 1 does the same for new folders. Restore is the exception: it takes a numbered name, as the ordinary bin does.</li>
+<li><b>The holding folder.</b>
+<ul>
+<li>Deleted content goes to <code>&lt;prefix&gt;.sharecraft-bin/&lt;YYYY-MM-DD&gt;/&lt;bin entry id&gt;/&lt;library-relative path&gt;</code>, using the UTC date of the delete.</li>
+<li>The bin entry keeps its ordinary rows, and a new <code>source_held</code> row names the held root.</li>
+<li>Purge and the 93-day purge delete the held objects first. If the library is read-only by then, nothing is written: the entry is purged, the objects stay, and an event says so.</li>
+<li>Disconnecting a library drops its <code>source_held</code> rows and leaves the objects.</li>
+</ul></li>
+<li><b>The holding sweep.</b> It runs once a day for each read-and-write S3 library. It deletes only objects under <code>&lt;prefix&gt;.sharecraft-bin/</code> whose date folder is more than 94 days old and whose entry id no <code>source_held</code> row names. It never deletes anything else.</li>
+<li><b>Copy between libraries</b> goes through ShareCraft:
+<ul>
+<li>Out of S3, it reads the bytes (<code>external::materialise</code>) and makes ordinary files, which count against the destination site's quota.</li>
+<li>Into a writable S3 library, it creates the nodes and stages one write per file, so the scan gate and the 30-second worker apply.</li>
+<li>From one S3 library to another, it does both.</li>
+</ul>
+Moving between libraries stays refused.</li>
+<li><b>Multipart.</b>
+<ul>
+<li>Above <code>S3::single_put_max()</code> (512 MiB), the worker writes in 64 MiB parts (settable for tests), each read from the staged file at an offset.</li>
+<li>Each part is signed with its own SHA-256, and the condition goes on the completion.</li>
+<li>A <code>source_multipart</code> row is written before the upload starts and removed when the upload completes or is aborted. Any failure after the start aborts.</li>
+<li>The sweep aborts rows older than a day, which only a crash leaves behind. There is no bucket listing of uploads.</li>
+</ul></li>
+<li><b>The upload limit</b> for an S3 library becomes <code>min(5 GiB, config.max_file_bytes, cache_max_bytes / 2)</code>.</li>
+<li><b>Still refused in S3 libraries</b> (409 <code>source_action_unavailable</code>, with a reworded message): new blank file, new from template, and moving between libraries.</li>
+<li><b>Restore and Purge in a read-only or blocked library.</b> Restore is refused (<code>source_read_only</code> or <code>source_write_blocked</code>). Purge goes ahead and leaves the held objects, as in the holding-folder rule above.</li>
+<li><b>Requests are counted</b> by the existing meter (class <code>Write</code>; copies count zero bytes, parts count their bytes). Nothing caps them, as in slice 1.</li>
+<li><b>Editor saves flush when the room empties</b>, not 60 seconds later when the file session ends.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li>Rust 2024. Workspace lints deny <code>unwrap_used</code>, <code>expect_used</code>, <code>panic</code> and <code>indexing_slicing</code>; <code>unsafe</code> is forbidden. Test files start with <code>#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]</code>.</li>
+<li>No new crates: <code>git diff 7255f63 -- Cargo.lock</code> shows no added package. Revert any lock churn.</li>
+<li>OS TLS only, and https only, except <code>Config::s3_plain_loopback</code> in tests.</li>
+<li>Migration <code>0026</code> only. Never edit an applied migration. LF line endings.</li>
+<li>The secret key never reaches Git, an event, a log, an error, <code>Debug</code>, a URL or an API answer.</li>
+<li>Events carry only counts, node ids and library-relative paths. API messages are plain sentences of at most 300 characters. Store error text reaches the log only as its <code>Code</code>.</li>
+<li>Every bucket change goes through <code>s3_write.rs</code>. A read-only library is never written. Nothing outside the library's prefix is written; the holding folder is inside it by construction.</li>
+<li>Never overwrite or move an outside change knowingly. Never drop an accepted save silently. Never write before the scan gate. Never delete an original before its copy is confirmed.</li>
+<li>No real endpoint is called, except by the controller in Task 12, after the owner's yes.</li>
+<li>Pages: plain HTML and JS in <code>web/</code>, with no build step. They work in light and dark, at 375 px, by keyboard and by screen reader, and show nothing by colour alone. Tables and long lists use alternating row shading.</li>
+<li>Documents are HTML, never Markdown.</li>
+<li>Commits end with <code>Co-Authored-By: Claude Opus 5.5 &lt;noreply@anthropic.com&gt;</code>. Implementers run no git command that changes anything; the controller commits exactly the files the report names. Nothing is merged or pushed without the owner.</li>
+<li>Any new route is added to <code>ROUTES</code> in <code>crates/server/tests/source_readonly.rs</code> with its S3 decision, and changed decisions are updated there.</li>
+<li>Tests drive <code>now</code>; there are no wall-clock sleeps.</li>
+</ul>
+
+<h2>How this plan is executed</h2>
+<p>As in slice 1: subagent-driven, with one implementer and one read-only reviewer per card, and fix rounds up to five. The ledger is <code>.superpowers/sdd/2026-11-24-s3-writes-slice2.html/progress.md</code>. Reports go beside it as <code>task-N-report.md</code>, with the first line <code>Status: done|stopped</code>.</p>
+<p><b>Commands</b> (PowerShell):</p>
+<ul>
+<li>Set up: <code>$env:CARGO_TARGET_DIR='J:\cargo-target\sharecraft-s3w'; $env:CARGO_INCREMENTAL='0'</code>, then load <code>.env</code> without printing it.</li>
+<li>Records tests: <code>cargo test -j 3 -p records --test &lt;name&gt;</code></li>
+<li>Server tests: <code>cargo test -j 3 -p server --test &lt;name&gt; -- --test-threads=1</code></li>
+<li>Lints and format: <code>cargo clippy -j 3 -p records -p server --all-targets</code>, then <code>cargo fmt --all</code></li>
+<li>Page tests: <code>node --test web/</code></li>
+</ul>
+<p>Use at most 3 jobs and one test binary at a time, and never <code>cargo xtask test</code>. The full run is GitHub's <code>check.yml</code>, after the owner approves a push.</p>
+<p><b>Seams every card allows</b>:</p>
+<ul>
+<li><code>crates/server/tests/common/*.rs</code>, including new fake faults and counters;</li>
+<li><code>set_*_for_tests</code> setters;</li>
+<li>new <code>ApiError</code>, <code>AccessError</code> and <code>WriteError</code> variants;</li>
+<li>new fields on structs that tests construct.</li>
+</ul>
+
+<h2>Shared types</h2>
+<pre><code>// crates/records/src/source_writes.rs (Task 1)
+pub struct Held { pub entry: NodeId, pub library: NodeId, pub root: String /* library-relative, ends '/' */,
+                  pub objects: u64, pub held_at: OffsetDateTime, pub retry_at: Option&lt;OffsetDateTime&gt; }
+pub struct OpenMultipart { pub library: NodeId, pub node: NodeId, pub key: String,
+                           pub upload_id: String, pub started_at: OffsetDateTime }
+
+// crates/server/src/source_write.rs (Task 3 adds the last three variants)
+pub enum WriteError { Denied, Offline, NameTaken, Gone, NoSpace, TooLarge, Failed,
+                      TooMany(u64), TooLargeToMove, Changed }
+
+// crates/server/src/s3_write.rs (Task 3)
+pub const MOVE_MAX_OBJECTS: u64 = 1_000;
+pub struct Moved { pub objects: u64, pub left_behind: u64,
+                   pub seen: Vec&lt;(String /* destination relative path */, Seen)&gt; }
+
+// crates/server/src/s3.rs (Task 2)
+pub const COPY_MAX: u64 = 5 * 1024 * 1024 * 1024;
+pub const PART_BYTES: u64 = 64 * 1024 * 1024;   // held in an AtomicU64, settable for tests
+pub const MAX_PARTS: u64 = 10_000;
+pub struct PartBody { pub path: PathBuf, pub offset: u64, pub len: u64, pub sha256: [u8; 32] }</code></pre>
+<p><b>New and reworded API errors</b>. Each answers JSON <code>{error, message}</code>, plus any field named in the first column.</p>
+<div class="scroll"><table>
+<thead><tr><th>Code</th><th>Status</th><th>Message</th></tr></thead>
+<tbody>
+<tr><td><code>source_too_many_objects</code> (+ <code>count</code>)</td><td>409</td><td>"This folder holds {count} objects in the bucket. ShareCraft renames, moves, copies or deletes at most 1,000 at a time." (count with thousands separators)</td></tr>
+<tr><td><code>source_item_saving</code></td><td>409</td><td>"This is still being saved to the storage. Try again when saving has finished, or discard the save that failed."</td></tr>
+<tr><td><code>source_too_large_to_move</code></td><td>409</td><td>"Files over 5 GiB in S3 storage cannot be renamed, moved, copied or deleted from ShareCraft yet."</td></tr>
+<tr><td><code>source_changed</code></td><td>409</td><td>"This changed in the storage since ShareCraft last looked. ShareCraft is checking it again; try again in a minute."</td></tr>
+<tr><td><code>source_action_unavailable</code> (reworded)</td><td>409</td><td>"This cannot be done yet in a library stored in S3."</td></tr>
+<tr><td><code>source_file_too_large</code> (reworded)</td><td>413</td><td>"Files over {limit} cannot be saved to this S3 storage." ({limit} in the style "5 GiB")</td></tr>
+</tbody></table></div>
+<p><b>New events</b>:</p>
+<ul class="band">
+<li><code>source.moved</code> (objects, left_behind)</li>
+<li><code>source.held</code> (objects)</li>
+<li><code>source.unheld</code></li>
+<li><code>source.held_purged</code></li>
+<li><code>source.held_left</code> (the library was read-only at purge)</li>
+<li><code>source.holding_swept</code> (count)</li>
+<li><code>source.multipart_aborted</code></li>
+</ul>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li>A folder move or delete that fails half-way loses nothing: copies come first, a failed copy removes the copies already made, and the originals stay. Test: Task 3 <code>a_failed_copy_mid_folder_removes_the_copies_and_keeps_every_original</code>.</li>
+<li>A file changed in the bucket after the last listing is not moved or held, and a restore does not overwrite it. Tests: Task 3 <code>moving_a_file_changed_outside_is_refused_and_nothing_is_deleted</code>; Task 5 <code>restore_onto_a_name_taken_in_the_bucket_but_not_yet_listed_uses_a_numbered_name</code>.</li>
+<li>Every multipart upload that starts either completes or is aborted, and a crash leaves a row that the sweep aborts. Tests: Task 8 <code>a_failed_part_aborts_the_upload_and_forgets_it</code>, <code>a_left_over_upload_row_is_aborted_by_the_sweep_after_a_day</code>.</li>
+<li>The holding folder never appears in a library, a search, a count or a download. The sweep never deletes anything outside it, or anything belonging to an entry still in the bin. Tests: Task 5 <code>the_sweep_removes_only_old_unnamed_objects_inside_the_holding_prefix</code>, <code>the_holding_prefix_never_appears_in_the_library</code>.</li>
+<li>A rename or move leaves no stale tracked path behind, so the next listing plans no change. Test: Task 4 <code>after_a_folder_move_the_next_listing_changes_nothing</code>.</li>
+</ol>
+
+<h2>File structure</h2>
+<div class="scroll"><table>
+<thead><tr><th>File</th><th>Responsibility in slice 2</th></tr></thead>
+<tbody>
+<tr><td><code>crates/records/migrations/0026_source_holds.sql</code></td><td><code>source_held</code>, <code>source_multipart</code></td></tr>
+<tr><td><code>crates/records/src/source_writes.rs</code></td><td>Held and multipart records; moving tracked paths</td></tr>
+<tr><td><code>crates/server/src/s3.rs</code>, <code>s3_xml.rs</code></td><td>Copy and multipart calls, a query on writes, part bodies, the quiet 404</td></tr>
+<tr><td><code>crates/server/tests/common/fake_s3.rs</code></td><td>Copy and multipart in the fake</td></tr>
+<tr><td><code>crates/server/src/s3_write.rs</code></td><td>Move, copy, hold, unhold, delete held, sweep, multipart write</td></tr>
+<tr><td><code>crates/server/src/source_write.rs</code></td><td>Structure operations under the source lock; sweeps; limits</td></tr>
+<tr><td><code>crates/server/src/api/{nodes,bulk,bin,mod,uploads,content}.rs</code></td><td>Routes now allowed, new errors</td></tr>
+<tr><td><code>crates/server/src/tree.rs</code>, <code>links.rs</code></td><td>Purge hook, sweep wiring</td></tr>
+<tr><td><code>crates/server/src/file_room.rs</code>, <code>checkpoint.rs</code></td><td>Flush when the room empties</td></tr>
+<tr><td><code>web/*</code></td><td>Actions, messages, warning text, leftovers</td></tr>
+<tr><td>Test files</td><td><code>crates/records/tests/source_holds.rs</code>; <code>crates/server/tests/{s3_client,s3_write,s3_structure,s3_bin,s3_copy,s3_multipart,s3_sessions,source_readonly}.rs</code></td></tr>
+</tbody></table></div>
+
+<h2>What the code looks like today (verified 24 November 2026)</h2>
+<div class="scroll"><table>
+<thead><tr><th>Thing</th><th>Where and what</th></tr></thead>
+<tbody>
+<tr><td>Latest migration</td><td><code>0025_source_writes.sql</code>; next is 0026</td></tr>
+<tr><td>Refusals to lift</td><td><code>api/nodes.rs</code>: <code>require_not_connected_for</code> (74-90) and <code>require_item_not_connected_for</code> (93-114), called from <code>delete_checked</code> 170, <code>restore_checked</code> 181, <code>change</code> 706, <code>copy</code> 791 and <code>create</code> 658. Also <code>bulk.rs</code> 17, 115 and 176, and <code>require_share_copyable_for</code> 830, which refuses copies out of S3.</td></tr>
+<tr><td>Tree operations</td><td><code>tree::apply(&amp;AppState,&amp;User,TreeOp)</code>. <code>TreeOp::{Rename,Move,Delete,Restore,ToSecondStage,Purge,Copy}</code> already work on S3 nodes; only the routes refuse.</td></tr>
+<tr><td>Bin</td><td>A bin entry is a <code>nodes</code> row (<code>deleted_with</code>, <code>bin_stage</code>, <code>purged_at</code>). <code>BIN_DAYS = 93</code>. The purge runs in <code>links::sweep_once</code> via <code>tree::purge_due</code> (tree.rs:689).</td></tr>
+<tr><td>Tracked paths</td><td><code>source_items</code> has PK <code>(library_id, repository_path)</code> and UNIQUE <code>(library_id, path)</code>; folders end with <code>/</code>. No function moves a subtree's paths.</td></tr>
+<tr><td>Reserved names</td><td><code>records::reserved_name</code> hides <code>.sharecraft-bin</code>, and <code>s3_write::object_key</code> refuses it, so holding keys are built by hand, as <code>probe_writes</code> builds its key.</td></tr>
+<tr><td>Client</td><td><code>s3.rs</code> has list, head, put, delete and get only. <code>send_once</code> (1201) sends no query, <code>Payload::open</code> streams whole files, and <code>failure()</code> (1075-1100) logs every 404.</td></tr>
+<tr><td>Fake</td><td><code>tests/common/fake_s3.rs</code> answers 501 to POST, and stores a PUT carrying <code>x-amz-copy-source</code> as an empty object.</td></tr>
+<tr><td>Size limit</td><td><code>source_write::write_limit</code> (317) is the smallest of 512 MiB, <code>max_file_bytes</code> (default 10 GiB) and cache/2. Also checked in <code>api/uploads.rs</code> at 407 and 634, and <code>api/content.rs</code> at 1430.</td></tr>
+<tr><td>Reading bytes from a bucket</td><td><code>external::materialise(state, node) -&gt; Result&lt;Option&lt;Ready&gt;, ExternalError&gt;</code> (external.rs:150)</td></tr>
+<tr><td>Editor flush</td><td><code>ExternalCheckpointer::session_ended</code> (source_write.rs:718) runs only when the file session ends, which is <code>room_grace</code> (60 s) after the room empties (file_room.rs:1030-1052).</td></tr>
+</tbody></table></div>
+
+<h2>Task cards</h2>
+<div class="task">
+<h3>Task 1: records for holding, multipart and moved paths</h3>
+<p><b>Files.</b> Create <code>crates/records/migrations/0026_source_holds.sql</code> and <code>crates/records/tests/source_holds.rs</code>. Modify <code>crates/records/src/{source_writes.rs, sources.rs, tree.rs, sites.rs}</code>.</p>
+<h4>Migration 0026 (LF endings)</h4>
+<pre><code>create table source_held (
+  entry_id uuid primary key references nodes(id),           -- the bin entry
+  library_id uuid not null references library_sources(library_id) on delete cascade,
+  root text not null check (char_length(root) between 1 and 1024),  -- library-relative, ends '/'
+  objects bigint not null check (objects &gt;= 0),
+  held_at timestamptz not null,
+  retry_at timestamptz
+);
+create index source_held_library on source_held (library_id);
+
+create table source_multipart (
+  library_id uuid not null references library_sources(library_id),  -- no cascade: see Rules
+  upload_id text not null check (char_length(upload_id) between 1 and 1024),
+  node_id uuid not null references nodes(id),
+  key text not null check (char_length(key) between 1 and 1024),
+  started_at timestamptz not null,
+  primary key (library_id, upload_id)
+);</code></pre>
+<h4>Interfaces</h4>
+<pre><code>impl Db {
+  pub async fn hold_record(&amp;self, entry: NodeId, library: NodeId, root: &amp;str, objects: u64,
+                           now: OffsetDateTime) -&gt; Result&lt;(), DbError&gt;;
+  pub async fn held(&amp;self, entry: NodeId) -&gt; Result&lt;Option&lt;Held&gt;, DbError&gt;;
+  pub async fn held_entries_of(&amp;self, library: NodeId) -&gt; Result&lt;Vec&lt;NodeId&gt;, DbError&gt;;
+  pub async fn forget_held(&amp;self, entry: NodeId) -&gt; Result&lt;bool, DbError&gt;;
+  pub async fn defer_held(&amp;self, entry: NodeId, until: OffsetDateTime) -&gt; Result&lt;bool, DbError&gt;;
+  pub async fn note_multipart(&amp;self, library: NodeId, node: NodeId, key: &amp;str, upload_id: &amp;str,
+                              now: OffsetDateTime) -&gt; Result&lt;(), DbError&gt;;
+  pub async fn forget_multipart(&amp;self, library: NodeId, upload_id: &amp;str) -&gt; Result&lt;bool, DbError&gt;;
+  pub async fn stale_multiparts(&amp;self, before: OffsetDateTime, limit: i64) -&gt; Result&lt;Vec&lt;OpenMultipart&gt;, DbError&gt;;
+  pub async fn move_source_items(&amp;self, library: NodeId, from: &amp;str, to: &amp;str) -&gt; Result&lt;u64, DbError&gt;;
+  pub async fn writes_below(&amp;self, library: NodeId, repository_path: &amp;str) -&gt; Result&lt;u64, DbError&gt;;
+}</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><code>move_source_items</code> is one transaction. It rewrites <code>repository_path</code> and <code>path</code> for the row equal to <code>from</code>, and for every row whose value starts with <code>from</code> when <code>from</code> ends with <code>/</code> (a folder), replacing that leading part with <code>to</code>. It answers the number of rows changed. Both unique constraints must hold at commit; a target already taken answers <code>DbError</code> and changes nothing. A row whose <code>path</code> differs from its <code>repository_path</code> (a case-collision suffix) keeps its suffix part.</li>
+<li><code>writes_below</code> counts <code>source_writes</code> rows of the library whose <code>path</code> equals <code>repository_path</code>, or starts with it when it ends with <code>/</code>.</li>
+<li><code>defer_held</code> sets <code>retry_at</code>. <code>held</code> answers the row whatever <code>retry_at</code> holds; callers decide.</li>
+<li><code>stale_multiparts</code> answers rows started before <code>before</code>, oldest first.</li>
+<li>Switching a library to read-only (<code>set_source_mode</code>) and disconnecting it answer <code>WritesPending</code> while <code>source_multipart</code> rows exist, just as for <code>source_writes</code>. <code>source_held</code> rows do not block either.</li>
+<li>Purging a node (tree.rs) or a site (sites.rs) deletes <code>source_held</code> rows naming those nodes, and <code>source_multipart</code> rows naming them, in the same transaction.</li>
+</ul>
+<p><b>Write failing tests in <code>crates/records/tests/source_holds.rs</code>:</b> <code>a_hold_round_trips_and_can_be_deferred_and_forgotten</code>; <code>held_entries_of_lists_only_that_library</code>; <code>disconnect_drops_held_rows_and_leaves_nothing_else</code>; <code>multipart_rows_round_trip_and_stale_ones_are_oldest_first</code>; <code>read_only_and_disconnect_are_refused_while_a_multipart_is_open</code>; <code>moving_a_file_rewrites_both_paths</code>; <code>moving_a_folder_rewrites_every_descendant_and_nothing_else</code>; <code>moving_onto_a_taken_path_changes_nothing</code>; <code>a_case_collision_suffix_survives_a_move</code>; <code>writes_below_counts_the_file_and_everything_under_a_folder</code>; <code>purging_a_node_removes_its_held_and_multipart_rows</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p records --test source_holds</code>. Expected: fails to compile.</p>
+<p><b>Implement</b>, then run it again, plus <code>--test source_writes</code>, <code>--test s3_sources</code>, <code>--test bin</code> and <code>cargo build -j 3 -p server --tests</code>. Expected: pass.</p>
+<p><b>Done means</b>: the listed tests pass, the existing records suites keep their counts, and the server builds.</p>
+<p><b>Review focus</b>: a prefix match that also catches <code>folder2/</code> when moving <code>folder/</code> (a <code>LIKE</code> without escaping <code>%</code> and <code>_</code>); the unique constraints during the update; the cascade choices.</p>
+</div>
+
+<div class="task">
+<h3>Task 2: client copy and multipart, the fake's half, the quiet 404</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/s3.rs</code>, <code>crates/server/src/s3_xml.rs</code>, <code>crates/server/tests/common/fake_s3.rs</code> and <code>crates/server/tests/s3_client.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>impl S3 {
+  pub async fn copy(&amp;self, t: &amp;S3Target, from_key: &amp;str, from_etag: &amp;str, to_key: &amp;str,
+                    cond: Cond&lt;'_&gt;) -&gt; Result&lt;ObjectHead, S3Error&gt;;
+  pub async fn start_multipart(&amp;self, t: &amp;S3Target, key: &amp;str, sha256: &amp;[u8; 32]) -&gt; Result&lt;String, S3Error&gt;;
+  pub async fn put_part(&amp;self, t: &amp;S3Target, key: &amp;str, upload_id: &amp;str, number: u16,
+                        body: &amp;PartBody) -&gt; Result&lt;String /* part ETag */, S3Error&gt;;
+  pub async fn complete_multipart(&amp;self, t: &amp;S3Target, key: &amp;str, upload_id: &amp;str,
+                                  parts: &amp;[(u16, String)], cond: Cond&lt;'_&gt;) -&gt; Result&lt;ObjectHead, S3Error&gt;;
+  pub async fn abort_multipart(&amp;self, t: &amp;S3Target, key: &amp;str, upload_id: &amp;str) -&gt; Result&lt;(), S3Error&gt;;
+  pub fn part_bytes(&amp;self) -&gt; u64;
+  pub fn set_part_bytes_for_tests(&amp;self, bytes: u64);
+}
+// s3_xml.rs
+pub fn upload_id(body: &amp;[u8]) -&gt; Option&lt;String&gt;;           // InitiateMultipartUploadResult
+pub fn copy_result_ok(body: &amp;[u8]) -&gt; bool;                // CopyObjectResult (false for &lt;Error&gt;)
+pub fn complete_result_ok(body: &amp;[u8]) -&gt; bool;            // CompleteMultipartUploadResult (false for &lt;Error&gt;)
+pub fn complete_request(parts: &amp;[(u16, String)]) -&gt; String; // the request body</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><code>send_once</code> takes a query (<code>&amp;[(&amp;str, &amp;str)]</code>), signed as reads sign theirs. Writes are still sent once and never retried.</li>
+<li><b><code>copy</code></b>:
+<ul>
+<li>It sends PUT <code>to_key</code> with <code>x-amz-copy-source: /&lt;bucket&gt;/&lt;URI-encoded from_key&gt;</code> and <code>x-amz-copy-source-if-match: from_etag</code>, plus <code>If-None-Match: *</code> or <code>If-Match</code> from <code>cond</code>.</li>
+<li>A 200 whose body is <code>&lt;Error&gt;</code> is a failure, mapped by its code.</li>
+<li>Above <code>COPY_MAX</code>, it answers <code>Unsupported</code> before sending.</li>
+<li>After it succeeds, it HEADs <code>to_key</code> and answers that.</li>
+</ul></li>
+<li><b><code>start_multipart</code></b> sends POST <code>?uploads</code> with <code>x-amz-meta-sharecraft-sha256</code> set to the whole file's hash, so a lost completion answer is recognised as in slice 1.</li>
+<li><b><code>put_part</code></b> streams <code>len</code> bytes from <code>offset</code> of <code>path</code> in 64 KiB pieces. It signs <code>body.sha256</code> and refuses a short file (<code>Other</code>). A new <code>Payload</code> constructor takes the offset and length. Numbers run from 1 to 10,000.</li>
+<li><b><code>complete_multipart</code></b> sends POST <code>?uploadId=</code> with the XML body (signed with its real hash) and the condition. A 200 with <code>&lt;Error&gt;</code> is a failure. After it succeeds, it HEADs the key and answers that.</li>
+<li><b><code>abort_multipart</code></b> sends DELETE <code>?uploadId=</code>. A 404 (<code>NoSuchUpload</code>) counts as done.</li>
+<li><b><code>mapped</code></b>: <code>NoSuchUpload</code> maps to <code>NotFound</code>; <code>EntityTooSmall</code>, <code>InvalidPart</code> and <code>InvalidPartOrder</code> map to <code>Other</code>.</li>
+<li><b>Counting</b>: every call counts as class <code>Write</code>. Parts count their bytes up; copies count none.</li>
+<li><b>The quiet 404.</b> <code>failure()</code> logs nothing for a 404 answer to HEAD or DELETE. Every other failure still logs <code>S3 answered &lt;status&gt; &lt;code&gt;</code>.</li>
+<li><b>The fake</b> gains:
+<ul>
+<li>CopyObject, honouring <code>x-amz-copy-source-if-match</code>, <code>If-None-Match</code> and <code>If-Match</code>, and keeping the source's <code>x-amz-meta-sharecraft-sha256</code>;</li>
+<li>Create, UploadPart (checking each part's hash), Complete (honouring the conditions; every part except the last must be at least 5 MiB, unless the test lowers that) and Abort;</li>
+<li><code>open_multiparts() -&gt; Vec&lt;(String /*key*/, String /*upload id*/)&gt;</code>;</li>
+<li>faults <code>error_in_200_next()</code> (the next copy or completion answers 200 with an <code>&lt;Error&gt;</code> body), <code>fail_part(n)</code> and <code>min_part_bytes(u64)</code>;</li>
+<li>new kinds in <code>writes()</code>: <code>("COPY", to, cond)</code>, <code>("PART", key, n)</code>, <code>("COMPLETE", key, cond)</code> and <code>("ABORT", key, "")</code>.</li>
+</ul>
+A PUT carrying <code>x-amz-copy-source</code> is never stored as an ordinary PUT.</li>
+</ul>
+<p><b>Write failing tests in <code>crates/server/tests/s3_client.rs</code>:</b> <code>a_copy_sends_the_source_and_its_etag_and_answers_the_new_head</code>; <code>a_copy_from_a_changed_source_is_a_precondition_failure</code>; <code>a_copy_onto_a_taken_key_with_if_absent_is_a_precondition_failure</code>; <code>an_error_inside_a_200_copy_answer_is_a_failure</code>; <code>a_copy_over_five_gib_is_refused_before_sending</code>; <code>a_multipart_upload_sends_hashed_parts_and_completes_with_the_condition</code>; <code>a_short_file_part_is_refused</code>; <code>an_error_inside_a_200_completion_is_a_failure</code>; <code>abort_forgets_the_upload_and_a_missing_upload_is_fine</code>; <code>a_head_404_is_not_logged_and_a_put_403_is</code>; <code>copies_and_parts_are_counted_as_writes</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_client -- --test-threads=1</code>. Expected: fails.</p>
+<p><b>Implement</b>, then run it again, plus <code>--test s3_write</code> and <code>--test s3_uploads</code>. Expected: pass.</p>
+<p><b>Done means</b>: the listed tests pass, existing client tests pass, and the module doc no longer says nothing sends POST.</p>
+<p><b>Review focus</b>: the copy-source encoding of keys with spaces, <code>+</code> and non-ASCII; the signature of a query with an empty value (<code>uploads=</code>); a part read past the end of the file; the copy that the fake used to store as empty.</p>
+</div>
+
+<div class="task">
+<h3>Task 3: bucket moves</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/s3_write.rs</code>, <code>crates/server/src/source_write.rs</code> (the <code>WriteError</code> variants and <code>sentence</code>) and <code>crates/server/tests/s3_write.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>pub async fn move_item(s3: &amp;S3, t: &amp;S3Target, from: &amp;str, to: &amp;str, folder: bool,
+                       known: &amp;[(String /*relative path*/, String /*recorded tag*/)]) -&gt; Result&lt;Moved, WriteError&gt;;
+pub async fn copy_item(s3: &amp;S3, t: &amp;S3Target, from: &amp;str, to: &amp;str, folder: bool,
+                       known: &amp;[(String, String)]) -&gt; Result&lt;Moved, WriteError&gt;;
+pub fn holding_root(date: time::Date, entry: NodeId) -&gt; String;   // ".sharecraft-bin/2026-11-24/&lt;uuid&gt;/"
+pub async fn hold(s3: &amp;S3, t: &amp;S3Target, from: &amp;str, folder: bool, root: &amp;str,
+                  known: &amp;[(String, String)]) -&gt; Result&lt;Moved, WriteError&gt;;
+pub async fn unhold(s3: &amp;S3, t: &amp;S3Target, root: &amp;str, held: &amp;str, to: &amp;str, folder: bool) -&gt; Result&lt;Moved, WriteError&gt;;
+pub async fn delete_held(s3: &amp;S3, t: &amp;S3Target, root: &amp;str) -&gt; Result&lt;u64, WriteError&gt;;
+pub async fn sweep_holding(s3: &amp;S3, t: &amp;S3Target, older_than: time::Date,
+                           keep: &amp;HashSet&lt;NodeId&gt;) -&gt; Result&lt;u64, WriteError&gt;;</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><b>Paths and keys.</b> Paths are library-relative; a folder path ends with <code>/</code>. Keys are built with <code>object_key</code>, except holding keys, which are built by hand from the prefix and the root. A holding key over 1,024 bytes answers <code>Failed</code> before anything is done.</li>
+<li><b>Which objects a folder step covers.</b> The step lists every key under the folder first (<code>list_page</code> with that prefix, all pages), including its marker. More than <code>MOVE_MAX_OBJECTS</code> answers <code>TooMany(count)</code> before any write. Any object larger than <code>COPY_MAX</code> answers <code>TooLargeToMove</code> before any write.</li>
+<li><b>Checking against the recorded tags.</b> Each file that <code>known</code> lists is checked: a HEAD whose <code>tag_of</code> differs from the recorded tag answers <code>Changed</code> before any write. For a folder, keys the listing finds that <code>known</code> does not list are also <code>Changed</code>, because they appeared outside.</li>
+<li><b>Destination names</b>: when any destination key already exists, the step answers <code>NameTaken</code> before any write. The HEAD of each destination checks this, and every copy is also sent <code>IfAbsent</code>.</li>
+<li><b>Order:</b>
+<ol>
+<li>All copies, with <code>x-amz-copy-source-if-match</code>.</li>
+<li>If any copy fails: delete the copies already made and answer the mapped error; a 412 on the source answers <code>Changed</code>.</li>
+<li>Then all deletes of the sources, carrying on past failures. <code>left_behind</code> counts the failed ones.</li>
+</ol>
+<code>seen</code> holds each destination's HEAD from the copy.</li>
+<li><b><code>copy_item</code></b> is <code>move_item</code> without the deletes.</li>
+<li><b><code>hold</code></b> is <code>move_item</code> to <code>root + from</code>. <b><code>unhold</code></b> is <code>move_item</code> from <code>root + held</code> to <code>to</code>, without checking tags, since nothing outside writes the holding folder. Its destination names are checked as above, so the caller can pick a numbered name and try again.</li>
+<li><b><code>delete_held</code></b> lists <code>root</code> and deletes every key under it, answering the count. One failed delete answers the mapped error after it has tried them all.</li>
+<li><b><code>sweep_holding</code></b> lists <code>.sharecraft-bin/</code> and deletes a key only when:
+<ul>
+<li>its second segment parses as a date before <code>older_than</code>;</li>
+<li>its third segment parses as a node id not in <code>keep</code>.</li>
+</ul>
+Any other key is left alone. It answers the count.</li>
+<li><b><code>sentence</code></b> gains plain sentences for <code>TooMany</code>, <code>TooLargeToMove</code> and <code>Changed</code>, with the same wording as the API messages.</li>
+</ul>
+<p><b>Write failing tests in <code>crates/server/tests/s3_write.rs</code>:</b> <code>moving_a_file_copies_then_deletes_and_answers_the_new_head</code>; <code>moving_a_folder_moves_every_object_and_its_marker</code>; <code>moving_a_folder_over_the_cap_is_refused_before_any_write</code>; <code>moving_an_object_over_five_gib_is_refused_before_any_write</code>; <code>moving_a_file_changed_outside_is_refused_and_nothing_is_deleted</code>; <code>a_key_that_appeared_inside_the_folder_is_a_change</code>; <code>moving_onto_a_taken_name_is_refused_before_any_write</code>; <code>a_failed_copy_mid_folder_removes_the_copies_and_keeps_every_original</code>; <code>a_failed_delete_is_counted_as_left_behind</code>; <code>copying_keeps_the_original</code>; <code>hold_and_unhold_round_trip_the_bytes_and_the_sha_metadata</code>; <code>unhold_onto_a_taken_name_answers_name_taken</code>; <code>delete_held_removes_only_that_root</code>; <code>the_sweep_removes_only_old_unnamed_objects_inside_the_holding_prefix</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_write -- --test-threads=1</code>. Expected: fails.</p>
+<p><b>Implement</b>, then run it again. Expected: pass.</p>
+<p><b>Done means</b>: the listed tests pass, and slice 1's tests in this file keep passing.</p>
+<p><b>Review focus</b>: any path where a delete runs before every copy is confirmed; cleanup that deletes a key it did not create; the sweep's parse of an odd key, such as <code>.sharecraft-bin/notes.txt</code>; key building that escapes the prefix.</p>
+</div>
+
+<div class="task">
+<h3>Task 4: rename and move in an S3 library</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/source_write.rs</code>, <code>crates/server/src/api/{nodes.rs, bulk.rs, mod.rs}</code> and <code>crates/server/tests/source_readonly.rs</code>. Create <code>crates/server/tests/s3_structure.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>pub(crate) async fn rename_or_move(state: &amp;AppState, actor: &amp;User, node: NodeId,
+                                   name: Option&lt;&amp;str&gt;, parent: Option&lt;NodeId&gt;) -&gt; Result&lt;Restructured, ApiError&gt;;
+pub(crate) struct Restructured { pub node: NodeId, pub left_behind: u64 }</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><b>Routing.</b> <code>nodes::change</code> and the bulk move call <code>rename_or_move</code> when the node is in a read-and-write S3 library. The guards change as follows:
+<ul>
+<li>A node in a read-only library still gets <code>source_read_only</code>.</li>
+<li>A node in a blocked library still gets <code>source_write_blocked</code>.</li>
+<li>A move to a parent in another library, or out of or into a connected library, still gets <code>source_action_unavailable</code>.</li>
+</ul></li>
+<li><b>Steps:</b>
+<ol>
+<li>Take the source lock (<code>lock_source</code>).</li>
+<li>Re-judge access.</li>
+<li>Refuse <code>source_item_saving</code> when <code>writes_below</code> is not zero.</li>
+<li>Check the name rules (<code>validate_node_name</code>, <code>nameable_segment</code>, and <code>name_free</code> ignoring case).</li>
+<li>Collect <code>known</code> from <code>source_items</code> below the node.</li>
+<li>Run <code>s3_write::move_item</code>.</li>
+<li><code>tree::apply</code> <code>Rename</code> and/or <code>Move</code>.</li>
+<li><code>move_source_items</code>, then record each <code>seen</code> tag on the moved items.</li>
+<li>For a document, <code>after_rename</code>; for a move, <code>recheck_below</code>.</li>
+<li>Event <code>source.moved</code>.</li>
+</ol>
+If <code>left_behind &gt; 0</code>, wake the listing (<code>state.sources().wake(library)</code>).</li>
+<li><b>Error mapping</b>, as <code>create_folder</code> maps <code>WriteError</code>:
+<ul>
+<li><code>TooMany(n)</code> → <code>source_too_many_objects</code>;</li>
+<li><code>TooLargeToMove</code> → <code>source_too_large_to_move</code>;</li>
+<li><code>Changed</code> → <code>source_changed</code>, and the listing is woken;</li>
+<li><code>NameTaken</code> → <code>name_taken</code>;</li>
+<li><code>Denied</code> → block the library.</li>
+</ul></li>
+<li><b>If the tree step fails after the bucket moved</b>: move the objects back with <code>move_item</code> (best effort), and answer the tree's error.</li>
+<li><b>What stays the same:</b> node ids, permissions and links. The answer gains <code>left_behind</code> when it is not zero.</li>
+<li><code>ROUTES</code>: <code>PATCH /nodes/{id}</code> and the bulk move become allowed for S3 read-and-write.</li>
+</ul>
+<p><b>Write failing tests in <code>crates/server/tests/s3_structure.rs</code>:</b> <code>renaming_a_file_renames_the_object_and_keeps_the_node</code>; <code>moving_a_folder_moves_every_object_and_keeps_permissions_and_links</code>; <code>after_a_folder_move_the_next_listing_changes_nothing</code>; <code>a_name_taken_ignoring_case_is_refused</code>; <code>a_file_with_a_pending_save_cannot_be_renamed</code>; <code>a_folder_over_the_cap_is_refused_with_its_count</code>; <code>a_change_outside_since_the_listing_is_refused_and_the_listing_is_woken</code>; <code>left_behind_originals_are_reported_and_the_listing_is_woken</code>; <code>moving_into_another_library_is_still_refused</code>; <code>a_read_only_library_still_refuses_renames</code>; <code>a_bulk_move_of_two_files_moves_both</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_structure -- --test-threads=1</code>. Expected: fails.</p>
+<p><b>Implement</b>, then run it again, plus <code>--test source_readonly</code>, <code>--test s3_modes</code>, <code>--test s3_write_routes</code> and <code>--test bulk</code> (if present). Expected: pass.</p>
+<p><b>Done means</b>: the listed tests pass, and <code>ROUTES</code> carries the new decisions.</p>
+<p><b>Review focus</b>: the lock held over every bucket call; a tree failure after the bucket changed; tags recorded from the copy's HEAD rather than recomputed (the echo rule); bulk moves taking one lock per item.</p>
+</div>
+
+<div class="task">
+<h3>Task 5: delete, restore, purge and the 93-day sweep</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/source_write.rs</code>, <code>crates/server/src/api/{nodes.rs, bulk.rs, bin.rs, mod.rs}</code>, <code>crates/server/src/tree.rs</code> (<code>purge_due</code>), <code>crates/server/src/links.rs</code> (<code>sweep_once</code>) and <code>crates/server/tests/source_readonly.rs</code>. Create <code>crates/server/tests/s3_bin.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>pub(crate) async fn delete_to_holding(state: &amp;AppState, actor: &amp;User, node: NodeId) -&gt; Result&lt;Restructured, ApiError&gt;;
+pub(crate) async fn restore_from_holding(state: &amp;AppState, actor: &amp;User, entry: NodeId) -&gt; Result&lt;Restored, ApiError&gt;;
+pub(crate) struct Restored { pub node: NodeId, pub renamed: Option&lt;String&gt; }
+pub(crate) async fn release_held(state: &amp;AppState, entry: NodeId, now: OffsetDateTime) -&gt; Result&lt;bool, ApiError&gt;;
+pub async fn sweep_holds(state: &amp;AppState, now: OffsetDateTime) -&gt; usize;</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><b>Delete</b> runs under the lock, with the busy check and <code>known</code> as in Task 4. It runs <code>hold</code> to <code>holding_root(today UTC, node)</code>, then <code>delete_one</code>, which makes the bin entry with id = node, then <code>hold_record</code> and event <code>source.held</code>. A bulk delete does this per item.</li>
+<li><b>Restore</b> of an entry that has a <code>source_held</code> row:
+<ol>
+<li>The library must be read-and-write and not blocked.</li>
+<li>Take the lock and choose the name: the original if it is free in the tree ignoring case, otherwise "name (2)" and so on, up to "(20)".</li>
+<li><code>unhold</code>. On <code>NameTaken</code> (the bucket has the name, but the tree does not yet), try the next number.</li>
+<li><code>TreeOp::Restore</code>, then <code>TreeOp::Rename</code> when the name changed.</li>
+<li>Upsert <code>source_items</code> for the restored subtree from <code>seen</code>.</li>
+<li>For a folder, write its marker (<code>make_folder</code>).</li>
+<li><code>forget_held</code>, then event <code>source.unheld</code>.</li>
+</ol>
+The answer is <code>{node, renamed}</code>, as today. An entry without a <code>source_held</code> row restores as today.</li>
+<li><b><code>release_held</code></b> (used by Purge and the 93-day purge) decides by the library's state:
+<ul>
+<li>Read-and-write: <code>delete_held</code>, then <code>forget_held</code>, event <code>source.held_purged</code>, answer <code>true</code>.</li>
+<li>Read-only, or disconnected (no row): <code>forget_held</code>, event <code>source.held_left</code>, answer <code>true</code>.</li>
+<li>Offline or failing: <code>defer_held(now + 1 hour)</code>, answer <code>false</code>.</li>
+</ul></li>
+<li><b>Where <code>release_held</code> is called:</b>
+<ul>
+<li><code>DELETE /bin/{id}</code> on a second-stage entry calls it before <code>TreeOp::Purge</code>. A <code>false</code> answers 503 <code>source_unavailable</code> (offline) and purges nothing.</li>
+<li><code>tree::purge_due</code> calls it before each purge and skips the entry on <code>false</code>, or while <code>retry_at</code> has not passed.</li>
+</ul></li>
+<li><b><code>sweep_holds</code></b>, called from <code>sweep_once</code>:
+<ul>
+<li>Once a day per read-and-write S3 library (in-memory last-run time per library), it runs <code>sweep_holding(today − 94 days, held_entries_of(library))</code>.</li>
+<li>It also aborts <code>stale_multiparts(now − 1 day)</code>; the abort itself is Task 8's <code>abort_stale</code>. Until Task 8 lands, this step is a call to a function that does nothing.</li>
+</ul></li>
+<li><code>ROUTES</code>: <code>DELETE /nodes/{id}</code>, <code>POST /bin/{id}/restore</code>, and the bulk delete and restore become allowed for S3 read-and-write.</li>
+</ul>
+<p><b>Write failing tests in <code>crates/server/tests/s3_bin.rs</code>:</b> <code>deleting_copies_to_the_holding_prefix_then_deletes</code>; <code>the_holding_prefix_never_appears_in_the_library</code>; <code>the_deleted_file_is_in_the_bin_with_its_name_and_size</code>; <code>restore_brings_bytes_node_and_permissions_back</code>; <code>restore_when_the_name_is_taken_uses_a_numbered_name</code>; <code>restore_onto_a_name_taken_in_the_bucket_but_not_yet_listed_uses_a_numbered_name</code>; <code>restoring_a_folder_writes_its_marker_and_every_file</code>; <code>purging_an_entry_removes_the_held_objects_only</code>; <code>purge_while_offline_answers_503_and_keeps_the_entry</code>; <code>the_93_day_purge_removes_held_objects_and_retries_an_hour_later_when_offline</code>; <code>purging_in_a_read_only_library_leaves_the_objects_and_says_so</code>; <code>restore_in_a_read_only_library_is_refused</code>; <code>deleting_a_folder_over_the_cap_is_refused</code>; <code>a_file_with_a_pending_save_cannot_be_deleted</code>; <code>the_daily_sweep_runs_once_a_day</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_bin -- --test-threads=1</code>. Expected: fails.</p>
+<p><b>Implement</b>, then run it again, plus <code>--test source_readonly</code>, <code>--test bin</code> and <code>--test s3_sync</code>. Expected: pass.</p>
+<p><b>Done means</b>: the listed tests pass, and the ordinary bin's tests are unchanged.</p>
+<p><b>Review focus</b>: a purge that removes the entry when the bucket delete failed (in a read-and-write library); the date used for the root at midnight; the next listing treating a restored file as new or changed; <code>purge_due</code> hammering an offline bucket every minute.</p>
+</div>
+
+<div class="task">
+<h3>Task 6: copy inside an S3 library</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/source_write.rs</code>, <code>crates/server/src/api/{nodes.rs, bulk.rs}</code> and <code>crates/server/tests/source_readonly.rs</code>. Create <code>crates/server/tests/s3_copy.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>pub(crate) async fn copy_within(state: &amp;AppState, actor: &amp;User, node: NodeId, parent: NodeId,
+                                name: Option&lt;&amp;str&gt;) -&gt; Result&lt;NodeId, ApiError&gt;;</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><code>nodes::copy</code> and the bulk copy call <code>copy_within</code> when the source and the target parent are in the same read-and-write S3 library.</li>
+<li><b>Steps:</b>
+<ol>
+<li>Take the lock, run the busy check and check the name rules (a taken name is refused).</li>
+<li>Run <code>s3_write::copy_item</code>.</li>
+<li><code>tree::apply(Copy)</code>.</li>
+<li>Upsert <code>source_items</code> for the new nodes from <code>seen</code>.</li>
+<li>Event <code>source.moved</code> with <code>left_behind</code> 0, kind copy, in its detail.</li>
+</ol></li>
+<li>No byte is downloaded; the fake's GET count stays the same.</li>
+<li>If the tree step fails, delete the copies (best effort) and answer the tree's error.</li>
+</ul>
+<p><b>Write failing tests in <code>crates/server/tests/s3_copy.rs</code>:</b> <code>copying_within_an_s3_library_is_a_server_side_copy_with_no_get</code>; <code>copying_a_folder_copies_every_object</code>; <code>a_copy_onto_a_taken_name_is_refused</code>; <code>a_copy_of_a_folder_over_the_cap_is_refused</code>; <code>after_a_copy_the_next_listing_changes_nothing</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_copy -- --test-threads=1</code>. Expected: fails. <b>Implement</b>, then run it again, plus <code>--test source_readonly</code>. Expected: pass.</p>
+<p><b>Done means</b>: the listed tests pass.</p>
+<p><b>Review focus</b>: the copied nodes getting fresh revisions and ids while their tags match the bucket.</p>
+</div>
+
+<div class="task">
+<h3>Task 7: copy between libraries</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/source_write.rs</code>, <code>crates/server/src/api/{nodes.rs, bulk.rs, mod.rs}</code> and <code>crates/server/tests/source_readonly.rs</code>. Extend <code>crates/server/tests/s3_copy.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>pub(crate) async fn copy_across(state: &amp;AppState, actor: &amp;User, node: NodeId, parent: NodeId,
+                                name: Option&lt;&amp;str&gt;) -&gt; Result&lt;NodeId, ApiError&gt;;</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><b>Out of S3</b> (source in an S3 library, target an ordinary place):
+<ol>
+<li>For each file, <code>external::materialise</code> its bytes.</li>
+<li>Create ordinary nodes with that content: <code>tree::apply(Create)</code>, then the ordinary content path the upload route uses (name it in the report).</li>
+</ol>
+The site quota is checked for the total before the first read. <code>require_share_copyable_for</code> stops refusing S3 sources (file-share sources keep <code>source_copy_unavailable</code>).</li>
+<li><b>Into a writable S3 library</b> from an ordinary place:
+<ul>
+<li>Folders are made with <code>create_folder</code>.</li>
+<li>Files are made with <code>create_staged</code> (base <code>None</code>) on the source's existing blob. The blob has already been scanned, so the gate passes at once.</li>
+<li>Nothing is written to the bucket in the request; the worker writes.</li>
+</ul></li>
+<li><b>From one S3 library to another S3 library</b> (or across buckets) is out of S3 into a temporary blob, then into S3.</li>
+<li><b>Limits</b>: at most 1,000 files and folders in one copy (<code>source_too_many_objects</code>). Each file is held to the destination's limit (<code>write_limit</code>, or <code>config.max_file_bytes</code>). Both are checked before any byte is read.</li>
+<li>A copy into a read-only or blocked library is refused as today.</li>
+</ul>
+<p><b>Write failing tests</b>, added to <code>s3_copy.rs</code>: <code>copying_an_s3_file_out_stores_it_and_counts_it_against_the_destination</code>; <code>copying_an_ordinary_file_into_an_s3_library_writes_it_to_the_bucket</code>; <code>copying_between_two_s3_libraries_reads_once_and_writes_once</code>; <code>copying_into_a_read_only_library_is_refused</code>; <code>a_copy_over_the_limits_is_refused_before_anything_is_read</code>; <code>copying_out_over_the_site_quota_is_refused_before_anything_is_read</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_copy -- --test-threads=1</code>. Expected: fails. <b>Implement</b>, then run it again, plus <code>--test source_readonly</code>, <code>--test s3_uploads</code> and <code>--test quotas</code> (if present). Expected: pass.</p>
+<p><b>Done means</b>: the listed tests pass.</p>
+<p><b>Review focus</b>: bytes copied out of S3 before the quota check; a copy in that skips the scan gate; a temporary blob left referenced after the copy.</p>
+</div>
+<div class="task">
+<h3>Task 8: multipart uploads over 512 MiB</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/s3_write.rs</code> (<code>write_object</code> and the helpers it uses), <code>crates/server/src/source_write.rs</code> (<code>write_limit</code>, the worker and <code>sweep_holds</code>), <code>crates/server/src/api/{uploads.rs, content.rs, mod.rs}</code>. Create <code>crates/server/tests/s3_multipart.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>// s3_write.rs: write_object keeps its signature; it chooses multipart above s3.single_put_max().
+pub async fn abort_stale(state: &amp;AppState, now: OffsetDateTime) -&gt; usize;   // called from sweep_holds</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><b>The upload limit.</b> <code>write_limit</code> becomes the smallest of <code>COPY_MAX</code> (5 GiB), <code>config.max_file_bytes</code> and cache/2. <code>check_size</code> and <code>put</code> keep their own single-PUT limit; only <code>write_object</code> picks multipart. <code>source_file_too_large</code> uses the new message.</li>
+<li><b>Multipart write.</b> It runs only after the same HEAD and condition choice as the single PUT:
+<ol>
+<li><code>note_multipart</code> is written before <code>start_multipart</code>; the worker passes the node and library.</li>
+<li>Parts of <code>s3.part_bytes()</code> each. Each part is hashed from the staged file, then sent.</li>
+<li><code>complete_multipart</code> with the condition.</li>
+<li><code>forget_multipart</code>.</li>
+</ol>
+Any error after <code>start_multipart</code> (a part, the completion, or the worker being dropped mid-way) calls <code>abort_multipart</code> and <code>forget_multipart</code>, then maps the error as a PUT's would. A 412 on completion is a conflict, handled exactly as slice 1 handles one (a named copy).</li>
+<li><b>A lost completion answer</b>, recognised by the HEAD's <code>x-amz-meta-sharecraft-sha256</code>, counts as done, as in slice 1.</li>
+<li><b><code>abort_stale</code></b> aborts each row from <code>stale_multiparts(now − 1 day)</code>, then forgets it, with event <code>source.multipart_aborted</code>. A library that is gone or read-only only forgets the row.</li>
+<li><b>Chunked uploads.</b> They accept files up to the new limit for S3 places. Nothing about ordinary places changes.</li>
+</ul>
+<p><b>Write failing tests in <code>crates/server/tests/s3_multipart.rs</code></b>, with <code>set_single_put_max_for_tests</code> and <code>set_part_bytes_for_tests</code> making small files take the multipart path:</p>
+<ul>
+<li><code>a_file_over_the_single_put_limit_is_written_in_parts_and_matches</code></li>
+<li><code>the_condition_rides_on_the_completion</code></li>
+<li><code>a_conflict_at_completion_makes_a_named_copy</code></li>
+<li><code>a_failed_part_aborts_the_upload_and_forgets_it</code></li>
+<li><code>an_error_inside_a_200_completion_aborts</code></li>
+<li><code>a_lost_completion_answer_is_recognised</code></li>
+<li><code>a_left_over_upload_row_is_aborted_by_the_sweep_after_a_day</code></li>
+<li><code>an_upload_over_five_gib_is_refused_in_plain_words_before_any_byte</code></li>
+<li><code>read_only_is_refused_while_a_multipart_is_open</code></li>
+</ul>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_multipart -- --test-threads=1</code>. Expected: fails. <b>Implement</b>, then run it again, plus <code>--test s3_write</code>, <code>--test s3_uploads</code> and <code>--test s3_write_routes</code>. The last needs its over-the-limit test updated to the new limit and message. Expected: pass.</p>
+<p><b>Done means</b>: the listed tests pass.</p>
+<p><b>Review focus</b>:</p>
+<ul>
+<li>any exit after <code>start_multipart</code> that neither completes nor aborts, including <code>?</code> in the middle;</li>
+<li>a condition dropped on the multipart path;</li>
+<li>a whole part held in memory;</li>
+<li>a row left behind after a successful completion.</li>
+</ul>
+</div>
+
+<div class="task">
+<h3>Task 9: editor saves reach the bucket when the last person leaves</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/file_room.rs</code>, <code>crates/server/src/checkpoint.rs</code>, <code>crates/server/src/source_write.rs</code> (<code>ExternalCheckpointer</code>, <code>flush_write</code> use) and <code>crates/records/src/source_writes.rs</code> (<code>flush_write</code>). Extend <code>crates/server/tests/s3_sessions.rs</code>.</p>
+<h4>Rules</h4>
+<ul class="band">
+<li>A new <code>Checkpointer::room_emptied(&amp;self, doc)</code> has a default that does nothing. <code>file_room.rs</code> calls it once each time the room goes from occupied to empty. It does not call it again until someone has joined. Live co-authoring rooms (<code>live_room.rs</code>) are not touched.</li>
+<li><code>ExternalCheckpointer::room_emptied</code> marks the node's pending write <code>flush</code> and wakes the worker, as <code>session_ended</code> does. <code>session_ended</code> keeps doing the same.</li>
+<li><code>Db::flush_write</code> also clears <code>next_try_at</code> when the row is not <code>failed</code>, so a flushed row is due at once.</li>
+<li>Ordinary (Git-backed) documents behave exactly as before.</li>
+</ul>
+<p><b>Write failing tests in <code>s3_sessions.rs</code>:</b> <code>leaving_the_room_makes_the_last_save_due_at_once</code>; <code>a_rejoin_before_the_write_keeps_one_write</code>; <code>an_ordinary_document_is_unchanged_when_its_room_empties</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_sessions -- --test-threads=1</code>. Expected: fails. <b>Implement</b>, then run it again, plus <code>--test file_rooms</code> (or the file-room suite by its real name) and <code>cargo test -j 3 -p records --test source_writes</code>. Expected: pass.</p>
+<p><b>Done means</b>: the listed tests pass, and the G5 file-room tests are unchanged.</p>
+<p><b>Review focus</b>: the empty transition fired on every message rather than once; a flush during a conflict state.</p>
+</div>
+
+<div class="task">
+<h3>Task 10: pages</h3>
+<p><b>Files.</b> Modify <code>web/source-panel.js</code>, <code>web/source-panel.test.mjs</code>, <code>web/library.js</code>, <code>web/library-settings.js</code>, <code>web/library-settings.html</code>, <code>web/site.js</code>, <code>web/site.html</code>, <code>web/upload.js</code>, <code>web/bin.js</code> (or <code>web/recycle.js</code>, whichever shows bin errors), and <code>web/style.css</code> only for leftover 2.</p>
+<h4>Rules</h4>
+<ul class="band">
+<li><code>sourceActions(access, source)</code> for a writable S3 library allows <code>rename</code>, <code>move</code>, <code>remove</code> and <code>copy</code>. Moves between libraries stay hidden or disabled with the reason.</li>
+<li><code>sourceWriteErrorText</code> knows the new codes and shows their server messages. For a <code>left_behind</code> answer it shows: "Done. {n} of the original objects could not be removed from the bucket; they will show up as separate files until someone removes them."</li>
+<li><b>The conditional-write warning.</b> The library banner shows <code>overwriteNote(conditional)</code> for a read-and-write library whose <code>conditional</code> is <code>no</code> or <code>unknown</code>. The connect dialog shows the same sentence after connecting in read-and-write mode, when the answer carries <code>conditional</code> other than <code>yes</code>. If the connect answer lacks <code>conditional</code>, add it in <code>crates/server/src/api/sources.rs</code> (allowed for this card).</li>
+<li><b>Leftover 2, the gap above "Check every".</b> Open <code>library-settings.html</code> for an S3 library in the Browser pane, find what makes the gap (probably the <code>.row</code> holding only the hidden switch, or an empty <code>.msg</code>), and remove it. The report includes a before-and-after screenshot at 375 px and at desktop width.</li>
+<li><b>Leftover 3, the charge sentence.</b> <code>#s3-mode-note</code> in <code>site.html</code> is shown only while "Read and write" is selected. While "Read only" is selected it reads "ShareCraft only reads from the bucket."</li>
+<li><b>Leftover 4, the repeated text.</b> The blocked headline becomes "Read-only until fixed." followed by the stored <code>write_error</code> sentence, in both <code>library-settings.js</code> and <code>source-panel.js</code>. The server's <code>BLOCKED_REASON</code> and the <code>SOURCE_WRITE_BLOCKED</code> message keep the single statement.</li>
+<li>Bin pages show the restore name change ("Restored as {name}") as they do today, and show the new errors in plain words.</li>
+</ul>
+<p><b>Write failing tests in <code>web/source-panel.test.mjs</code>:</b> writable S3 actions include rename, move, remove and copy; the new codes and <code>left_behind</code> map to the sentences above; the banner shows the overwrite note for <code>no</code> and <code>unknown</code> and not for <code>yes</code>; the blocked text names the refusal once.</p>
+<p><b>Run</b> <code>node --test web/</code>. Expected: fails. <b>Implement</b>, then run it again. Expected: pass. Then check the library page, the settings page, the connect dialog and the bin page in the Browser pane, in light and dark, at 375 px.</p>
+<p><b>Done means</b>: the page tests pass, the screenshots are in the report, and there is no horizontal scroll at 375 px.</p>
+<p><b>Review focus</b>: an action offered that the server refuses; colour-only state; text that repeats itself.</p>
+</div>
+
+<div class="task">
+<h3>Task 11: whole-slice review and one fix wave</h3>
+<p>A read-only review (most capable model) of <code>7255f63..HEAD</code>, against this plan, the scope and the Review focus list. Numbered findings go in the ledger, and one fix run addresses the Critical and Important ones. The controller then runs the touched suites, <code>cargo clippy</code>, <code>cargo fmt --check</code> and <code>node --test web/</code>, and asks the owner to approve a push for the full <code>check.yml</code> run.</p>
+</div>
+
+<div class="task">
+<h3>Task 12: live check on the owner's R2 bucket (controller)</h3>
+<p>Before asking, the controller re-reads Cloudflare's R2 price page and states the cost. Expected: a few hundred Class A requests, plus about 1 GiB stored for a day, inside the free allowance, so $0.00. The owner makes a test bucket and an Object Read &amp; Write token, and types the key into the page. The check, on a throwaway server as in slice 1:</p>
+<ul class="band">
+<li>Rename a file, and rename and move a folder of about 20 files.</li>
+<li>Delete a file and a folder, confirm the <code>.sharecraft-bin/</code> objects in the dashboard, Restore one, and Purge the other.</li>
+<li>Copy within the bucket.</li>
+<li>Copy out to an ordinary library, and copy back in.</li>
+<li>Upload a 600 MiB file, which takes the multipart path, and compare its SHA-256 after the owner downloads it.</li>
+<li>Change a file in the dashboard and try to move it, to confirm the refusal.</li>
+<li>Edit a document, leave, and confirm the write arrives within seconds.</li>
+<li>Check that no multipart upload is left open (dashboard or <code>ListMultipartUploads</code>).</li>
+</ul>
+<p>The owner revokes the token afterwards.</p>
+</div>
+
+<div class="task">
+<h3>Task 13: the records</h3>
+<p><b>Files.</b> <code>BUILDING.html</code> (the S3 section: slice 2, the live check results, the parked minors), <code>scope.html</code> (decisions for the holding folder, the 1,000-object cap, the 5 GiB cap and copy between libraries) and <code>sequencing.html</code> (what is next). Each in the same style as the slice 1 records commit (1b2c2a6).</p>
+</div>
+
+<h2>Not checked, and risks</h2>
+<ul class="band">
+<li><b>Moves are not atomic.</b> A failure part-way through can leave duplicates until the next listing. It never loses content.</li>
+<li><b>Request cost.</b> A rename, move or delete costs two requests per object, plus a HEAD per file. A 1,000-object folder is about 3,000 requests. Held content is billed as storage until it is purged.</li>
+<li><b>A long request.</b> A large folder holds the request, and the library's source lock, for minutes. Listings and the write worker wait meanwhile.</li>
+<li><b>Untested stores.</b> R2's handling of <code>x-amz-copy-source-if-match</code> together with <code>If-None-Match</code> on the same copy is taken from Cloudflare's documentation. Task 12 confirms it; until then a store that ignores one of them is a risk. MinIO and AWS are not tested.</li>
+<li><b>Large objects</b> over 5 GiB that someone else put in the bucket cannot be renamed, moved, copied or deleted from ShareCraft.</li>
+<li><b>Deletes made in the bucket by others</b> still show as deletions without a holding copy, as in slice 1.</li>
+<li><b>Version history.</b> Delete markers and "Restore this version" (versioned buckets) stay for later, with Task 13 of the S3 plan.</li>
+</ul>
+</main>
+</body>
+</html>

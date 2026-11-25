@@ -1036,10 +1036,16 @@ async fn run(
             }
             () = sleep_until(grace_ends) => {}
         }
+        let was_empty = empty_since.is_some();
         empty_since = match (room.is_empty(), empty_since) {
             (false, _) => None,
             (true, since) => since.or_else(|| Some(Instant::now())),
         };
+        // Told once per emptying: the loop runs for every command, but only the step from
+        // occupied to empty gets here.
+        if !was_empty && empty_since.is_some() {
+            store.room_emptied(doc);
+        }
         // A session in conflict has nothing to come back to, so it does not wait out the grace
         // period.
         let grace_over = empty_since

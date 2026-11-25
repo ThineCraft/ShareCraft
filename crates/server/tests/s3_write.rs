@@ -9,19 +9,24 @@
 
 mod common;
 
+use std::collections::HashSet;
 use std::time::Duration;
+
+use collab_core::ids::NodeId;
 
 use common::fake_s3::FakeS3;
 use records::{S3Endpoint, Tri, object_tag, reserved_name, windows_safe_name};
-use server::s3::{PutBody, S3, S3Target};
+use server::s3::{COPY_MAX, PutBody, S3, S3Target};
 use server::s3_sign::{Credentials, sha256_hex};
 use server::s3_write::{
-    make_folder, object_key, probe_writes, write_beside, write_numbered, write_object,
+    MOVE_MAX_OBJECTS, Moved, copy_item, delete_held, hold, holding_root, make_folder, move_item,
+    object_key, probe_writes, sweep_holding, unhold, write_beside, write_numbered, write_object,
 };
 use server::secrets::Secret;
 use server::source_write::{Base, Probe, Seen, WriteError, Written, numbered_name, sibling_name};
 use sha2::Digest;
-use time::OffsetDateTime;
+use time::{Date, Month, OffsetDateTime};
+use uuid::Uuid;
 
 const BUCKET: &str = "docs";
 const PREFIX: &str = "lib/";
@@ -621,11 +626,27 @@ async fn errors_map_to_plain_write_errors() {
             .unwrap_err(),
         WriteError::Failed
     );
-    // Over the single-PUT limit: refused before any request.
-    s3.set_single_put_max_for_tests(2);
+    // Over 5 GiB (what ShareCraft can move afterwards): refused before any request.
+    let huge = PutBody {
+        size: COPY_MAX + 1,
+        ..body.clone()
+    };
     let before = fake.requests().len();
     assert_eq!(
-        write_object(&s3, &t, "big.bin", &body, &base(None), Tri::Yes)
+        write_object(&s3, &t, "big.bin", &huge, &base(None), Tri::Yes)
+            .await
+            .unwrap_err(),
+        WriteError::TooLarge
+    );
+    // More parts than a multipart upload takes: refused before any request too.
+    s3.set_single_put_max_for_tests(2);
+    s3.set_part_bytes_for_tests(1);
+    let many = PutBody {
+        size: 10_001,
+        ..body.clone()
+    };
+    assert_eq!(
+        write_object(&s3, &t, "big.bin", &many, &base(None), Tri::Yes)
             .await
             .unwrap_err(),
         WriteError::TooLarge
@@ -820,4 +841,685 @@ async fn on_a_store_that_ignores_conditions_a_taken_copy_name_is_not_overwritten
         .unwrap();
     assert_eq!(path, "new (2).txt");
     assert_eq!(fake.object(BUCKET, "lib/new.txt").unwrap().bytes, b"theirs");
+}
+
+// ---- Bucket moves (slice 2) ----
+
+/// What the tree recorded for each library-relative path: a file's tag from its `HEAD`, and an
+/// empty tag for a folder (a path ending `/`).
+async fn known(s3: &S3, t: &S3Target, paths: &[&str]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for path in paths {
+        let tag = if path.ends_with('/') {
+            String::new()
+        } else {
+            tag_of(s3, t, &format!("{PREFIX}{path}")).await
+        };
+        out.push(((*path).to_owned(), tag));
+    }
+    out
+}
+
+fn kinds(fake: &FakeS3) -> Vec<String> {
+    fake.writes().into_iter().map(|(kind, _, _)| kind).collect()
+}
+
+fn seen_paths(moved: &Moved) -> Vec<String> {
+    let mut paths: Vec<String> = moved.seen.iter().map(|(p, _)| p.clone()).collect();
+    paths.sort();
+    paths
+}
+
+fn day(year: i32, month: Month, d: u8) -> Date {
+    Date::from_calendar_date(year, month, d).unwrap()
+}
+
+fn new_root() -> String {
+    holding_root(day(2026, Month::November, 24), NodeId(Uuid::new_v4()))
+}
+
+#[tokio::test]
+async fn moving_a_file_copies_then_deletes_and_answers_the_new_head() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/a.txt", b"hello");
+    let k = known(&s3, &t, &["a.txt"]).await;
+
+    let moved = move_item(&s3, &t, "a.txt", "dir/b.txt", false, &k)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.writes(),
+        [
+            w("COPY", "lib/dir/b.txt", "absent"),
+            w("DELETE", "lib/a.txt", "none")
+        ]
+    );
+    // The copy is conditional on the source's tag.
+    let copy = fake
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "PUT")
+        .unwrap();
+    assert!(
+        copy.headers
+            .contains(&"x-amz-copy-source-if-match".to_owned())
+    );
+    assert!(fake.object(BUCKET, "lib/a.txt").is_none());
+    let stored = fake.object(BUCKET, "lib/dir/b.txt").unwrap();
+    assert_eq!(stored.bytes, b"hello");
+    assert_eq!(moved.objects, 1);
+    assert_eq!(moved.left_behind, 0);
+    assert_eq!(moved.seen.len(), 1);
+    let (path, seen) = &moved.seen[0];
+    assert_eq!(path, "dir/b.txt");
+    assert_eq!(
+        seen.tag,
+        object_tag(5, stored.modified_s, &stored.etag, false)
+    );
+    assert_eq!(seen.size, 5);
+
+    // A path that would leave the prefix is refused before anything is asked.
+    let writes = fake.writes().len();
+    for (from, to) in [
+        ("../x.txt", "y.txt"),
+        ("dir/b.txt", "../y.txt"),
+        ("dir/b.txt", ""),
+    ] {
+        assert_eq!(
+            move_item(&s3, &t, from, to, false, &[]).await.unwrap_err(),
+            WriteError::Failed,
+            "{from} -> {to}"
+        );
+    }
+    // A folder cannot move into itself.
+    assert_eq!(
+        move_item(&s3, &t, "dir/", "dir/inner/", true, &[])
+            .await
+            .unwrap_err(),
+        WriteError::Failed
+    );
+    assert_eq!(fake.writes().len(), writes);
+}
+
+#[tokio::test]
+async fn moving_a_folder_moves_every_object_and_its_marker() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/docs/", b"");
+    fake.put(BUCKET, "lib/docs/a.txt", b"a");
+    fake.put(BUCKET, "lib/docs/sub/b.txt", b"bb");
+    fake.put(BUCKET, "lib/docs2/x.txt", b"not inside");
+    fake.put(BUCKET, "lib/docs.txt", b"not inside");
+    let k = known(
+        &s3,
+        &t,
+        &["docs/", "docs/a.txt", "docs/sub/", "docs/sub/b.txt"],
+    )
+    .await;
+
+    let moved = move_item(&s3, &t, "docs/", "archive/docs/", true, &k)
+        .await
+        .unwrap();
+    assert_eq!(moved.objects, 3);
+    assert_eq!(moved.left_behind, 0);
+    assert_eq!(
+        seen_paths(&moved),
+        [
+            "archive/docs/",
+            "archive/docs/a.txt",
+            "archive/docs/sub/b.txt"
+        ]
+    );
+    assert_eq!(
+        kinds(&fake),
+        ["COPY", "COPY", "COPY", "DELETE", "DELETE", "DELETE"]
+    );
+    assert!(
+        fake.writes()
+            .iter()
+            .all(|(kind, _, cond)| kind == "DELETE" || cond == "absent")
+    );
+    for key in ["lib/docs/", "lib/docs/a.txt", "lib/docs/sub/b.txt"] {
+        assert!(fake.object(BUCKET, key).is_none(), "{key}");
+    }
+    assert_eq!(
+        fake.object(BUCKET, "lib/archive/docs/sub/b.txt")
+            .unwrap()
+            .bytes,
+        b"bb"
+    );
+    assert!(fake.object(BUCKET, "lib/archive/docs/").is_some());
+    assert!(fake.object(BUCKET, "lib/docs2/x.txt").is_some());
+    assert!(fake.object(BUCKET, "lib/docs.txt").is_some());
+}
+
+#[tokio::test]
+async fn moving_a_folder_over_the_cap_is_refused_before_any_write() {
+    let (fake, s3, t) = setup().await;
+    fake.page_size(400);
+    for i in 0..=MOVE_MAX_OBJECTS {
+        fake.put(BUCKET, &format!("lib/big/{i:04}.txt"), b"x");
+    }
+    let result = move_item(&s3, &t, "big/", "other/", true, &[]).await;
+    assert_eq!(
+        result.unwrap_err(),
+        WriteError::TooMany(MOVE_MAX_OBJECTS + 1)
+    );
+    assert!(fake.writes().is_empty());
+    let result = copy_item(&s3, &t, "big/", "other/", true, &[], &[]).await;
+    assert_eq!(result.unwrap_err(), WriteError::TooMany(1001));
+    assert_eq!(server::source_write::thousands(1001), "1,001");
+    assert_eq!(server::source_write::thousands(1_234_567), "1,234,567");
+    assert_eq!(server::source_write::thousands(999), "999");
+    let result = hold(&s3, &t, "big/", true, &new_root(), &[]).await;
+    assert_eq!(result.unwrap_err(), WriteError::TooMany(1001));
+    assert!(fake.writes().is_empty());
+}
+
+#[tokio::test]
+async fn moving_an_object_over_five_gib_is_refused_before_any_write() {
+    let (fake, s3, t) = setup().await;
+    let huge = server::s3::COPY_MAX + 1;
+    fake.put(BUCKET, "lib/huge.bin", b"pretend");
+    fake.claim_size("lib/huge.bin", huge);
+    fake.put(BUCKET, "lib/f/small.txt", b"s");
+    fake.put(BUCKET, "lib/f/huge.bin", b"pretend");
+    fake.claim_size("lib/f/huge.bin", huge);
+    let k = known(&s3, &t, &["huge.bin", "f/", "f/small.txt", "f/huge.bin"]).await;
+
+    assert_eq!(
+        move_item(&s3, &t, "huge.bin", "moved.bin", false, &k)
+            .await
+            .unwrap_err(),
+        WriteError::TooLargeToMove
+    );
+    assert_eq!(
+        move_item(&s3, &t, "f/", "g/", true, &k).await.unwrap_err(),
+        WriteError::TooLargeToMove
+    );
+    assert_eq!(
+        copy_item(&s3, &t, "f/", "g/", true, &k, &[])
+            .await
+            .unwrap_err(),
+        WriteError::TooLargeToMove
+    );
+    assert_eq!(
+        hold(&s3, &t, "huge.bin", false, &new_root(), &k)
+            .await
+            .unwrap_err(),
+        WriteError::TooLargeToMove
+    );
+    assert!(fake.writes().is_empty());
+}
+
+#[tokio::test]
+async fn moving_a_file_changed_outside_is_refused_and_nothing_is_deleted() {
+    let (fake, s3, t) = setup().await;
+    fake.put_at(BUCKET, "lib/a.txt", b"v1", 1_700_000_000);
+    let k = known(&s3, &t, &["a.txt"]).await;
+    fake.put_at(BUCKET, "lib/a.txt", b"changed outside", 1_800_000_000);
+    assert_eq!(
+        move_item(&s3, &t, "a.txt", "b.txt", false, &k)
+            .await
+            .unwrap_err(),
+        WriteError::Changed
+    );
+    assert!(fake.writes().is_empty());
+
+    // Changed between the check and the copy: the store refuses the copy.
+    let k = known(&s3, &t, &["a.txt"]).await;
+    fake.change_after_head("lib/a.txt", b"changed meanwhile");
+    assert_eq!(
+        move_item(&s3, &t, "a.txt", "b.txt", false, &k)
+            .await
+            .unwrap_err(),
+        WriteError::Changed
+    );
+    assert_eq!(fake.writes(), [w("COPY", "lib/b.txt", "absent")]);
+    assert_eq!(
+        fake.object(BUCKET, "lib/a.txt").unwrap().bytes,
+        b"changed meanwhile"
+    );
+    assert!(fake.object(BUCKET, "lib/b.txt").is_none());
+
+    // A file that is gone is a change too.
+    fake.remove(BUCKET, "lib/a.txt");
+    assert_eq!(
+        move_item(&s3, &t, "a.txt", "b.txt", false, &k)
+            .await
+            .unwrap_err(),
+        WriteError::Changed
+    );
+    assert_eq!(fake.writes().len(), 1);
+}
+
+#[tokio::test]
+async fn a_key_that_appeared_inside_the_folder_is_a_change() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/docs/a.txt", b"a");
+    let k = known(&s3, &t, &["docs/", "docs/a.txt"]).await;
+    fake.put(BUCKET, "lib/docs/new.txt", b"from outside");
+    assert_eq!(
+        move_item(&s3, &t, "docs/", "other/", true, &k)
+            .await
+            .unwrap_err(),
+        WriteError::Changed
+    );
+    assert!(fake.writes().is_empty());
+
+    // A known file changed inside the folder is a change as well.
+    fake.remove(BUCKET, "lib/docs/new.txt");
+    fake.put_at(BUCKET, "lib/docs/a.txt", b"edited", 1_800_000_000);
+    assert_eq!(
+        hold(&s3, &t, "docs/", true, &new_root(), &k)
+            .await
+            .unwrap_err(),
+        WriteError::Changed
+    );
+    assert!(fake.writes().is_empty());
+    assert!(fake.object(BUCKET, "lib/docs/a.txt").is_some());
+}
+
+#[tokio::test]
+async fn moving_onto_a_taken_name_is_refused_before_any_write() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/a.txt", b"mine");
+    fake.put(BUCKET, "lib/b.txt", b"theirs");
+    fake.put(BUCKET, "lib/docs/a.txt", b"a");
+    fake.put(BUCKET, "lib/dest/docs/a.txt", b"theirs");
+    let k = known(&s3, &t, &["a.txt", "b.txt", "docs/", "docs/a.txt"]).await;
+    assert_eq!(
+        move_item(&s3, &t, "a.txt", "b.txt", false, &k)
+            .await
+            .unwrap_err(),
+        WriteError::NameTaken
+    );
+    assert_eq!(
+        move_item(&s3, &t, "docs/", "dest/docs/", true, &k)
+            .await
+            .unwrap_err(),
+        WriteError::NameTaken
+    );
+    assert!(fake.writes().is_empty());
+
+    // A name taken between the check and the copy: the copy is refused, and nothing of the
+    // other writer's is touched.
+    fake.appear_after_miss("lib/c.txt", b"someone else's");
+    assert_eq!(
+        move_item(&s3, &t, "a.txt", "c.txt", false, &k)
+            .await
+            .unwrap_err(),
+        WriteError::NameTaken
+    );
+    assert_eq!(fake.writes(), [w("COPY", "lib/c.txt", "absent")]);
+    assert_eq!(
+        fake.object(BUCKET, "lib/c.txt").unwrap().bytes,
+        b"someone else's"
+    );
+    assert_eq!(fake.object(BUCKET, "lib/a.txt").unwrap().bytes, b"mine");
+}
+
+#[tokio::test]
+async fn a_failed_copy_mid_folder_removes_the_copies_and_keeps_every_original() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/docs/", b"");
+    fake.put(BUCKET, "lib/docs/a.txt", b"a");
+    fake.put(BUCKET, "lib/docs/b.txt", b"b");
+    fake.put(BUCKET, "lib/docs/c.txt", b"c");
+    fake.put(BUCKET, "lib/new/other.txt", b"not ours");
+    let k = known(
+        &s3,
+        &t,
+        &["docs/", "docs/a.txt", "docs/b.txt", "docs/c.txt"],
+    )
+    .await;
+    fake.fail_copy_to("lib/new/docs/b.txt", 403, "AccessDenied");
+
+    let result = move_item(&s3, &t, "docs/", "new/docs/", true, &k).await;
+    assert_eq!(result.unwrap_err(), WriteError::Denied);
+    assert_eq!(
+        fake.writes(),
+        [
+            w("COPY", "lib/new/docs/", "absent"),
+            w("COPY", "lib/new/docs/a.txt", "absent"),
+            w("COPY", "lib/new/docs/b.txt", "absent"),
+            w("DELETE", "lib/new/docs/", "none"),
+            w("DELETE", "lib/new/docs/a.txt", "none"),
+        ]
+    );
+    for key in [
+        "lib/docs/",
+        "lib/docs/a.txt",
+        "lib/docs/b.txt",
+        "lib/docs/c.txt",
+        "lib/new/other.txt",
+    ] {
+        assert!(fake.object(BUCKET, key).is_some(), "{key}");
+    }
+    for key in ["lib/new/docs/", "lib/new/docs/a.txt", "lib/new/docs/b.txt"] {
+        assert!(fake.object(BUCKET, key).is_none(), "{key}");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_delete_is_counted_as_left_behind() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/docs/a.txt", b"a");
+    fake.put(BUCKET, "lib/docs/b.txt", b"b");
+    let k = known(&s3, &t, &["docs/", "docs/a.txt", "docs/b.txt"]).await;
+    // Two copies and the first delete are accepted; the second delete is refused.
+    fake.deny_writes_after(3);
+    let moved = move_item(&s3, &t, "docs/", "new/", true, &k).await.unwrap();
+    assert_eq!(moved.objects, 2);
+    assert_eq!(moved.left_behind, 1);
+    assert_eq!(seen_paths(&moved), ["new/a.txt", "new/b.txt"]);
+    assert_eq!(kinds(&fake), ["COPY", "COPY", "DELETE", "DELETE"]);
+    assert!(fake.object(BUCKET, "lib/docs/a.txt").is_none());
+    assert!(fake.object(BUCKET, "lib/docs/b.txt").is_some());
+    assert!(fake.object(BUCKET, "lib/new/a.txt").is_some());
+    assert!(fake.object(BUCKET, "lib/new/b.txt").is_some());
+}
+
+#[tokio::test]
+async fn copying_keeps_the_original() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/a.txt", b"one");
+    fake.put(BUCKET, "lib/docs/", b"");
+    fake.put(BUCKET, "lib/docs/b.txt", b"two");
+    let k = known(&s3, &t, &["a.txt", "docs/", "docs/b.txt"]).await;
+
+    let copied = copy_item(&s3, &t, "a.txt", "a copy.txt", false, &k, &[])
+        .await
+        .unwrap();
+    assert_eq!(copied.objects, 1);
+    assert_eq!(seen_paths(&copied), ["a copy.txt"]);
+    let copied = copy_item(&s3, &t, "docs/", "docs copy/", true, &k, &[])
+        .await
+        .unwrap();
+    assert_eq!(copied.objects, 2);
+    assert_eq!(seen_paths(&copied), ["docs copy/", "docs copy/b.txt"]);
+    assert_eq!(kinds(&fake), ["COPY", "COPY", "COPY"]);
+    assert_eq!(fake.object(BUCKET, "lib/a.txt").unwrap().bytes, b"one");
+    assert_eq!(fake.object(BUCKET, "lib/a copy.txt").unwrap().bytes, b"one");
+    assert_eq!(fake.object(BUCKET, "lib/docs/b.txt").unwrap().bytes, b"two");
+    assert_eq!(
+        fake.object(BUCKET, "lib/docs copy/b.txt").unwrap().bytes,
+        b"two"
+    );
+}
+
+#[tokio::test]
+async fn a_copy_leaves_out_what_it_is_told_to_skip_and_counts_and_checks_none_of_it() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/docs/", b"");
+    fake.put(BUCKET, "lib/docs/a.txt", b"one");
+    fake.put(BUCKET, "lib/docs/hidden.txt", b"two");
+    fake.put(BUCKET, "lib/docs/hid/", b"");
+    fake.put(BUCKET, "lib/docs/hid/b.txt", b"three");
+    fake.put(BUCKET, "lib/docs/hid/deep/c.txt", b"four");
+    fake.put(BUCKET, "lib/docs/hidden.txt.bak", b"five");
+    // The tree's record of the hidden file is stale: left out, it is not checked.
+    let mut k = known(
+        &s3,
+        &t,
+        &[
+            "docs/",
+            "docs/a.txt",
+            "docs/hidden.txt",
+            "docs/hid/",
+            "docs/hid/b.txt",
+            "docs/hid/deep/c.txt",
+            "docs/hidden.txt.bak",
+        ],
+    )
+    .await;
+    for entry in &mut k {
+        if entry.0 == "docs/hid/b.txt" {
+            entry.1 = "x0-0~stale".to_owned();
+        }
+    }
+    let skip = vec!["docs/hid/".to_owned(), "docs/hidden.txt".to_owned()];
+
+    let copied = copy_item(&s3, &t, "docs/", "docs copy/", true, &k, &skip)
+        .await
+        .unwrap();
+    assert_eq!(copied.objects, 3);
+    assert_eq!(
+        seen_paths(&copied),
+        ["docs copy/", "docs copy/a.txt", "docs copy/hidden.txt.bak"]
+    );
+    assert_eq!(kinds(&fake), ["COPY", "COPY", "COPY"]);
+    for gone in ["hidden.txt", "hid/", "hid/b.txt", "hid/deep/c.txt"] {
+        assert!(
+            fake.object(BUCKET, &format!("lib/docs copy/{gone}"))
+                .is_none(),
+            "{gone}"
+        );
+    }
+    assert!(fake.object(BUCKET, "lib/docs/hid/b.txt").is_some());
+}
+
+#[tokio::test]
+async fn hold_and_unhold_round_trip_the_bytes_and_the_sha_metadata() {
+    let (fake, s3, t) = setup().await;
+    let (_f, body) = file_body(b"precious");
+    write_object(&s3, &t, "docs/a.txt", &body, &base(None), Tri::Yes)
+        .await
+        .unwrap();
+    make_folder(&s3, &t, "docs", Tri::Yes).await.unwrap();
+    let sha = fake.object(BUCKET, "lib/docs/a.txt").unwrap().sha256;
+    assert!(sha.is_some());
+    let entry = NodeId(Uuid::new_v4());
+    let root = holding_root(day(2026, Month::November, 24), entry);
+    assert_eq!(root, format!(".sharecraft-bin/2026-11-24/{}/", entry.0));
+    let k = known(&s3, &t, &["docs/", "docs/a.txt"]).await;
+    let before = fake.writes().len();
+
+    let held = hold(&s3, &t, "docs/", true, &root, &k).await.unwrap();
+    assert_eq!(held.objects, 2);
+    assert_eq!(held.left_behind, 0);
+    assert_eq!(
+        seen_paths(&held),
+        [format!("{root}docs/"), format!("{root}docs/a.txt")]
+    );
+    let held_key = format!("lib/{root}docs/a.txt");
+    let stored = fake.object(BUCKET, &held_key).unwrap();
+    assert_eq!(stored.bytes, b"precious");
+    assert_eq!(stored.sha256, sha);
+    assert!(fake.object(BUCKET, "lib/docs/a.txt").is_none());
+    assert!(fake.object(BUCKET, "lib/docs/").is_none());
+    assert!(
+        fake.writes()[before..]
+            .iter()
+            .all(|(_, key, _)| key.starts_with("lib/"))
+    );
+
+    let back = unhold(&s3, &t, &root, "docs/", "docs/", true)
+        .await
+        .unwrap();
+    assert_eq!(back.objects, 2);
+    assert_eq!(seen_paths(&back), ["docs/", "docs/a.txt"]);
+    let stored = fake.object(BUCKET, "lib/docs/a.txt").unwrap();
+    assert_eq!(stored.bytes, b"precious");
+    assert_eq!(stored.sha256, sha);
+    assert!(fake.object(BUCKET, &held_key).is_none());
+
+    // A root that is not a holding root, or a holding key over 1,024 bytes, is refused first.
+    let writes = fake.writes().len();
+    let k = known(&s3, &t, &["docs/a.txt"]).await;
+    for bad in [
+        "docs/",
+        ".sharecraft-bin/../",
+        ".sharecraft-bin/2026-11-24/x/",
+        ".sharecraft-bin/2026-11-24/",
+        "",
+    ] {
+        assert_eq!(
+            hold(&s3, &t, "docs/a.txt", false, bad, &k)
+                .await
+                .unwrap_err(),
+            WriteError::Failed,
+            "{bad}"
+        );
+    }
+    // 967 bytes: a key in the library, but too long once under the holding root.
+    let segment = "日".repeat(80);
+    let long = format!("{segment}/{segment}/{segment}/{segment}.txt");
+    assert_eq!(long.len(), 967);
+    assert!(object_key(&t, &long).is_some());
+    assert_eq!(
+        hold(&s3, &t, &long, false, &root, &[]).await.unwrap_err(),
+        WriteError::Failed
+    );
+    assert_eq!(fake.writes().len(), writes);
+}
+
+#[tokio::test]
+async fn unhold_onto_a_taken_name_answers_name_taken() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/a.txt", b"deleted one");
+    let k = known(&s3, &t, &["a.txt"]).await;
+    let root = new_root();
+    hold(&s3, &t, "a.txt", false, &root, &k).await.unwrap();
+    fake.put(BUCKET, "lib/a.txt", b"a new one");
+    let writes = fake.writes().len();
+
+    assert_eq!(
+        unhold(&s3, &t, &root, "a.txt", "a.txt", false)
+            .await
+            .unwrap_err(),
+        WriteError::NameTaken
+    );
+    assert_eq!(fake.writes().len(), writes);
+    let back = unhold(&s3, &t, &root, "a.txt", "a (2).txt", false)
+        .await
+        .unwrap();
+    assert_eq!(seen_paths(&back), ["a (2).txt"]);
+    assert_eq!(
+        fake.object(BUCKET, "lib/a (2).txt").unwrap().bytes,
+        b"deleted one"
+    );
+    assert_eq!(
+        fake.object(BUCKET, "lib/a.txt").unwrap().bytes,
+        b"a new one"
+    );
+}
+
+#[tokio::test]
+async fn delete_held_removes_only_that_root() {
+    let (fake, s3, t) = setup().await;
+    let one = new_root();
+    let two = new_root();
+    fake.put(BUCKET, &format!("lib/{one}docs/"), b"");
+    fake.put(BUCKET, &format!("lib/{one}docs/a.txt"), b"a");
+    fake.put(BUCKET, &format!("lib/{one}b.txt"), b"b");
+    fake.put(BUCKET, &format!("lib/{two}a.txt"), b"kept");
+    fake.put(BUCKET, "lib/a.txt", b"kept");
+    // The same root under another prefix is another library's.
+    fake.put(BUCKET, &format!("other/{one}a.txt"), b"kept");
+
+    assert_eq!(delete_held(&s3, &t, &one).await.unwrap(), 3);
+    assert_eq!(kinds(&fake), ["DELETE", "DELETE", "DELETE"]);
+    assert!(
+        fake.object(BUCKET, &format!("lib/{one}docs/a.txt"))
+            .is_none()
+    );
+    assert!(fake.object(BUCKET, &format!("lib/{two}a.txt")).is_some());
+    assert!(fake.object(BUCKET, "lib/a.txt").is_some());
+    assert!(fake.object(BUCKET, &format!("other/{one}a.txt")).is_some());
+
+    // A failed delete is reported after every key was tried.
+    fake.put(BUCKET, &format!("lib/{two}b.txt"), b"b");
+    fake.deny_writes_after(3);
+    assert_eq!(
+        delete_held(&s3, &t, &two).await.unwrap_err(),
+        WriteError::Denied
+    );
+    assert_eq!(fake.writes().len(), 5);
+    // Not a holding root: refused without a request.
+    assert_eq!(
+        delete_held(&s3, &t, "").await.unwrap_err(),
+        WriteError::Failed
+    );
+    assert_eq!(
+        delete_held(&s3, &t, "docs/").await.unwrap_err(),
+        WriteError::Failed
+    );
+    assert_eq!(fake.writes().len(), 5);
+}
+
+#[tokio::test]
+async fn the_sweep_removes_only_old_unnamed_objects_inside_the_holding_prefix() {
+    let (fake, s3, t) = setup().await;
+    let old = day(2026, Month::January, 1);
+    let unnamed = NodeId(Uuid::new_v4());
+    let kept = NodeId(Uuid::new_v4());
+    let gone_one = format!("lib/{}a.txt", holding_root(old, unnamed));
+    let gone_two = format!("lib/{}docs/b.txt", holding_root(old, unnamed));
+    let left = [
+        format!("lib/{}a.txt", holding_root(old, kept)),
+        format!(
+            "lib/{}a.txt",
+            holding_root(day(2026, Month::November, 20), unnamed)
+        ),
+        "lib/.sharecraft-bin/notes.txt".to_owned(),
+        "lib/.sharecraft-bin/2026-01-01/notes.txt".to_owned(),
+        format!("lib/.sharecraft-bin/2026-01-01/{}", unnamed.0),
+        format!("lib/.sharecraft-bin/not-a-date/{}/a.txt", unnamed.0),
+        format!("lib/.sharecraft-bin/2026-13-01/{}/a.txt", unnamed.0),
+        "lib/.sharecraft-bin/2026-01-01/not-an-id/a.txt".to_owned(),
+        "lib/.sharecraft-binder/2026-01-01/x/a.txt".to_owned(),
+        "lib/old.txt".to_owned(),
+        format!("lib/docs/{}a.txt", holding_root(old, unnamed)),
+        format!("other/{}a.txt", holding_root(old, unnamed)),
+    ];
+    fake.put(BUCKET, &gone_one, b"x");
+    fake.put(BUCKET, &gone_two, b"x");
+    for key in &left {
+        fake.put(BUCKET, key, b"x");
+    }
+    let keep: HashSet<NodeId> = [kept].into_iter().collect();
+
+    let count = sweep_holding(&s3, &t, day(2026, Month::August, 1), &keep)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+    let mut deleted: Vec<String> = fake.writes().into_iter().map(|(_, key, _)| key).collect();
+    deleted.sort();
+    let mut expected = vec![gone_one, gone_two];
+    expected.sort();
+    assert_eq!(deleted, expected);
+    assert!(kinds(&fake).iter().all(|kind| kind == "DELETE"));
+    for key in &left {
+        assert!(fake.object(BUCKET, key).is_some(), "{key}");
+    }
+}
+
+#[tokio::test]
+async fn moving_a_file_with_no_recorded_tag_is_a_change() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/a.txt", b"never recorded");
+    let other = known(&s3, &t, &["a.txt"]).await;
+    let other = [("b.txt".to_owned(), other[0].1.clone())];
+    for k in [&[][..], &other[..]] {
+        assert_eq!(
+            move_item(&s3, &t, "a.txt", "c.txt", false, k)
+                .await
+                .unwrap_err(),
+            WriteError::Changed
+        );
+        assert_eq!(
+            copy_item(&s3, &t, "a.txt", "c.txt", false, k, &[])
+                .await
+                .unwrap_err(),
+            WriteError::Changed
+        );
+        assert_eq!(
+            hold(&s3, &t, "a.txt", false, &new_root(), k)
+                .await
+                .unwrap_err(),
+            WriteError::Changed
+        );
+    }
+    assert!(fake.writes().is_empty());
+    assert!(fake.object(BUCKET, "lib/a.txt").is_some());
 }

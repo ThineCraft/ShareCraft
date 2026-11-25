@@ -69,6 +69,11 @@ pub trait Checkpointer: Send + Sync + 'static {
     /// runs elsewhere. By default nothing is done.
     fn session_ended(&self, _doc: DocId) {}
 
+    /// Told by a file session of `doc` each time its room goes from occupied to empty, once per
+    /// emptying (not again until someone has joined). The session may live on for its grace
+    /// period. Must not block. By default nothing is done.
+    fn room_emptied(&self, _doc: DocId) {}
+
     /// Records one change to the content tree as one commit credited to its author.
     ///
     /// # Errors

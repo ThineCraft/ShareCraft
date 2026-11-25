@@ -513,6 +513,12 @@ async fn after_purge(
         .bind(&ids)
         .execute(&mut *conn)
         .await?;
+    sqlx::query("delete from source_held where entry_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *conn)
+        .await?;
+    // Its open multipart uploads keep their rows (the node row stays, purged): a row is how
+    // the sweep finds an upload to abort, and the sweep forgets it then.
     sqlx::query("delete from source_items where node_id = any($1)")
         .bind(&ids)
         .execute(&mut *conn)

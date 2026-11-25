@@ -225,6 +225,14 @@ impl Env {
         self.doc(node).await["revision"].as_str().map(str::to_owned)
     }
 
+    async fn revision_as(&self, user: &TestUser, node: NodeId) -> Option<String> {
+        let (status, body) = self
+            .call(user, Method::GET, &format!("/api/docs/{}", node.0), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["revision"].as_str().map(str::to_owned)
+    }
+
     /// An editor of `node` opened by `user`.
     async fn editor(&self, user: &TestUser, node: NodeId) -> FileClient {
         FileClient::connect_as(&self.server, doc_of(node), user).await
@@ -439,6 +447,118 @@ async fn leaving_the_session_flushes_the_last_save() {
     env.write(OffsetDateTime::now_utc()).await;
     assert_eq!(env.object("docs/sheet.xlsx").unwrap().bytes, b"last words");
     assert!(env.pending(file).await.is_none());
+}
+
+/// Waits (at most five seconds) until `file`'s pending write is flushed.
+async fn flushed(env: &Env, file: NodeId) -> PendingWrite {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(pending) = env.pending(file).await
+            && pending.flush
+        {
+            return pending;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the room emptying did not flush the save"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn leaving_the_room_makes_the_last_save_due_at_once() {
+    // The default grace period (60 s) is far from over: only the empty room can flush.
+    let env = Env::new().await;
+    let (_, file) = env.sheet().await;
+    let mut editor = env.editor(&env.owner, file).await;
+    let base = env.revision(file).await.unwrap();
+    env.saved(&editor, file, &base, b"last words").await;
+    // A retry time left on the row (a scan that was waited out) must not hold the write back.
+    sqlx::query(
+        "update source_writes set next_try_at = now() + interval '1 hour' where node_id = $1",
+    )
+    .bind(file.0)
+    .execute(env.db().test_pool())
+    .await
+    .unwrap();
+    assert!(!env.pending(file).await.unwrap().flush);
+    editor.close().await;
+
+    let pending = flushed(&env, file).await;
+    assert!(pending.next_try_at.is_none(), "{pending:?}");
+    env.write(OffsetDateTime::now_utc()).await;
+    assert_eq!(env.object("docs/sheet.xlsx").unwrap().bytes, b"last words");
+    assert!(env.pending(file).await.is_none());
+}
+
+#[tokio::test]
+async fn a_rejoin_before_the_write_keeps_one_write() {
+    let env = Env::new().await;
+    let (_, file) = env.sheet().await;
+    let mut editor = env.editor(&env.owner, file).await;
+    let base = env.revision(file).await.unwrap();
+    env.saved(&editor, file, &base, b"first and last").await;
+    editor.close().await;
+    flushed(&env, file).await;
+
+    // Back in the room before the worker has written anything.
+    let again = env.editor(&env.owner, file).await;
+    assert!(again.can_edit);
+    let now = OffsetDateTime::now_utc();
+    env.write(now).await;
+    env.write(now + time::Duration::seconds(31)).await;
+    assert_eq!(
+        env.writes_of("docs/sheet.xlsx"),
+        [("PUT".into(), "match".into())]
+    );
+    assert_eq!(
+        env.object("docs/sheet.xlsx").unwrap().bytes,
+        b"first and last"
+    );
+    assert!(env.pending(file).await.is_none());
+}
+
+#[tokio::test]
+async fn an_ordinary_document_is_unchanged_when_its_room_empties() {
+    let env = Env::new().await;
+    let home = common::Site::library(&env.server).await;
+    let response = env
+        .server
+        .http(Some(&env.admin))
+        .post(env.server.url("/api/docs/upload"))
+        .query(&[
+            ("parent", home.0.to_string()),
+            ("name", "plain.xlsx".into()),
+        ])
+        .body(b"plain workbook".to_vec())
+        .send()
+        .await
+        .unwrap();
+    let (status, body) = answer(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let plain = id_of(&body);
+    let mut editor = env.editor(&env.admin, plain).await;
+    let base = env.revision_as(&env.admin, plain).await.unwrap();
+    let token = editor.token().expect("the editor holds the seat");
+    let (status, body) = env
+        .save(&env.admin, plain, &token, Some(&base), b"plain edits")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    editor.close().await;
+    // Let the room see the departure: a later join is answered only after it has.
+    let mut again = env.editor(&env.admin, plain).await;
+    again.close().await;
+
+    // The save is in the store as ever; nothing was staged for any bucket.
+    assert!(env.pending(plain).await.is_none());
+    let (rows,): (i64,) = sqlx::query_as("select count(*) from source_writes")
+        .fetch_one(env.db().test_pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    assert_eq!(env.write(OffsetDateTime::now_utc()).await, 0);
+    assert!(env.fake.writes().is_empty());
 }
 
 #[tokio::test]

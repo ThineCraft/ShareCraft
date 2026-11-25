@@ -17,7 +17,10 @@ use std::time::Duration;
 use collab_core::ids::NodeId;
 use common::fake_s3::{FakeS3, Opts};
 use records::{S3Endpoint, Versioning};
-use server::s3::{Body, Class, Cond, PutBody, S3, S3Error, S3Target, SINGLE_PUT_MAX};
+use server::s3::{
+    Body, COPY_MAX, Class, Cond, PartBody, PutBody, S3, S3Error, S3Target, SINGLE_PUT_MAX,
+    failure_log_line,
+};
 use server::s3_sign::Credentials;
 use server::s3_sign::sha256_hex;
 use server::secrets::Secret;
@@ -1069,4 +1072,428 @@ async fn a_store_that_ignores_conditions_accepts_both() {
         .unwrap();
     assert_eq!(fake.object(BUCKET, "k.txt").unwrap().bytes, b"ours");
     assert_eq!(fake.count("write"), 2);
+}
+
+// ---- copy and multipart -------------------------------------------------------------------
+
+fn sha_of(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// The part of `bytes` from `offset` for `len`, read from the file that holds all of `bytes`.
+fn part_of(file: &tempfile::NamedTempFile, bytes: &[u8], offset: usize, len: usize) -> PartBody {
+    PartBody {
+        path: file.path().to_path_buf(),
+        offset: offset as u64,
+        len: len as u64,
+        sha256: sha_of(&bytes[offset..offset + len]),
+    }
+}
+
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+async fn source_object(s3: &S3, t: &S3Target, key: &str, bytes: &[u8]) -> String {
+    let (_file, body) = file_body(bytes);
+    s3.put(t, key, &body, Cond::None).await.unwrap().etag
+}
+
+#[tokio::test]
+async fn a_copy_sends_the_source_and_its_etag_and_answers_the_new_head() {
+    let fake = fake().await;
+    fake.require_keys(KEY_ID, SECRET);
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let from = "a b/é+c.txt";
+    let to = "dest dir/ü+d e.txt";
+    let etag = source_object(&s3, &t, from, b"copy me").await;
+
+    let head = s3
+        .copy(&t, from, &etag, 7, to, Cond::IfAbsent)
+        .await
+        .unwrap();
+    assert_eq!(head.size, 7);
+    let stored = fake.object(BUCKET, to).unwrap();
+    assert_eq!(stored.bytes, b"copy me");
+    assert_eq!(head.etag, stored.etag);
+    assert_eq!(head.modified_s, stored.modified_s);
+    // The source's content hash travels with the copy.
+    assert_eq!(stored.sha256, fake.object(BUCKET, from).unwrap().sha256);
+    assert!(stored.sha256.is_some());
+    assert_eq!(head.sha256, stored.sha256);
+    assert!(fake.object(BUCKET, from).is_some());
+
+    let copies: Vec<_> = fake
+        .writes()
+        .into_iter()
+        .filter(|w| w.0 == "COPY")
+        .collect();
+    assert_eq!(copies, [("COPY".into(), to.into(), "absent".into())]);
+    let sent = fake
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "PUT" && r.headers.iter().any(|h| h == "x-amz-copy-source"))
+        .unwrap();
+    for name in [
+        "x-amz-copy-source-if-match",
+        "if-none-match",
+        "authorization",
+    ] {
+        assert!(sent.headers.iter().any(|h| h == name), "{name}: {sent:?}");
+    }
+
+    // With If-Match the condition word is "match"; the destination does not exist, so the
+    // store refuses.
+    let again = s3
+        .copy(&t, from, &etag, 7, "second.txt", Cond::IfMatch("\"x\""))
+        .await;
+    assert_eq!(again.unwrap_err(), S3Error::Precondition);
+    assert!(
+        fake.writes()
+            .iter()
+            .any(|w| w.0 == "COPY" && w.2 == "match")
+    );
+    // A copy is never stored as an ordinary empty PUT.
+    assert!(fake.object(BUCKET, "second.txt").is_none());
+}
+
+#[tokio::test]
+async fn a_copy_from_a_changed_source_is_a_precondition_failure() {
+    let fake = fake().await;
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let etag = source_object(&s3, &t, "src.txt", b"v1").await;
+    // Someone else rewrites the source after we recorded its tag.
+    fake.put(BUCKET, "src.txt", b"v2 from outside");
+
+    assert_eq!(
+        s3.copy(&t, "src.txt", &etag, 2, "dst.txt", Cond::IfAbsent)
+            .await
+            .unwrap_err(),
+        S3Error::Precondition
+    );
+    assert!(fake.object(BUCKET, "dst.txt").is_none());
+}
+
+#[tokio::test]
+async fn a_copy_onto_a_taken_key_with_if_absent_is_a_precondition_failure() {
+    let fake = fake().await;
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let etag = source_object(&s3, &t, "src.txt", b"ours").await;
+    fake.put(BUCKET, "dst.txt", b"theirs");
+
+    assert_eq!(
+        s3.copy(&t, "src.txt", &etag, 4, "dst.txt", Cond::IfAbsent)
+            .await
+            .unwrap_err(),
+        S3Error::Precondition
+    );
+    assert_eq!(fake.object(BUCKET, "dst.txt").unwrap().bytes, b"theirs");
+}
+
+#[tokio::test]
+async fn an_error_inside_a_200_copy_answer_is_a_failure() {
+    let fake = fake().await;
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let etag = source_object(&s3, &t, "src.txt", b"ours").await;
+    fake.error_in_200_next();
+
+    let result = s3
+        .copy(&t, "src.txt", &etag, 4, "dst.txt", Cond::IfAbsent)
+        .await;
+    assert_eq!(result.unwrap_err(), S3Error::Throttled);
+    assert!(fake.object(BUCKET, "dst.txt").is_none());
+    // It was sent once, not retried; the next copy is fine.
+    assert_eq!(fake.writes().iter().filter(|w| w.0 == "COPY").count(), 1);
+    s3.copy(&t, "src.txt", &etag, 4, "dst.txt", Cond::IfAbsent)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_copy_over_five_gib_is_refused_before_sending() {
+    let fake = fake().await;
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let etag = source_object(&s3, &t, "big.bin", b"stand-in").await;
+
+    assert_eq!(
+        s3.copy(
+            &t,
+            "big.bin",
+            &etag,
+            COPY_MAX + 1,
+            "big2.bin",
+            Cond::IfAbsent
+        )
+        .await
+        .unwrap_err(),
+        S3Error::Unsupported
+    );
+    assert!(fake.writes().iter().all(|w| w.0 != "COPY"));
+    // Exactly 5 GiB is allowed (the stand-in object is small; the size is the caller's).
+    let heads = fake.count("head");
+    s3.copy(&t, "big.bin", &etag, COPY_MAX, "big2.bin", Cond::IfAbsent)
+        .await
+        .unwrap();
+    // One HEAD only (of the new object): the source is not asked for.
+    assert_eq!(fake.count("head"), heads + 1);
+}
+
+#[tokio::test]
+async fn a_multipart_upload_sends_hashed_parts_and_completes_with_the_condition() {
+    let fake = fake().await;
+    fake.require_keys(KEY_ID, SECRET);
+    fake.min_part_bytes(10);
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let bytes: Vec<u8> = (0..25_u8).collect();
+    let (file, _) = file_body(&bytes);
+    let key = "multi/big file+é.bin";
+
+    let id = s3.start_multipart(&t, key, &sha_of(&bytes)).await.unwrap();
+    assert!(!id.is_empty());
+    assert_eq!(fake.open_multiparts(), [(key.to_owned(), id.clone())]);
+    let mut parts = Vec::new();
+    for (number, (offset, len)) in [(0, 10), (10, 10), (20, 5)].into_iter().enumerate() {
+        let number = number as u16 + 1;
+        let body = part_of(&file, &bytes, offset, len);
+        let etag = s3.put_part(&t, key, &id, number, &body).await.unwrap();
+        parts.push((number, etag));
+    }
+    // A part whose bytes are not the hash it signed is refused by the store.
+    let mut wrong = part_of(&file, &bytes, 0, 10);
+    wrong.sha256 = [9; 32];
+    assert_eq!(
+        s3.put_part(&t, key, &id, 1, &wrong).await.unwrap_err(),
+        S3Error::Other
+    );
+
+    let head = s3
+        .complete_multipart(&t, key, &id, &parts, Cond::IfAbsent)
+        .await
+        .unwrap();
+    assert_eq!(head.size, 25);
+    let stored = fake.object(BUCKET, key).unwrap();
+    assert_eq!(stored.bytes, bytes);
+    assert_eq!(
+        stored.sha256.as_deref(),
+        Some(hex(&sha_of(&bytes)).as_str())
+    );
+    assert_eq!(head.sha256, stored.sha256);
+    assert_eq!(head.etag, stored.etag);
+    assert!(fake.open_multiparts().is_empty());
+    let kinds: Vec<_> = fake.writes().into_iter().map(|w| (w.0, w.2)).collect();
+    let expected: Vec<(String, String)> = [
+        ("PART", "1"),
+        ("PART", "2"),
+        ("PART", "3"),
+        ("PART", "1"),
+        ("COMPLETE", "absent"),
+    ]
+    .into_iter()
+    .map(|(a, b)| (a.to_owned(), b.to_owned()))
+    .collect();
+    assert_eq!(kinds, expected);
+
+    // The condition is honoured at completion: the key is taken now.
+    let id = s3.start_multipart(&t, key, &sha_of(&bytes)).await.unwrap();
+    let last = part_of(&file, &bytes, 20, 5);
+    let etag = s3.put_part(&t, key, &id, 1, &last).await.unwrap();
+    assert_eq!(
+        s3.complete_multipart(&t, key, &id, &[(1, etag.clone())], Cond::IfAbsent)
+            .await
+            .unwrap_err(),
+        S3Error::Precondition
+    );
+    assert_eq!(fake.object(BUCKET, key).unwrap().bytes, bytes);
+
+    // A failing part is an error, sent once.
+    fake.fail_part(2);
+    let body = part_of(&file, &bytes, 0, 10);
+    assert!(s3.put_part(&t, key, &id, 2, &body).await.is_err());
+    // A part too small for the middle of an upload is refused at completion.
+    let small = part_of(&file, &bytes, 0, 3);
+    let tiny = s3.put_part(&t, key, &id, 3, &small).await.unwrap();
+    assert_eq!(
+        s3.complete_multipart(&t, key, &id, &[(1, etag), (3, tiny)], Cond::None)
+            .await
+            .unwrap_err(),
+        S3Error::Other
+    );
+    assert_eq!(fake.object(BUCKET, key).unwrap().bytes, bytes);
+}
+
+#[tokio::test]
+async fn a_short_file_part_is_refused() {
+    let fake = fake().await;
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let bytes = b"only twelve!".to_vec();
+    let (file, _) = file_body(&bytes);
+    let id = s3.start_multipart(&t, "k", &sha_of(&bytes)).await.unwrap();
+
+    // Asks for bytes past the end of the file.
+    let mut body = part_of(&file, &bytes, 4, 8);
+    body.len = 20;
+    assert_eq!(
+        s3.put_part(&t, "k", &id, 1, &body).await.unwrap_err(),
+        S3Error::Other
+    );
+    body.offset = 100;
+    body.len = 1;
+    assert_eq!(
+        s3.put_part(&t, "k", &id, 1, &body).await.unwrap_err(),
+        S3Error::Other
+    );
+    // Numbers run from 1 to 10,000.
+    let ok = part_of(&file, &bytes, 0, 4);
+    for number in [0_u16, 10_001] {
+        assert_eq!(
+            s3.put_part(&t, "k", &id, number, &ok).await.unwrap_err(),
+            S3Error::Other
+        );
+    }
+    // Nothing was sent for any of them.
+    assert!(fake.writes().iter().all(|w| w.0 != "PART"));
+    // The last part, ending exactly at the end of the file, is fine.
+    let last = part_of(&file, &bytes, 4, 8);
+    s3.put_part(&t, "k", &id, 1, &last).await.unwrap();
+    assert_eq!(fake.writes().iter().filter(|w| w.0 == "PART").count(), 1);
+}
+
+#[tokio::test]
+async fn an_error_inside_a_200_completion_is_a_failure() {
+    let fake = fake().await;
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let bytes = b"abc".to_vec();
+    let (file, _) = file_body(&bytes);
+    let id = s3.start_multipart(&t, "k", &sha_of(&bytes)).await.unwrap();
+    let etag = s3
+        .put_part(&t, "k", &id, 1, &part_of(&file, &bytes, 0, 3))
+        .await
+        .unwrap();
+    fake.error_in_200_next();
+
+    let result = s3
+        .complete_multipart(&t, "k", &id, &[(1, etag.clone())], Cond::None)
+        .await;
+    assert_eq!(result.unwrap_err(), S3Error::Throttled);
+    assert!(fake.object(BUCKET, "k").is_none());
+    // The upload is still there, so the caller can abort it.
+    assert_eq!(fake.open_multiparts().len(), 1);
+    s3.complete_multipart(&t, "k", &id, &[(1, etag)], Cond::None)
+        .await
+        .unwrap();
+    assert_eq!(fake.object(BUCKET, "k").unwrap().bytes, bytes);
+}
+
+#[tokio::test]
+async fn abort_forgets_the_upload_and_a_missing_upload_is_fine() {
+    let fake = fake().await;
+    fake.require_keys(KEY_ID, SECRET);
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let id = s3.start_multipart(&t, "k", &[1; 32]).await.unwrap();
+    assert_eq!(fake.open_multiparts().len(), 1);
+
+    s3.abort_multipart(&t, "k", &id).await.unwrap();
+    assert!(fake.open_multiparts().is_empty());
+    // Gone already: NoSuchUpload counts as done.
+    s3.abort_multipart(&t, "k", &id).await.unwrap();
+    let aborts = fake.writes().iter().filter(|w| w.0 == "ABORT").count();
+    assert_eq!(aborts, 2);
+    // A part for an upload that is gone is NotFound.
+    let (file, _) = file_body(b"xyz");
+    let body = part_of(&file, b"xyz", 0, 3);
+    assert_eq!(
+        s3.put_part(&t, "k", &id, 1, &body).await.unwrap_err(),
+        S3Error::NotFound
+    );
+    // Other failures are still failures.
+    fake.fail_next(403, "AccessDenied");
+    assert_eq!(
+        s3.abort_multipart(&t, "k", &id).await.unwrap_err(),
+        S3Error::Denied
+    );
+}
+
+#[tokio::test]
+async fn a_head_404_is_not_logged_and_a_put_403_is() {
+    // The log line is decided by one function: a 404 to a HEAD or a DELETE is quiet.
+    assert_eq!(failure_log_line("HEAD", 404, None), None);
+    assert_eq!(failure_log_line("DELETE", 404, Some("NoSuchUpload")), None);
+    assert_eq!(
+        failure_log_line("GET", 404, Some("NoSuchKey")).as_deref(),
+        Some("sharecraft-server: S3 answered 404 NoSuchKey")
+    );
+    assert_eq!(
+        failure_log_line("PUT", 403, Some("AccessDenied")).as_deref(),
+        Some("sharecraft-server: S3 answered 403 AccessDenied")
+    );
+    assert_eq!(
+        failure_log_line("HEAD", 403, None).as_deref(),
+        Some("sharecraft-server: S3 answered 403 (no code)")
+    );
+    assert!(failure_log_line("PUT", 404, Some("NoSuchBucket")).is_some());
+
+    // And the calls still answer as before.
+    let fake = fake().await;
+    let s3 = client();
+    let t = target(&s3, &fake);
+    assert_eq!(s3.head(&t, "missing").await.unwrap_err(), S3Error::NotFound);
+    s3.delete(&t, "missing").await.unwrap();
+    fake.read_only();
+    let (_f, body) = file_body(b"x");
+    assert_eq!(
+        s3.put(&t, "k", &body, Cond::None).await.unwrap_err(),
+        S3Error::Denied
+    );
+}
+
+#[tokio::test]
+async fn copies_and_parts_are_counted_as_writes() {
+    let fake = fake().await;
+    fake.min_part_bytes(1);
+    let s3 = client();
+    let library = NodeId(Uuid::new_v4());
+    let t = target(&s3, &fake).with_library(library);
+    let etag = source_object(&s3, &t, "src.txt", b"12345").await;
+    let _ = s3.take_usage();
+
+    s3.copy(&t, "src.txt", &etag, 5, "dst.txt", Cond::IfAbsent)
+        .await
+        .unwrap();
+    let bytes = b"abcdefg".to_vec();
+    let (file, _) = file_body(&bytes);
+    let id = s3.start_multipart(&t, "m", &sha_of(&bytes)).await.unwrap();
+    let e1 = s3
+        .put_part(&t, "m", &id, 1, &part_of(&file, &bytes, 0, 4))
+        .await
+        .unwrap();
+    let e2 = s3
+        .put_part(&t, "m", &id, 2, &part_of(&file, &bytes, 4, 3))
+        .await
+        .unwrap();
+    s3.complete_multipart(&t, "m", &id, &[(1, e1), (2, e2)], Cond::None)
+        .await
+        .unwrap();
+    let other = s3.start_multipart(&t, "n", &sha_of(&bytes)).await.unwrap();
+    s3.abort_multipart(&t, "n", &other).await.unwrap();
+
+    let usage = s3.take_usage();
+    assert_eq!(usage.len(), 1);
+    let (counted, usage) = usage[0];
+    assert_eq!(counted, library);
+    // copy 1, start 1, parts 2, complete 1, start 1, abort 1.
+    assert_eq!(usage.write, 7);
+    // Parts count their bytes up; the copy, the documents and the HEADs count none.
+    assert_eq!(usage.bytes_up, 7);
+    // The HEAD of the new object after the copy, and the HEAD after completion.
+    assert_eq!(usage.read, 2);
 }

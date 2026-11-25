@@ -2212,7 +2212,7 @@ cargo xtask test -j 3 -p records --test sources</code></pre>
 
 <section id="s3-signing"><h2>37 / S3: request signing and editable storage</h2>
 <p>Built on 18 November 2026 as S3 surfacing Task 2, on the branch <code>s3-surfacing</code>, and merged into the release integration branch on 19 November 2026. It is library code only: <code>crates/server/src/s3_sign.rs</code> signs requests with AWS Signature Version 4 and is tested against AWS&rsquo;s published example vectors. No route, setting or page uses it, so nothing in ShareCraft talks to S3 yet. The plan is <code>plans/2026-11-18-s3-surfacing.html</code>.</p>
-<p class="small">The paragraph above is the record of 19 November 2026. Reading from S3 libraries (Phase 1, read-only) was built after it and is on <code>main</code>; this file does not describe it, and the S3 plan does. The rest of this section records editable S3 storage, slice 1.</p>
+<p class="small">The paragraph above is the record of 19 November 2026. Reading from S3 libraries (Phase 1, read-only) was built after it and is on <code>main</code>; this file does not describe it, and the S3 plan does. The rest of this section records editable S3 storage, slice 1, and then slice 2 (from the heading &ldquo;Editable S3 storage, slice 2&rdquo; on).</p>
 
 <h3>Editable S3 storage, slice 1</h3>
 <p>Built on 24 November 2026 on the branch <code>s3-writes</code>, cut from <code>main</code> at <code>78bfd6a</code>. It is not merged. The branch was pushed and the full GitHub check was green at <code>cc2b88b</code> (run 45456975116). One more commit, <code>8788b3f</code>, came from the live check below; it was pushed on 24 November 2026 and its check run (45479777333) was running when this was written. Nothing is merged. The plan is <code>plans/2026-11-24-s3-writes-slice1.html</code> and the scope is <code>plans/2026-11-24-s3-editable-scope.html</code>. Slice 1 is upload, replace, save from an editor and new folder. The shared write path is in <code>crates/server/src/source_write.rs</code> and <code>crates/records/src/source_writes.rs</code>. Everything that changes a bucket is in <code>crates/server/src/s3_write.rs</code> and nowhere else. No file-share write code was written.</p>
@@ -2341,6 +2341,116 @@ node --test web/</code></pre>
 </tbody></table></div>
 <p>Minor (d) of the live check, the missing write counts on the Source line, was withdrawn: the line shows &ldquo;Saving 1 file&hellip;&rdquo; while a write is pending.</p>
 
+<h3 id="s3-slice2">Editable S3 storage, slice 2</h3>
+<p>Built on 25 November 2026 on the branch <code>s3-writes-2</code>, cut from <code>main</code> at <code>7255f63</code> (slice 1 is merged there). It is not merged; the merge waits for the owner. The last commit is <code>4eb4c2a</code>. The plan is <code>plans/2026-11-24-s3-writes-slice2.html</code>; the scope is <code>plans/2026-11-24-s3-editable-scope.html</code> (the &ldquo;Slice 2&rdquo; rows). Slice 2 adds rename and move, delete with a holding folder, restore and purge, copy, multipart upload for big files, and editor saves that flush when the last person leaves. Migration 0026 (<code>0026_source_holds.sql</code>) adds the <code>source_held</code> and <code>source_multipart</code> rows; 0025 is not edited. The full GitHub check was green at <code>8dcbff4</code> (run 45629730680). The last commit changed only the write worker and was reviewed.</p>
+
+<h3>What a library can do now</h3>
+<div class="table-wrap"><table class="banded"><caption>Actions in a read-and-write S3 library, slice 2</caption>
+<thead><tr><th>Action</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>Rename and move</td><td>Each object is copied to its new key, then the original is deleted. A folder moves object by object, markers included. The file keeps its content, so an open editor does not go stale. Moving a folder into itself is refused. A name taken, ignoring case, answers <code>409 name_taken</code>; nothing is numbered.</td></tr>
+<tr><td>Delete</td><td>The content goes to <code>&lt;prefix&gt;.sharecraft-bin/&lt;YYYY-MM-DD&gt;/&lt;entry&gt;/&lt;path&gt;</code>, using the UTC date of the delete and the bin entry&rsquo;s id. The bin entry keeps its ordinary rows, and a <code>source_held</code> row names the held root.</td></tr>
+<tr><td>Restore</td><td>Copies the held objects back. A taken name gets a number, as the ordinary bin does. It writes a folder marker only when the held folder had none. Refused in a read-only library (<code>source_read_only</code>) and a blocked one (<code>source_write_blocked</code>).</td></tr>
+<tr><td>Purge, and the bin&rsquo;s 93-day purge</td><td>Deletes the held objects first, then the entry. If the library is read-only or blocked by then, nothing is written: the entry is purged, the objects stay, and <code>source.held_left</code> says so.</td></tr>
+<tr><td>Holding sweep</td><td>Once a day per read-and-write S3 library. It deletes only objects under <code>&lt;prefix&gt;.sharecraft-bin/</code> whose date folder is more than 94 days old and whose entry id no <code>source_held</code> row names. It never deletes anything else. The same sweep aborts old multipart uploads (below).</td></tr>
+<tr><td>Copy inside a bucket</td><td>Server-side copy. A taken name is refused. A subfolder the copier cannot view is skipped, as in an ordinary copy, so a copy never leaks hidden content.</td></tr>
+<tr><td>Copy between libraries</td><td>Out of S3: ShareCraft reads the bytes and makes ordinary files, which count against the destination site&rsquo;s quota; a taken name is numbered, as an ordinary copy does. Into a read-and-write S3 library: it makes the nodes and stages one write per file, so the scan gate and the 30-second worker apply. S3 to S3 does both. A copy that stops part way answers with its own code and a <code>made</code> count. A failed copy out is cleaned up by purging, not binning. <strong>Moving between libraries stays refused.</strong></td></tr>
+<tr><td>Upload over 512 MiB</td><td>Multipart, in 64 MiB parts (settable for tests), each read from the staged file at an offset and signed with its own SHA-256. The condition goes on the completion. A <code>source_multipart</code> row is written right after the upload starts and removed when it completes or aborts; any failure aborts. The upload limit is the smaller of 5 GiB, the configured maximum file size and half the cache size.</td></tr>
+<tr><td>Editor saves</td><td>Flushed when the room empties, not 60 seconds later when the file session ends. A save in flight at that moment waits for the throttle.</td></tr>
+<tr><td>Still refused</td><td>A new blank file, a new file from a template, and a move between libraries answer <code>409 source_action_unavailable</code> with a reworded message.</td></tr>
+</tbody></table></div>
+
+<h3>Rules slice 2 keeps</h3>
+<ul class="band">
+<li><strong>Copies before deletes.</strong> Every move and every hold copies all objects first. A failed copy deletes the copies already made and changes nothing else. A failed delete after all copies is reported as &ldquo;left behind&rdquo; and finishes the tree change; the originals return as new files at the next listing. Nothing is lost; at worst something is duplicated.</li>
+<li><strong>A change made outside is never moved over.</strong> Before each file is copied, a HEAD checks it against the recorded tag, and the copy carries <code>x-amz-copy-source-if-match</code>. A mismatch refuses the whole step with <code>409 source_changed</code> and wakes a listing.</li>
+<li><strong>At most 1,000 objects in one step.</strong> A larger folder is refused before anything changes: <code>409 source_too_many_objects</code>, with the count. Folder markers count.</li>
+<li><strong>Nothing over 5 GiB.</strong> One copy request stops at 5 GiB. A bigger object cannot be renamed, moved, copied or deleted from ShareCraft: <code>409 source_too_large_to_move</code>. Uploads are capped at 5 GiB, so everything ShareCraft writes can be moved.</li>
+<li><strong>Busy files.</strong> A file with a save waiting or failed, or a folder with one inside, answers <code>409 source_item_saving</code>. The person waits or discards the failed save. A save that arrives during a rename, move or delete lands at the new path (found by the final review and fixed in <code>8dcbff4</code>).</li>
+<li><strong>Structure changes run in the request,</strong> under the library&rsquo;s source lock, bucket first and tree second. They do not use the write queue.</li>
+<li><strong>Archived objects</strong> (cold storage) are refused plainly; they are not offered a retry.</li>
+</ul>
+
+<h3>API errors and events</h3>
+<div class="table-wrap"><table class="banded"><caption>New and reworded answers</caption>
+<thead><tr><th>Answer</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>409 source_too_many_objects</code> (with <code>count</code>)</td><td>A folder holds more than 1,000 objects.</td></tr>
+<tr><td><code>409 source_item_saving</code></td><td>A save is waiting or failed on the item or inside the folder.</td></tr>
+<tr><td><code>409 source_too_large_to_move</code></td><td>An object is over 5 GiB.</td></tr>
+<tr><td><code>409 source_changed</code></td><td>The bucket no longer holds what ShareCraft recorded. A listing is woken; try again in a minute.</td></tr>
+<tr><td>A copy-incomplete answer (the code of what stopped it, plus <code>made</code>)</td><td>A copy into an S3 library stopped part way; <code>made</code> files and folders were made.</td></tr>
+<tr><td><code>409 source_busy</code> (reworded)</td><td>The library is busy with a listing or another structure change. It no longer says &ldquo;a sync is running&rdquo;. Since <code>4eb4c2a</code> it is not answered while a large upload is in flight.</td></tr>
+<tr><td><code>409 source_action_unavailable</code> (reworded)</td><td>New blank file, new from a template, move between libraries.</td></tr>
+<tr><td><code>413 source_file_too_large</code></td><td>Now above the 5 GiB-based limit, not 512 MiB.</td></tr>
+</tbody></table></div>
+<p>Events carry counts, node ids and library-relative paths only: <code>source.moved</code>, <code>source.held</code>, <code>source.unheld</code>, <code>source.held_purged</code>, <code>source.held_left</code> (objects left in the bucket), <code>source.holding_swept</code> and <code>source.multipart_aborted</code>, beside the slice 1 events <code>source.conflict_copy</code> and <code>source.write_blocked</code>. Disconnecting a library drops its <code>source_held</code> rows and leaves the objects in the bucket. Every new route has a decision in <code>crates/server/tests/source_readonly.rs</code>.</p>
+
+<h3>The write worker and the library lock</h3>
+<p>The live check found that the worker held the library&rsquo;s source lock for a whole upload. During a 600 MiB multipart upload, every rename, move, delete and copy in that library answered <code>source_busy</code>, for minutes (longer at 5 GiB). Commit <code>4eb4c2a</code> fixes it: the worker sends bytes without the lock. Conflict copies are reworked to match: the copy&rsquo;s node (and a numbered name) is made under the lock, and the bytes then go as a new-file write. Discarding a write during its transfer is allowed; the bytes that landed are adopted by the next listing. <strong>One write worker is now load-bearing:</strong> the design assumes a single worker, and two server processes on one database are not guarded against.</p>
+
+<h3>Operator notes</h3>
+<ul class="band">
+<li><strong>Lifecycle rule for stores other than R2.</strong> A crash between starting a multipart upload and recording it leaves an upload that ShareCraft does not know about, and there is no bucket listing of uploads to find it. R2 clears such uploads itself. On any other store, add a lifecycle rule that aborts incomplete multipart uploads after a few days. ShareCraft aborts the uploads it does know about (rows older than a day).</li>
+<li><strong>Structure changes are slow.</strong> They take about 1.2 seconds per object on R2 (a 25-object folder: delete 30 s, restore 27 s; a 21-object copy 23 s). A 1,000-object folder can hold one request for about 20 minutes, and a browser or proxy may give up first. The change still finishes on the server. A queue is a slice 3 candidate.</li>
+<li><strong>The holding folder belongs to ShareCraft.</strong> Do not delete <code>.sharecraft-bin/</code> by hand while the bin holds entries; their Restore would find nothing.</li>
+<li>The listing&rsquo;s files count stays stale until the next listing (57 shown, 68 real, in the live check).</li>
+</ul>
+
+<h3>Commands</h3>
+<p>As in slice 1: from the worktree root in PowerShell, one test binary at a time, at most three build jobs, and server <code>s3_*</code> and <code>source_*</code> binaries with <code>--test-threads=1</code>. The full suite runs on GitHub (<code>check.yml</code>).</p>
+
+<h3>What the live check on 25 November 2026 checked</h3>
+<p>The server at <code>8dcbff4</code> ran on its own port against a new Cloudflare R2 bucket made for the check. The controller created the bucket with the owner&rsquo;s yes; the owner made the token and typed the key. <strong>The bucket and the token were deleted afterwards.</strong> No key was shown to the controller or written down.</p>
+<div class="table-wrap"><table class="banded"><caption>Checked live, slice 2</caption>
+<thead><tr><th>Check</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>Rename and move</td><td>A file renamed. A folder renamed and moved (21 objects).</td></tr>
+<tr><td>Delete</td><td>A file and a folder went to <code>.sharecraft-bin/2026-11-25/&lt;entry&gt;/&hellip;</code>.</td></tr>
+<tr><td>Restore</td><td>A folder came back (25 objects).</td></tr>
+<tr><td>Purge</td><td>The second stage deleted the held object.</td></tr>
+<tr><td>Copy inside the bucket</td><td>A file and a 21-object folder.</td></tr>
+<tr><td>Copy out to Documents</td><td>20 files, content intact.</td></tr>
+<tr><td>Copy back in</td><td>Staged, then written.</td></tr>
+<tr><td>600 MiB upload</td><td>Went multipart in about 10 parts; size 629,145,600 bytes. The page&rsquo;s SHA-256 began 766dd6b5 and ended 364f. The owner downloaded the file and its hash matched, so the multipart content is verified. No <code>source_multipart</code> rows remained.</td></tr>
+<tr><td>Outside change</td><td>A move was refused with <code>source_changed</code>; the woken listing adopted the outside object before the following delete.</td></tr>
+<tr><td>Editor save</td><td>Reached the bucket 1.7 seconds after the last person left.</td></tr>
+<tr><td>Final listing</td><td>Tree 68 files, bucket 68, no duplicates.</td></tr>
+<tr><td>Pages at 375 px, light and dark</td><td>Library, row menu, delete toast with Undo, the name-taken message and the bin: no sideways scroll, shading present.</td></tr>
+</tbody></table></div>
+<p><strong>Faults found.</strong> (1) The worker held the library lock during uploads, so structure changes answered <code>source_busy</code> for the length of a big upload, and the wording was wrong too. Fixed in <code>4eb4c2a</code>, which was not re-run live; tests and a review cover it. (2) Structure changes take about 1.2 s per object, so the ruling&rsquo;s &ldquo;a minute or two&rdquo; for 1,000 objects was wrong; see the operator notes. Not fixed.</p>
+<div class="table-wrap"><table class="banded"><caption>Not checked live, slice 2</caption>
+<thead><tr><th>Not checked</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>The fix in <code>4eb4c2a</code></td><td>Written after the live run. Covered by tests and review, not by a second live run.</td></tr>
+<tr><td>The 1,000-object cap, and a 5 GiB object</td><td>Tests only.</td></tr>
+<tr><td>The 94-day holding sweep and the abort of abandoned uploads</td><td>Tests only; nothing in the bucket was old enough.</td></tr>
+<tr><td>A store other than R2</td><td>Only the fake store stands for it.</td></tr>
+</tbody></table></div>
+
+<h3>Deferred and parked items, slice 2</h3>
+<p>Every minor the ledger left open, grouped. None was fixed unless it says so. The ones that matter most are named in <a href="sequencing.html">sequencing.html</a>.</p>
+<div class="table-wrap"><table class="banded"><caption>Deferred and parked minors, slice 2</caption>
+<thead><tr><th>Group</th><th>Item</th></tr></thead>
+<tbody>
+<tr><td>Data safety</td><td>The source and cleanup deletes in a move carry no <code>If-Match</code>, so there is a small window to delete newer outside content.</td></tr>
+<tr><td>Data safety</td><td>Restore after a save landed during a delete has a branch that is practically unreachable: the save retries until restored, and is lost if the entry is purged first. The log text there is wrong.</td></tr>
+<tr><td>Data safety</td><td>A lost answer to a copy leaves a duplicate (no loss). A tree refusal after an unhold can leave duplicates.</td></tr>
+<tr><td>Can loop or stall</td><td><strong>A conflict copy whose node cannot be made</strong> (the author is unreadable or has no access) retries for ever and is never written.</td></tr>
+<tr><td>Can loop or stall</td><td><strong>Restore when the parent folder was purged:</strong> the entry cannot be restored (an ordinary bin restores to the library top).</td></tr>
+<tr><td>Can loop or stall</td><td>The stale-upload sweep has no back-off, logs per row per tick, and does not skip blocked libraries.</td></tr>
+<tr><td>Can loop or stall</td><td>A numbered rename before the sha-keyed repath can split a row from the tree if a newer save lands between them.</td></tr>
+<tr><td>Long requests</td><td>Structure changes hold the request (about 1.2 s per object). There is no queue.</td></tr>
+<tr><td>Long requests</td><td>The single-worker assumption is not enforced across two processes. Deferrals are counted as acted.</td></tr>
+<tr><td>Rare edge cases</td><td>A purge in a blocked library answers offline (503) when the lock is busy. <code>release_held</code> forgets the hold after dropping the lock. A bulk copy item that stopped part way reports the code without a <code>made</code> count, and <code>across_one</code> finds the stray by name, not by id. A key outside the prefix is forgotten silently. A top-level copy-out failure leaves an empty file. A markerless emptied folder vanishes, as S3 semantics have it.</td></tr>
+<tr><td>Rare edge cases</td><td>Minors M4 to M8 of the final review (<code>final-review.md</code> in the plan&rsquo;s working folder).</td></tr>
+<tr><td>Tests missing</td><td>Too-large-to-move and Denied-to-block on a move; a folder move over a pending new file; the multipart finish wait; a held conflict follow-up; the cleanup of copies after a tree failure; some multipart abort branches in <code>s3_write.rs</code>; the page&rsquo;s banner conditions.</td></tr>
+<tr><td>Tests missing</td><td>The <code>RenameFolder</code> row for <code>source_item_saving</code> in the route table depends on timing. Whether the restructure rights match the tree&rsquo;s Move rights is unverified.</td></tr>
+<tr><td>Wording and tidy</td><td>The conflict-copy event is emitted before the bytes land. Stale doc comments (<code>source_writes.rs</code> retry time; &ldquo;one write&rdquo; in <code>source_write.rs</code>; the relocate comment above <code>skipped()</code>). The parent guard is duplicated in <code>nodes.rs</code> and <code>source_write.rs</code>. Fake-store oddities: part-number routing order, and <code>error_in_200</code> consumed by other failures.</td></tr>
+<tr><td>Pages</td><td>The left-behind sentence replaces the undo toast in bulk runs and after a rename. The bulk too-many line has no count. The status note may not be announced, since focus moves. Moves from a non-S3 library into S3 are offered, and the server refuses them.</td></tr>
+<tr><td>To verify</td><td>Cache eviction spares blobs a pending write names (the slice 1 rule). The room run loop is never entered empty, which would send a spurious room-emptied flush.</td></tr>
+</tbody></table></div>
+
 </section>
 
 <section id="release-state"><h2>38 / Release state</h2>
@@ -2350,11 +2460,11 @@ node --test web/</code></pre>
 <tbody>
 <tr><td>Live co-authoring (G4 and G5)</td><td>Built; on in development only when switched on; off in production</td><td><code>Config.live_editors</code> is empty unless <code>SHARECRAFT_LIVE_EDITORS=gridcraft</code> is set and the installed GridCraft build declares the live format. The built-in default stays empty and production stays off until the owner decides (section 32).</td></tr>
 <tr><td>File-share libraries</td><td>Phase 1 (read-only) built</td><td>No folder is approved by default, so nothing can be connected; no page shows it.</td></tr>
-<tr><td>S3 libraries</td><td>Signing library and read-only libraries on <code>main</code>; editing (slice 1) on <code>s3-writes</code>, not merged</td><td>A new S3 library is read-only. Only an administrator can make one read and write (section 37).</td></tr>
+<tr><td>S3 libraries</td><td>Signing library and read-only libraries on <code>main</code>; editing: slice 1 on <code>main</code>; slice 2 (rename, move, delete, copy, multipart) on <code>s3-writes-2</code>, not merged</td><td>A new S3 library is read-only. Only an administrator can make one read and write (section 37).</td></tr>
 </tbody></table></div>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 24 November 2026<br>Change note, 24 November 2026: section 37 now records editable S3 storage, slice 1, on the branch <code>s3-writes</code> (not merged): the two modes and who chooses them, the guard, how a write flows, the write probe, the 512 MiB limit, editor-save coalescing, migration 0025, the commands, what the live check on 24 November 2026 did and did not check, and the deferred items. Section 38 gains the S3 row. Not a release.<br>Earlier change note: plan G5 is built and its acceptance run is done; its final review and the fixes from that review are the last step. Section 13 says how to check a GridCraft build for live editing; sections 14 and 15 describe the live path (status words, offline, reconnecting, the behind mark, the live-base route); section 21 lists the limits and the two follow-ups before production; section 32 says how to switch live editing on and off and records the acceptance run of 22 November 2026; <code>SHARECRAFT_LIVE_EDITORS</code> is in section 05. Off by default, and off in production until the owner decides.<br>Earlier change note: sections 35 to 38 record the release integration branch: G5 presence, room notices and the live page (not reachable until G5 Task 6), file-share libraries Phase 1 (off until an administrator approves a folder; migration renumbered 0022), the S3 signing library (no route) and how each is kept off. Not a release until the owner says so.<br>Earlier change note: section 34 records plan G4, verified live checkpoints, built on <code>gridcraft-coauthoring-g4</code> and not yet merged: the checkpoint cadence and limits, a lone editor resuming after its own sole-editor checkpoint, a checkpoint dispute stopping the live session with both copies kept, outside replacements kept as major versions, and migration 0020, edited in place (development databases must be reset). The final-review fixes add: <code>ReturnReady</code> sent again on rejoin, same-person and same-build checkers, identity data checked by hash, upload deadlines that scale with size, exclusion from checking only (writing too only while someone else can write), held instead of refused changes during a pause, and optional new join fields. <code>Config.live_editors</code> remains empty until G5. Not a release.<br>Earlier change note: GridCraft co-authoring plan G3 is built and reviewed in-process in the GridCraft fork, but is not merged into its <code>sharecraft</code> branch or connected to a browser host.<br>Describes the development build through plan 5 phase A1, GitHub surfacing, built on <code>github-surfacing</code> and not yet merged, together with the earlier editor, platform, branding and production-mode plans. Not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 25 November 2026<br>Change note, 25 November 2026: section 37 now also records editable S3 storage, slice 2, on the branch <code>s3-writes-2</code> (not merged): rename and move, the holding folder with restore, purge and the 94-day sweep, copy inside a bucket and between libraries, multipart over 512 MiB, editor saves on room empty, the library lock fix, new API errors and events, operator notes (lifecycle rule; 1.2 s per object), the live check on R2 of 25 November 2026 and the parked minors. Not a release.<br>Earlier change note, 24 November 2026: section 37 recorded editable S3 storage, slice 1, on the branch <code>s3-writes</code> (not merged): the two modes and who chooses them, the guard, how a write flows, the write probe, the 512 MiB limit, editor-save coalescing, migration 0025, the commands, what the live check on 24 November 2026 did and did not check, and the deferred items. Section 38 gains the S3 row. Not a release.<br>Earlier change note: plan G5 is built and its acceptance run is done; its final review and the fixes from that review are the last step. Section 13 says how to check a GridCraft build for live editing; sections 14 and 15 describe the live path (status words, offline, reconnecting, the behind mark, the live-base route); section 21 lists the limits and the two follow-ups before production; section 32 says how to switch live editing on and off and records the acceptance run of 22 November 2026; <code>SHARECRAFT_LIVE_EDITORS</code> is in section 05. Off by default, and off in production until the owner decides.<br>Earlier change note: sections 35 to 38 record the release integration branch: G5 presence, room notices and the live page (not reachable until G5 Task 6), file-share libraries Phase 1 (off until an administrator approves a folder; migration renumbered 0022), the S3 signing library (no route) and how each is kept off. Not a release until the owner says so.<br>Earlier change note: section 34 records plan G4, verified live checkpoints, built on <code>gridcraft-coauthoring-g4</code> and not yet merged: the checkpoint cadence and limits, a lone editor resuming after its own sole-editor checkpoint, a checkpoint dispute stopping the live session with both copies kept, outside replacements kept as major versions, and migration 0020, edited in place (development databases must be reset). The final-review fixes add: <code>ReturnReady</code> sent again on rejoin, same-person and same-build checkers, identity data checked by hash, upload deadlines that scale with size, exclusion from checking only (writing too only while someone else can write), held instead of refused changes during a pause, and optional new join fields. <code>Config.live_editors</code> remains empty until G5. Not a release.<br>Earlier change note: GridCraft co-authoring plan G3 is built and reviewed in-process in the GridCraft fork, but is not merged into its <code>sharecraft</code> branch or connected to a browser host.<br>Describes the development build through plan 5 phase A1, GitHub surfacing, built on <code>github-surfacing</code> and not yet merged, together with the earlier editor, platform, branding and production-mode plans. Not a release.</footer>
 </main></div>
 </body>
 </html>

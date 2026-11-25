@@ -32,6 +32,7 @@ import { pickImage } from './image-picker.js';
 import { studioLimits } from './look-studio.js';
 import {
   modeSwitchText,
+  blockedText,
   overwriteNote,
   sourceName,
   sourceWriteErrorText,
@@ -469,7 +470,7 @@ function showS3Mode() {
   const writable = source.mode === 'read_write';
   const blocked = writable && source.write_state === 'blocked';
   $('s3-mode-text').textContent = blocked
-    ? `Read-only until fixed: the storage refused a change.${source.write_error ? ` ${source.write_error}` : ''}`
+    ? blockedText(source)
     : writable
       ? 'Read and write. What people add here is saved in the bucket, and your provider may charge for each change.'
       : 'Read only. Files open from the bucket but cannot be changed in ShareCraft.';
