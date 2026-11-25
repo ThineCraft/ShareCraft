@@ -559,10 +559,15 @@ impl Db {
     /// the person closed the file). A retry time still holds it back, so `_now` is not used.
     /// Whether there is a row.
     pub async fn flush_write(&self, node: NodeId, _now: OffsetDateTime) -> Result<bool, DbError> {
-        let done = sqlx::query("update source_writes set flush = true where node_id = $1")
-            .bind(node.0)
-            .execute(self.pool())
-            .await?;
+        // A row that is not failed is due at once; a failed one keeps its retry time.
+        let done = sqlx::query(
+            "update source_writes set flush = true, \
+             next_try_at = case when state = 'failed' then next_try_at else null end \
+             where node_id = $1",
+        )
+        .bind(node.0)
+        .execute(self.pool())
+        .await?;
         Ok(done.rows_affected() > 0)
     }
 

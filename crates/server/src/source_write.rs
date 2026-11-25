@@ -722,6 +722,18 @@ impl Checkpointer for ExternalCheckpointer {
     /// flushed and the writer woken. Spawned, so the ending session does not wait. If the flush
     /// cannot be recorded, the write still happens once the wait is over.
     fn session_ended(&self, doc: DocId) {
+        self.flush_last_save(doc);
+    }
+
+    /// The same flush as when the session ends, as soon as the last person has left, so the last
+    /// save does not wait out the room's grace period.
+    fn room_emptied(&self, doc: DocId) {
+        self.flush_last_save(doc);
+    }
+}
+
+impl ExternalCheckpointer {
+    fn flush_last_save(&self, doc: DocId) {
         let Some(runtime) = &self.runtime else {
             return;
         };
