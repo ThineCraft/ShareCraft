@@ -849,6 +849,23 @@ pub async fn delete_held(s3: &S3, t: &S3Target, root: &str) -> Result<u64, Write
     delete_keys(s3, t, &keys).await
 }
 
+/// Deletes the copies a step made (the destinations of `seen`, library-relative), best effort: a
+/// copy that cannot be removed is a duplicate the next listing shows, never a loss. Answers how
+/// many could not be removed.
+pub async fn remove_copies(s3: &S3, t: &S3Target, seen: &[(String, Seen)]) -> u64 {
+    let mut failed = 0;
+    for (path, _) in seen {
+        let Some(key) = item_key(t, path, path.ends_with('/')) else {
+            failed += 1;
+            continue;
+        };
+        if s3.delete(t, &key).await.is_err() {
+            failed += 1;
+        }
+    }
+    failed
+}
+
 /// Deletes `keys`, carrying on past failures. Answers the count, or the first failure's error.
 async fn delete_keys(s3: &S3, t: &S3Target, keys: &[String]) -> Result<u64, WriteError> {
     let mut deleted = 0;

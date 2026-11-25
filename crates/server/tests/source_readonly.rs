@@ -772,19 +772,14 @@ const ROWS: &[Row] = &[
     row(Act::StartNewVersion, "POST /api/uploads", 201, Succeeds),
     row(Act::Chunk, "PUT /api/uploads/{id}", 200, Succeeds),
     row(Act::Finish, "POST /api/uploads/{id}/finish", 201, Succeeds),
-    // Renames and moves inside the library go through the bucket (slice 2); moves into, out of
-    // or between libraries stay unavailable.
+    // Renames, moves and copies inside the library go through the bucket (slice 2); moves and
+    // copies into or between libraries stay unavailable (copies are Task 7).
     row(Act::Rename, "PATCH /api/nodes/{id}", 200, Succeeds),
     row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200, Succeeds),
     row(Act::MoveIn, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
     row(Act::MoveOut, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
     row(Act::CopyIn, "POST /api/nodes/{id}/copy", 201, UNAVAILABLE),
-    row(
-        Act::CopyWithin,
-        "POST /api/nodes/{id}/copy",
-        201,
-        UNAVAILABLE,
-    ),
+    row(Act::CopyWithin, "POST /api/nodes/{id}/copy", 201, Succeeds),
     // Deletes move the objects into the library's holding folder (slice 2). The binned files
     // of the fixture were put in the bin by the listing, which holds nothing of them: they
     // cannot come back into the library.
@@ -1455,7 +1450,11 @@ impl Env {
             Act::CopyWithin => (
                 Method::POST,
                 format!("/api/nodes/{}/copy", fx.item("copy-me.txt")),
-                json!({ "parent": fx.other }),
+                // A name of its own: a copy never takes a taken name, and each person copies.
+                json!({
+                    "parent": fx.other,
+                    "name": format!("copy-{}.txt", Uuid::new_v4().simple()),
+                }),
             ),
             Act::Delete => (
                 Method::DELETE,
@@ -1798,7 +1797,7 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
             assert!(body["renamed"].is_null(), "restore as {who}: {body}");
         }
     }
-    // Nothing but the uploads, new folders and saves, the renames and moves inside the library,
+    // Nothing but the uploads, new folders and saves, the renames, moves and copies inside the library,
     // and the deletes into its holding folder and the restores out of it reached the bucket
     // (the finished sessions' files go to the library's top).
     let deleted = [
@@ -1820,6 +1819,7 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
                     "other/bulk-move.txt"
                 ]
                 .contains(&key.as_str())
+                    || key.starts_with("other/copy-")
                     || deleted.contains(&key.as_str())
                     || key == "doomed/"
                     || held(&key),

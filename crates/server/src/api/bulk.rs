@@ -5,7 +5,7 @@
 //! `POST /api/nodes/{id}/copy`, `DELETE /api/nodes/{id}`, `POST /api/bin/{id}/restore`), with
 //! its own result, in the order given: one failing does not stop the others. An item in, or
 //! going into, a library connected to a source is refused as the single-item route refuses it
-//! (`source_read_only`). A move inside a read-and-write S3 library goes through the bucket, as
+//! (`source_read_only`). A move or copy inside a read-and-write S3 library goes through the bucket, as
 //! the single-item route does, taking the library's source lock once for each item.
 
 use axum::Json;
@@ -15,7 +15,7 @@ use records::{FileType, ScanState};
 use serde::{Deserialize, Serialize};
 
 use super::nodes::{
-    copy_one, delete_checked, move_one, node_id, require_not_connected_for, restore_checked,
+    copy_checked, delete_checked, move_one, node_id, require_not_connected_for, restore_checked,
     restructure_place,
 };
 use super::{ApiError, JsonBody, to_completion};
@@ -116,13 +116,14 @@ pub(crate) async fn run(
     let op = body.op;
     let results = to_completion(async move {
         let mut results = Vec::with_capacity(body.items.len());
-        // Where a move or copy goes is judged once for every item: into a connected library,
-        // each is refused as the single-item route refuses it.
-        let into = match parent {
-            Some(parent) => require_not_connected_for(state.db(), actor.id, parent)
+        // Where a move goes is judged once for every item: into a connected library, each is
+        // refused as the single-item route refuses it. A copy is judged with its item (it may
+        // go into the library its item is in).
+        let into = match (op, parent) {
+            (BulkOp::Move, Some(parent)) => require_not_connected_for(state.db(), actor.id, parent)
                 .await
                 .err(),
-            None => None,
+            _ => None,
         };
         for item in body.items {
             let done = match node_id(&item) {
@@ -201,10 +202,9 @@ async fn one(
                 .map(|_| Done::default())
         }
         (BulkOp::Copy, Some(parent)) => {
-            if let Some(refused) = into {
-                return Err(refused);
-            }
-            let copied = copy_one(state, actor, id, parent, None).await?;
+            // Into a connected library: refused, but inside one read-and-write S3 library, which
+            // copies through the bucket (see `copy_checked`).
+            let copied = copy_checked(state, actor, id, parent, None).await?;
             Ok(Done {
                 new_id: Some(copied.id().to_owned()),
                 renamed: copied.renamed().map(|(from, to)| Renamed { from, to }),

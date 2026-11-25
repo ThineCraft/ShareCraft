@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::{
-    AccessError, BinStage, Db, Editor, ExternalEntry, NewEvent, NewPendingWrite, Node, NodeKind,
-    PendingWrite, Perms, ScanState, SourceItem, SourceKind, SourceLock, SourceMode, Tri, User,
-    WriteState, object_tag,
+    Access, AccessError, BinStage, Db, Editor, ExternalEntry, NewEvent, NewPendingWrite, Node,
+    NodeKind, PendingWrite, Perms, ScanState, SourceItem, SourceKind, SourceLock, SourceMode, Tri,
+    User, WriteState, object_tag,
 };
 use revisions::{
     BlobRef, Checkpoint, CheckpointError, Content, GitError, Meta, Outcome, RevisionId,
@@ -44,8 +44,8 @@ use crate::checkpoint::Checkpointer;
 use crate::s3::{PutBody, S3Error, S3Target};
 use crate::s3_source::nameable_segment;
 use crate::s3_write::{
-    Moved, delete_held, hold, holding_root, make_folder, move_item, object_key, probe_writes,
-    sweep_holding, unhold, write_beside, write_numbered, write_object,
+    Moved, copy_item, delete_held, hold, holding_root, make_folder, move_item, object_key,
+    probe_writes, remove_copies, sweep_holding, unhold, write_beside, write_numbered, write_object,
 };
 use crate::tree::{self, TreeOp};
 
@@ -1735,6 +1735,63 @@ fn known_of(items: &[SourceItem]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Where `node` is for a step made in a bucket (a rename, move, delete or copy), judged as every
+/// such step judges it: the read-and-write S3 library it is in (`404` for someone who cannot
+/// see it, `409 source_read_only` or `409 source_write_blocked` as [`writable_place`] says, `409
+/// source_action_unavailable` outside a library), a library itself `409 source_read_only`, and a
+/// file or folder; with the node and the person's access to it, for the caller to judge the
+/// right it needs.
+async fn bucket_item(
+    state: &AppState,
+    actor: &User,
+    node: NodeId,
+) -> Result<(NodeId, Node, Access), ApiError> {
+    let db = state.db();
+    let library = match writable_place(db, actor.id, node).await? {
+        Place::External(Store::S3(target)) => target.library,
+        Place::Ordinary => return Err(ApiError::SourceActionUnavailable),
+    };
+    if library == node {
+        return Err(ApiError::SourceReadOnly);
+    }
+    let (item, access) = tree::visible(db, actor, node).await?;
+    if !matches!(item.kind, NodeKind::Folder | NodeKind::Document) {
+        return Err(AccessError::WrongPlace.into());
+    }
+    Ok((library, item, access))
+}
+
+/// Judges `destination` as the place `node` of `library` goes into (a move) or is copied into:
+/// in that same library (`409 source_action_unavailable` anywhere else, `404` for someone who
+/// cannot see it), a library or folder, `add` there, and never inside `node` itself.
+async fn bucket_destination(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+    destination: NodeId,
+    node: NodeId,
+) -> Result<(), ApiError> {
+    let db = state.db();
+    match writable_place(db, actor.id, destination).await {
+        Ok(Place::External(Store::S3(target))) if target.library == library => {}
+        Err(ApiError::NotFound) => return Err(ApiError::NotFound),
+        _ => return Err(ApiError::SourceActionUnavailable),
+    }
+    let (place, place_access) = tree::visible(db, actor, destination).await?;
+    if !matches!(place.kind, NodeKind::Library | NodeKind::Folder) {
+        return Err(AccessError::WrongPlace.into());
+    }
+    tree::require(&place_access, Perms::ADD)?;
+    if db
+        .is_at_or_below(destination, node)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    {
+        return Err(AccessError::IntoItself.into());
+    }
+    Ok(())
+}
+
 /// Everything about renaming `node` to `name` and/or moving it into `parent` inside its
 /// read-and-write S3 library that is judged before the bucket is asked. `None` when nothing
 /// would change.
@@ -1755,38 +1812,12 @@ async fn restructure_allowed(
 ) -> Result<Option<Restructure>, ApiError> {
     let db = state.db();
     let unavailable = |e: records::DbError| ApiError::unavailable(&e);
-    let library = match writable_place(db, actor.id, node).await? {
-        Place::External(Store::S3(target)) => target.library,
-        Place::Ordinary => return Err(ApiError::SourceActionUnavailable),
-    };
-    if library == node {
-        return Err(ApiError::SourceReadOnly);
-    }
-    let (item, access) = tree::visible(db, actor, node).await?;
-    if !matches!(item.kind, NodeKind::Folder | NodeKind::Document) {
-        return Err(AccessError::WrongPlace.into());
-    }
+    let (library, item, access) = bucket_item(state, actor, node).await?;
     tree::require(&access, Perms::EDIT)?;
     let current = item.parent.ok_or(ApiError::SourceActionUnavailable)?;
     let destination = parent.unwrap_or(current);
     if destination != current {
-        match writable_place(db, actor.id, destination).await {
-            Ok(Place::External(Store::S3(target))) if target.library == library => {}
-            Err(ApiError::NotFound) => return Err(ApiError::NotFound),
-            _ => return Err(ApiError::SourceActionUnavailable),
-        }
-        let (place, place_access) = tree::visible(db, actor, destination).await?;
-        if !matches!(place.kind, NodeKind::Library | NodeKind::Folder) {
-            return Err(AccessError::WrongPlace.into());
-        }
-        tree::require(&place_access, Perms::ADD)?;
-        if db
-            .is_at_or_below(destination, node)
-            .await
-            .map_err(unavailable)?
-        {
-            return Err(AccessError::IntoItself.into());
-        }
+        bucket_destination(state, actor, library, destination, node).await?;
     }
     let new_name = match name {
         Some(name) => checked_name(db, &item, name).await?,
@@ -2041,6 +2072,238 @@ async fn record_moved(state: &AppState, plan: &Restructure, moved: &Moved) {
     }
 }
 
+/// A copy of an item of a bucket, judged and ready to be made.
+struct CopyPlan {
+    /// The copy's name, always given to the tree so it is the one the paths below are made of.
+    name: String,
+    /// The bucket step: `from` the item, `to` its copy, and the tracking rows of the item.
+    plan: Restructure,
+}
+
+/// Everything about copying `node` into `parent` (as `name` or as it is) inside its
+/// read-and-write S3 library that is judged before the bucket is asked: where the node and the
+/// parent are (see [`bucket_item`] and [`bucket_destination`]), `view` on the node and `add` on
+/// the parent (as [`tree::apply`] judges a copy), the folders setting for a folder, a name the
+/// listing shows and the bucket takes (`422 invalid_name`), `409 source_item_saving` when the
+/// item or anything inside it has a change not yet written, an item in archive storage (`409
+/// source_unavailable {reason: archived}`), and a name free at the parent ignoring case (`409
+/// name_taken`: a copy is never numbered).
+async fn copy_allowed(
+    state: &AppState,
+    actor: &User,
+    node: NodeId,
+    parent: NodeId,
+    name: Option<&str>,
+) -> Result<CopyPlan, ApiError> {
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let (library, item, access) = bucket_item(state, actor, node).await?;
+    tree::require(&access, Perms::VIEW)?;
+    bucket_destination(state, actor, library, parent, node).await?;
+    if item.kind == NodeKind::Folder && folders_off(db, parent).await? {
+        return Err(AccessError::FoldersOff.into());
+    }
+    let asked = name.map_or(item.name.as_str(), str::trim);
+    let new_name = match checked_name(db, &item, asked).await {
+        Err(ApiError::WrongExtension) => return Err(ApiError::InvalidName),
+        checked => checked?,
+    };
+    let (tracked, items) = tracked_subtree(db, library, node).await?;
+    let (_, path) = external_path(state, parent, &new_name).await?;
+    if !db
+        .name_free(parent, &new_name, None)
+        .await
+        .map_err(unavailable)?
+    {
+        return Err(AccessError::NameTaken.into());
+    }
+    let folder = item.kind == NodeKind::Folder;
+    let to = if folder { format!("{path}/") } else { path };
+    let shown_to = shown_in(db, library, parent, &new_name).await?;
+    Ok(CopyPlan {
+        name: new_name.clone(),
+        plan: Restructure {
+            library,
+            kind: item.kind,
+            name: Some(new_name),
+            old_name: item.name,
+            parent: Some(parent),
+            from: tracked.repository_path,
+            to,
+            shown_from: tracked.path,
+            shown_to,
+            items,
+        },
+    })
+}
+
+/// Copies `node` into `parent` inside its read-and-write S3 library, for `actor`, named `name`
+/// or as it is: in the bucket first (every object copied by the store itself, on the tag
+/// ShareCraft recorded, so no byte is downloaded), then in the tree (new nodes with ids of their
+/// own), then in the tracking rows, with the tags of the copies as the store answered them, so
+/// the next listing sees nothing new. Each copied file has a revision of its own, and its
+/// content is read when it is first opened. Answers the new node.
+///
+/// Everything that can be refused is judged before the bucket is asked (see [`copy_allowed`]),
+/// and judged again once the library's source lock is held; the lock is held over every bucket
+/// call and until the rows are recorded (`409 source_busy` after ten seconds). If the tree
+/// refuses after the bucket was copied, the copies are deleted (best effort; one that cannot be
+/// deleted is a new file at the next listing, which is woken) and the tree's error is answered.
+/// Records `source.moved {node, from, objects, left_behind: 0, kind: "copy"}`.
+///
+/// # Errors
+/// As [`copy_allowed`]; `409 source_too_many_objects {count}`, `409 source_too_large_to_move`,
+/// `409 source_changed` (a listing is woken), `409 name_taken`, `409 source_write_blocked` (the
+/// store refused: the library is blocked) and `source_unavailable` from the bucket.
+pub(crate) async fn copy_within(
+    state: &AppState,
+    actor: &User,
+    node: NodeId,
+    parent: NodeId,
+    name: Option<&str>,
+) -> Result<NodeId, ApiError> {
+    let db = state.db();
+    let first = copy_allowed(state, actor, node, parent, name).await?;
+    let lock = lock_source(db, first.plan.library).await?;
+    // Judged again once the lock is held: a listing or a write may have run meanwhile.
+    let CopyPlan { name, plan } = copy_allowed(state, actor, node, parent, name).await?;
+    let target = bucket(state, plan.library).await?;
+    let known = known_of(&plan.items);
+    let copied = match copy_item(
+        state.s3(),
+        &target,
+        &plan.from,
+        &plan.to,
+        plan.folder(),
+        &known,
+    )
+    .await
+    {
+        Ok(copied) => copied,
+        Err(error) => return Err(refusal(state, plan.library, error).await),
+    };
+    let applied = tree::apply(
+        state,
+        actor,
+        TreeOp::Copy {
+            id: node,
+            parent,
+            name: Some(name),
+        },
+    )
+    .await;
+    let root = match applied {
+        Ok(applied) => applied.node,
+        Err(e) => {
+            if remove_copies(state.s3(), &target, &copied.seen).await > 0 {
+                state.sources().wake(plan.library);
+            }
+            return Err(match e {
+                AccessError::WrongExtension => ApiError::InvalidName,
+                e => e.into(),
+            });
+        }
+    };
+    record_copied(state, &plan, node, root.id, &copied).await;
+    drop(lock);
+    state.events().emit(NewEvent {
+        kind: "source.moved",
+        actor: Some(actor.id),
+        subject: None,
+        document: (plan.kind == NodeKind::Document).then_some(DocId(root.id.0)),
+        node: Some(plan.library),
+        detail: json!({
+            "node": root.id.0.to_string(),
+            "from": node.0.to_string(),
+            "objects": copied.objects,
+            "left_behind": 0,
+            "kind": "copy",
+        }),
+    });
+    Ok(root.id)
+}
+
+/// Records a copy made in the bucket and the tree: each new node (the tree made them with ids
+/// of their own, below `root`, with the names of the originals below `from`) is tracked at the
+/// path of its copy, a folder as the listing will show it and a file with the tag its copy was
+/// answered with (never one computed here: the next listing must find the same) and a revision
+/// of its own. A row that cannot be recorded is left to the listing, which is woken.
+async fn record_copied(
+    state: &AppState,
+    plan: &Restructure,
+    from: NodeId,
+    root: NodeId,
+    copied: &Moved,
+) {
+    let db = state.db();
+    // Which new node is the copy of which old one: the same names, level by level.
+    let mut twins: HashMap<NodeId, NodeId> = HashMap::from([(from, root)]);
+    let mut level = vec![(from, root)];
+    while let Some((old, new)) = level.pop() {
+        let (olds, news) = match (db.live_children(old).await, db.live_children(new).await) {
+            (Ok(olds), Ok(news)) => (olds, news),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("sharecraft-server: the nodes of a copy could not be read: {e}");
+                state.sources().wake(plan.library);
+                return;
+            }
+        };
+        for child in olds {
+            if let Some(twin) = news.iter().find(|n| n.name == child.name) {
+                twins.insert(child.id, twin.id);
+                level.push((child.id, twin.id));
+            }
+        }
+    }
+    let seen: HashMap<&str, &Seen> = copied
+        .seen
+        .iter()
+        .map(|(path, seen)| (path.as_str(), seen))
+        .collect();
+    let mut folders = Vec::new();
+    let mut files = Vec::new();
+    for item in &plan.items {
+        let (Some(node), Some(path)) = (twins.get(&item.node), plan.reshown(&item.path)) else {
+            // Not copied as a node (out of the person's sight): the listing adds it.
+            state.sources().wake(plan.library);
+            continue;
+        };
+        let repository_path = plan.rebased(&item.repository_path);
+        if item.blob_sha.is_none() {
+            folders.push(SourceItem {
+                node: *node,
+                path,
+                repository_path,
+                blob_sha: None,
+                size: item.size,
+            });
+            continue;
+        }
+        let Some(seen) = seen.get(repository_path.as_str()) else {
+            state.sources().wake(plan.library);
+            continue;
+        };
+        files.push(ExternalEntry {
+            node: *node,
+            path,
+            repository_path,
+            size: seen.size,
+            mtime_ns: i64::try_from(seen.modified.unix_timestamp_nanos()).unwrap_or(0),
+            tag: Some(seen.tag.clone()),
+        });
+    }
+    if let Err(e) = db.upsert_source_items(plan.library, &folders).await {
+        eprintln!("sharecraft-server: the folders of a copy could not be tracked: {e}");
+        state.sources().wake(plan.library);
+    }
+    for entry in &files {
+        if let Err(e) = db.record_external_item(plan.library, entry).await {
+            eprintln!("sharecraft-server: a copied file could not be tracked: {e}");
+            state.sources().wake(plan.library);
+        }
+    }
+}
+
 /// Everything about deleting `node` inside its read-and-write S3 library that is judged before
 /// the bucket is asked, as [`tree::apply`] judges a delete and [`restructure_allowed`] a bucket
 /// step: where the node is (`404`, `409 source_read_only`, `409 source_write_blocked`, a library
@@ -2052,17 +2315,7 @@ async fn delete_allowed(
     node: NodeId,
 ) -> Result<Restructure, ApiError> {
     let db = state.db();
-    let library = match writable_place(db, actor.id, node).await? {
-        Place::External(Store::S3(target)) => target.library,
-        Place::Ordinary => return Err(ApiError::SourceActionUnavailable),
-    };
-    if library == node {
-        return Err(ApiError::SourceReadOnly);
-    }
-    let (item, access) = tree::visible(db, actor, node).await?;
-    if !matches!(item.kind, NodeKind::Folder | NodeKind::Document) {
-        return Err(AccessError::WrongPlace.into());
-    }
+    let (library, item, access) = bucket_item(state, actor, node).await?;
     tree::require(&access, Perms::DELETE)?;
     let (tracked, items) = tracked_subtree(db, library, node).await?;
     Ok(Restructure {

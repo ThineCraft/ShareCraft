@@ -29,8 +29,8 @@ use crate::AppState;
 use crate::auth::Signed;
 use crate::room::AccessChange;
 use crate::source_write::{
-    Place, Store, create_folder, delete_to_holding, rename_or_move, restore_from_holding,
-    writable_place,
+    Place, Store, copy_within, create_folder, delete_to_holding, rename_or_move,
+    restore_from_holding, writable_place,
 };
 use crate::tree::{self, TreeOp};
 
@@ -876,16 +876,86 @@ pub(crate) async fn copy(
     let id = node_id(&id)?;
     let parent = node_id(&body.parent)?;
     let actor = signed.session.user;
-    // Into a connected library: refused. Out of one: an ordinary copy.
-    require_not_connected_for(state.db(), actor.id, parent).await?;
     let copied =
-        to_completion(async move { copy_one(&state, &actor, id, parent, body.name).await }).await?;
+        to_completion(async move { copy_checked(&state, &actor, id, parent, body.name).await })
+            .await?;
     Ok((StatusCode::CREATED, Json(copied)).into_response())
+}
+
+/// Where a copy of `id` into `parent` by `user` is made: `Ok(None)` in the ordinary tree (a copy
+/// out of a connected library is an ordinary copy), `Ok(Some(library))` in the bucket of the
+/// read-and-write S3 library that both `id` and `parent` are in (see [`copy_within`]). A
+/// `parent` in any other connected library is refused as [`require_not_connected_for`] refuses
+/// it (copies between libraries are not built yet), and one in a library whose writes are
+/// blocked `409 source_write_blocked` when `id` is in it too.
+pub(crate) async fn copy_place(
+    db: &Db,
+    user: UserId,
+    id: NodeId,
+    parent: NodeId,
+) -> Result<Option<NodeId>, ApiError> {
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    match writable_place(db, user, parent).await {
+        Ok(Place::External(Store::S3(target))) => {
+            match writable_place(db, user, id).await {
+                Ok(Place::External(Store::S3(source))) if source.library == target.library => {
+                    return Ok(Some(target.library));
+                }
+                Err(ApiError::NotFound) => return Err(ApiError::NotFound),
+                _ => {}
+            }
+            Err(ApiError::SourceActionUnavailable)
+        }
+        Err(ApiError::SourceWriteBlocked) => {
+            let (from, into) = (
+                db.source_library_of(id).await.map_err(unavailable)?,
+                db.source_library_of(parent).await.map_err(unavailable)?,
+            );
+            if from.is_some() && from == into {
+                return Err(ApiError::SourceWriteBlocked);
+            }
+            Err(ApiError::SourceActionUnavailable)
+        }
+        _ => {
+            require_not_connected_for(db, user, parent).await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Copies `id` into `parent` for `actor`, named `name` or as it is, wherever it is: inside a
+/// read-and-write S3 library through the bucket ([`copy_place`]), otherwise as an ordinary copy
+/// ([`copy_one`]); into any other connected library it is refused. Run inside
+/// [`to_completion`].
+pub(crate) async fn copy_checked(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+    parent: NodeId,
+    name: Option<String>,
+) -> Result<Copied, ApiError> {
+    if copy_place(state.db(), actor.id, id, parent)
+        .await?
+        .is_none()
+    {
+        return copy_one(state, actor, id, parent, name).await;
+    }
+    let copy = copy_within(state, actor, id, parent, name.as_deref()).await?;
+    let node = state
+        .db()
+        .node(copy)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Copied {
+        node: NodeOut::from(node),
+        renamed: None,
+    })
 }
 
 /// Copies `id` into `parent` for `actor`, named `name` or as it is. Run inside
 /// [`to_completion`]. The caller refuses a copy into a connected library first (see
-/// [`require_not_connected_for`]); a copy out of one is an ordinary copy.
+/// [`copy_place`]); a copy out of one is an ordinary copy.
 pub(crate) async fn copy_one(
     state: &AppState,
     actor: &User,
