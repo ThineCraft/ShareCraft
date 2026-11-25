@@ -12,7 +12,7 @@ use common::{document_in, new_id, put, site, user};
 use records::test_support::TestDb;
 use records::{
     AccessError, ExternalEntry, NewPendingWrite, NewSource, NodeChange, NodeKind, NodeRow, S3Place,
-    SealedRow, SourceKind, SourceMode, Tri, Versioning, object_tag, s3_location,
+    SealedRow, SourceItem, SourceKind, SourceMode, Tri, Versioning, object_tag, s3_location,
 };
 use revisions::BlobRef;
 use serde_json::json;
@@ -190,12 +190,40 @@ async fn stage_path(f: &Fixture, path: &str) {
             path,
             blob,
             base_tag: None,
+            seen_revision: None,
             by: f.user,
             flush: false,
             now: t0(),
         })
         .await
         .unwrap();
+}
+
+/// Stages `bytes` for `node` at `path` on `base`, as an editor's save read at `seen`.
+async fn stage_on(
+    f: &Fixture,
+    node: NodeId,
+    path: &str,
+    bytes: &[u8],
+    base: Option<&str>,
+    seen: Option<&str>,
+) -> Result<String, AccessError> {
+    let blob = BlobRef::of(bytes);
+    f.test.db.pin_cached(&blob, t0()).await.unwrap();
+    f.test
+        .db
+        .stage_write(&NewPendingWrite {
+            node,
+            library: f.library,
+            path,
+            blob,
+            base_tag: base,
+            seen_revision: seen,
+            by: f.user,
+            flush: false,
+            now: t0(),
+        })
+        .await
 }
 
 fn purged_row(
@@ -632,7 +660,7 @@ async fn writes_below_counts_the_file_and_everything_under_a_folder() {
 }
 
 #[tokio::test]
-async fn purging_a_node_removes_its_held_and_multipart_rows() {
+async fn purging_a_node_removes_its_held_rows_and_keeps_its_multipart_rows() {
     let f = fixture().await;
     let db = &f.test.db;
     let doomed = new_file(&f, "Doomed").await;
@@ -663,8 +691,8 @@ async fn purging_a_node_removes_its_held_and_multipart_rows() {
         .stale_multiparts(t0() + Duration::days(1), 10)
         .await
         .unwrap();
-    assert_eq!(open.len(), 1);
-    assert_eq!(open.first().unwrap().node, kept);
+    // A purged node keeps its upload rows: they are how the sweep finds an upload to abort.
+    assert_eq!(open.len(), 2);
 
     // A purged site takes the rest.
     db.apply_nodes(NodeChange {
@@ -685,4 +713,179 @@ async fn purging_a_node_removes_its_held_and_multipart_rows() {
     .await
     .unwrap();
     assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn a_move_takes_the_pending_writes_along_and_a_retag_their_base() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    let old = object_tag(4, 1_700_000_000, "\"etag\"", false);
+    let file = track(&f, "docs/a.txt", "docs/a.txt").await;
+    let revision = db.external_item(file).await.unwrap().unwrap().revision;
+    // A save staged while the folder is being moved in the bucket, and a new file's first write.
+    stage_on(
+        &f,
+        file,
+        "docs/a.txt",
+        b"edited",
+        Some(&old),
+        Some(&revision),
+    )
+    .await
+    .unwrap();
+    stage_path(&f, "docs/sub/new.txt").await;
+    stage_path(&f, "docs2/stays.txt").await;
+
+    assert_eq!(
+        db.move_source_items(f.library, "docs/", "moved/docs/")
+            .await
+            .unwrap(),
+        1
+    );
+    let row = db.pending_write(file).await.unwrap().unwrap();
+    assert_eq!(row.path, "moved/docs/a.txt");
+    let mut staged: Vec<String> = db
+        .pending_writes_of(f.library)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|w| w.path)
+        .collect();
+    staged.sort();
+    assert_eq!(
+        staged,
+        [
+            "docs2/stays.txt",
+            "moved/docs/a.txt",
+            "moved/docs/sub/new.txt"
+        ]
+    );
+
+    // The copy's tag becomes the base the write is checked on; another tag changes nothing.
+    let new = object_tag(4, 1_700_000_100, "\"copy\"", false);
+    let modified = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+    assert!(
+        !db.retag_source_item(file, "x4-0~00", &new, 4, modified)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.pending_write(file).await.unwrap().unwrap().base_tag,
+        Some(old.clone())
+    );
+    assert!(
+        db.retag_source_item(file, &old, &new, 4, modified)
+            .await
+            .unwrap()
+    );
+    let row = db.pending_write(file).await.unwrap().unwrap();
+    assert_eq!(row.base_tag, Some(new));
+    // The revision the editor holds is kept.
+    assert_eq!(
+        db.external_item(file).await.unwrap().unwrap().revision,
+        row.revision
+    );
+}
+
+#[tokio::test]
+async fn a_stage_takes_a_tracked_files_path_and_tag_from_its_tracking_row() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    let old = object_tag(4, 1_700_000_000, "\"etag\"", false);
+    let new = object_tag(4, 1_700_000_100, "\"copy\"", false);
+    let modified = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+    let file = track(&f, "a/x.txt", "a/x.txt").await;
+    let read_at = db.external_item(file).await.unwrap().unwrap().revision;
+    // Moved after the editor read the file, before its save was staged.
+    db.move_source_items(f.library, "a/x.txt", "b/x.txt")
+        .await
+        .unwrap();
+    assert!(
+        db.retag_source_item(file, &old, &new, 4, modified)
+            .await
+            .unwrap()
+    );
+    stage_on(&f, file, "a/x.txt", b"edited", Some(&old), Some(&read_at))
+        .await
+        .unwrap();
+    let row = db.pending_write(file).await.unwrap().unwrap();
+    assert_eq!(row.path, "b/x.txt");
+    assert_eq!(row.base_tag, Some(new.clone()));
+
+    // Read at another revision (the file changed since): the path follows, the base does not.
+    let other = track(&f, "c.txt", "c.txt").await;
+    stage_on(
+        &f,
+        other,
+        "wrong.txt",
+        b"edited",
+        Some("base-c"),
+        Some(&"0".repeat(40)),
+    )
+    .await
+    .unwrap();
+    let row = db.pending_write(other).await.unwrap().unwrap();
+    assert_eq!(row.path, "c.txt");
+    assert_eq!(row.base_tag.as_deref(), Some("base-c"));
+}
+
+#[tokio::test]
+async fn a_new_file_takes_the_folder_of_its_tracked_parent() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    let folder = put(
+        &f.test,
+        new_id(),
+        NodeKind::Folder,
+        Some(f.library),
+        f.site,
+        "docs",
+    )
+    .await;
+    db.upsert_source_items(
+        f.library,
+        &[SourceItem {
+            node: folder,
+            path: "docs".into(),
+            repository_path: "docs/".into(),
+            blob_sha: None,
+            size: 0,
+        }],
+    )
+    .await
+    .unwrap();
+    let file: NodeId = document_in(&f.test, f.user, folder, f.site, "new.txt")
+        .await
+        .into();
+    // The folder moved between the caller's look and the stage.
+    db.move_source_items(f.library, "docs/", "papers/")
+        .await
+        .unwrap();
+    stage_on(&f, file, "docs/new.txt", b"new", None, None)
+        .await
+        .unwrap();
+    let row = db.pending_write(file).await.unwrap().unwrap();
+    assert_eq!(row.path, "papers/new.txt");
+    assert_eq!(row.base_tag, None);
+}
+
+#[tokio::test]
+async fn a_deleted_file_takes_no_new_stage() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    let file = track(&f, "a.txt", "a.txt").await;
+    let mut row = purged_row(&f, file, NodeKind::Document, Some(f.library), "a.txt");
+    row.purged_at = None;
+    row.deleted_with = Some(file);
+    db.apply_nodes(NodeChange {
+        rows: &[row],
+        ..NodeChange::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        stage_on(&f, file, "a.txt", b"too late", None, None).await,
+        Err(AccessError::NotFound)
+    );
+    assert_eq!(db.pending_write(file).await.unwrap(), None);
 }

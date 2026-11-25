@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   sourceAccess,
   sourceControlsEnabled,
@@ -456,6 +457,15 @@ test('overwriteNote shows for conditional no or unknown and for nothing else', (
   assert.equal(overwriteNote('unknown'), overwriteNote('no'));
   assert.equal(overwriteNote(undefined), '');
   assert.equal(overwriteNote(null), '');
+});
+
+test('the new-library note is read with the link that takes the focus', () => {
+  // The note is revealed by un-hiding a status region, which a screen reader may not announce,
+  // and the focus then moves to the link: the link names the note as its description.
+  const html = readFileSync(new URL('./site.html', import.meta.url), 'utf8');
+  const link = html.match(/<a [^>]*id="new-library-open"[^>]*>/)?.[0] ?? '';
+  assert.match(link, /aria-describedby="new-library-note"/);
+  assert.match(html, /<p id="new-library-note"/);
 });
 
 test('mayResolve is true only when the server said the person may Retry or Discard', () => {

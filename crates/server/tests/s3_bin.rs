@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use server::AppState;
 use server::s3_write::holding_root;
 use server::source_sync::sync_once;
-use server::source_write::sweep_holds;
+use server::source_write::{sweep_holds, write_due};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -883,4 +883,61 @@ async fn a_deleted_s3_file_is_not_found_by_search_or_counted() {
             .unwrap()
             .contains(&a)
     );
+}
+
+#[tokio::test]
+async fn a_save_made_during_a_delete_refuses_the_delete_and_is_written() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    let library = env.library("Racing delete").await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "a.txt").await;
+
+    // The save lands after the hold's copy and before the original's delete.
+    let paused = env.fake.pause_next_delete();
+    let save = async {
+        paused.reached().await;
+        let response = env
+            .server
+            .http(Some(&env.owner))
+            .post(env.server.url("/api/docs/upload"))
+            .query(&[
+                ("parent", docs.0.to_string()),
+                ("name", "a.txt".to_owned()),
+                ("on_conflict", "replace".to_owned()),
+            ])
+            .body(b"newer".to_vec())
+            .send()
+            .await
+            .unwrap();
+        let saved = answer(response).await;
+        paused.release();
+        saved
+    };
+    let (refused, saved) = tokio::join!(env.delete(file), save);
+    assert_eq!(saved.0, StatusCode::OK, "{}", saved.1);
+    // As a save staged before the delete: refused, and nothing deleted.
+    assert_error(&refused, StatusCode::CONFLICT, "source_item_saving");
+    assert_eq!(refused.1["message"], ITEM_SAVING);
+    assert!(!env.in_bin(file).await);
+    assert_eq!(env.child(docs, "a.txt").await, file);
+    assert!(env.db().held(file).await.unwrap().is_none());
+    assert!(env.held(file, "docs/a.txt").is_none());
+    assert_eq!(env.object("docs/a.txt").unwrap().bytes, b"a");
+
+    // The save is written where the file is, on the object moved back.
+    write_due(
+        &env.state,
+        OffsetDateTime::now_utc() + time::Duration::seconds(31),
+    )
+    .await;
+    assert!(env.db().pending_write(file).await.unwrap().is_none());
+    assert_eq!(env.object("docs/a.txt").unwrap().bytes, b"newer");
+    assert_eq!(env.children(docs).await, [("a.txt".to_owned(), file)]);
+    env.plans_nothing(library).await;
+
+    // Written, the file can be deleted.
+    let (status, body) = env.delete(file).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(env.in_bin(file).await);
 }

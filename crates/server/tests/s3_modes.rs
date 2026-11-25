@@ -270,6 +270,7 @@ impl Env {
             path,
             blob,
             base_tag: None,
+            seen_revision: None,
             by: self.admin.id,
             flush: false,
             now,

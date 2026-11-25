@@ -19,7 +19,7 @@ use std::time::Duration;
 use collab_core::ids::{DocId, NodeId};
 use common::fake_s3::{FakeS3, Opts, Stored};
 use common::{FileClient, TestServer, TestUser, spawn_server_config_without_workers};
-use records::{Principal, S3_ENDPOINTS};
+use records::{Principal, S3_ENDPOINTS, WriteState};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
@@ -258,6 +258,51 @@ impl Env {
 
     fn woken(&self, library: NodeId) -> bool {
         self.state.sources().take_wake_for_tests(library)
+    }
+
+    /// Lists the library once and fails unless it added, changed, removed or moved nothing
+    /// (its counts of files and bytes may follow a write).
+    async fn plans_nothing(&self, library: NodeId) {
+        if let Some(report) = sync_once(&self.state, library, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+        {
+            assert_eq!(
+                (report.added, report.changed, report.removed, report.moved),
+                (0, 0, 0, 0),
+                "the listing changed something"
+            );
+        }
+    }
+
+    /// An editor's save of `bytes` over `base`, holding the seat `token`.
+    async fn save(
+        &self,
+        node: NodeId,
+        token: &str,
+        base: &str,
+        bytes: &[u8],
+    ) -> (StatusCode, Value) {
+        let response = self
+            .server
+            .http(Some(&self.owner))
+            .put(self.server.url(&format!("/api/docs/{}/content", node.0)))
+            .header(SEAT, token)
+            .query(&[("base", base)])
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .unwrap();
+        answer(response).await
+    }
+
+    /// Runs the write worker once, past the coalescing wait.
+    async fn write_now(&self) {
+        write_due(
+            &self.state,
+            OffsetDateTime::now_utc() + time::Duration::seconds(31),
+        )
+        .await;
     }
 }
 
@@ -730,4 +775,152 @@ async fn an_archived_file_is_refused_plainly() {
     }
     assert!(env.writes().is_empty(), "{:?}", env.writes());
     assert!(!env.woken(library));
+}
+
+#[tokio::test]
+async fn a_file_too_large_to_copy_cannot_be_renamed_or_moved() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/huge.bin"), b"huge");
+    env.fake.put(BUCKET, &key("archive/"), b"");
+    let library = env.library("Huge").await;
+    let docs = env.child(library, "docs").await;
+    let archive = env.child(library, "archive").await;
+    let file = env.child(docs, "huge.bin").await;
+    // Over CopyObject's 5 GiB, as the bucket answers it (a test cannot store one).
+    env.fake
+        .claim_size(&key("docs/huge.bin"), server::s3::COPY_MAX + 1);
+
+    for refused in [
+        env.rename(file, "bigger.bin").await,
+        env.move_to(file, archive).await,
+        // The folder holding it too.
+        env.rename(docs, "papers").await,
+    ] {
+        assert_error(&refused, StatusCode::CONFLICT, "source_too_large_to_move");
+    }
+    assert!(env.writes().is_empty(), "{:?}", env.writes());
+    assert_eq!(env.child(docs, "huge.bin").await, file);
+    assert_eq!(env.child(library, "docs").await, docs);
+    assert!(!env.woken(library));
+}
+
+#[tokio::test]
+async fn a_store_that_refuses_the_copy_blocks_the_library() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    env.fake.put(BUCKET, &key("archive/"), b"");
+    let library = env.library("Denied").await;
+    let docs = env.child(library, "docs").await;
+    let archive = env.child(library, "archive").await;
+    let file = env.child(docs, "a.txt").await;
+    env.fake.read_only();
+
+    let refused = env.move_to(file, archive).await;
+    assert_error(&refused, StatusCode::CONFLICT, "source_write_blocked");
+    assert!(matches!(
+        env.db().write_state(library).await.unwrap(),
+        Some((WriteState::Blocked, _))
+    ));
+    assert_eq!(env.object("docs/a.txt").unwrap().bytes, b"a");
+    assert!(env.object("archive/a.txt").is_none());
+    assert_eq!(env.child(docs, "a.txt").await, file);
+    // Blocked now: a rename is refused before the bucket is asked.
+    let writes = env.fake.writes().len();
+    assert_error(
+        &env.rename(file, "b.txt").await,
+        StatusCode::CONFLICT,
+        "source_write_blocked",
+    );
+    assert_eq!(env.fake.writes().len(), writes);
+}
+
+#[tokio::test]
+async fn a_save_made_during_a_rename_is_written_to_the_renamed_file() {
+    let env = Env::new().await;
+    env.fake
+        .put(BUCKET, &key("docs/sheet.xlsx"), b"bucket sheet");
+    let library = env.library("Racing").await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "sheet.xlsx").await;
+    let editor = FileClient::connect_as(&env.server, DocId(file.0), &env.owner).await;
+    let token = editor.token().expect("the editor holds the seat");
+    let base = env.revision(file).await;
+
+    // The save lands after the copy and before the original's delete.
+    let paused = env.fake.pause_next_delete();
+    let save = async {
+        paused.reached().await;
+        let saved = env
+            .save(file, &token, &base, b"edited during the rename")
+            .await;
+        paused.release();
+        saved
+    };
+    let (renamed, saved) = tokio::join!(env.rename(file, "renamed.xlsx"), save);
+    assert_eq!(renamed.0, StatusCode::OK, "{}", renamed.1);
+    assert_eq!(saved.0, StatusCode::OK, "{}", saved.1);
+    assert_eq!(saved.1["changed"], true, "{}", saved.1);
+    let row = env.db().pending_write(file).await.unwrap().unwrap();
+    assert_eq!(row.path, "docs/renamed.xlsx");
+
+    env.write_now().await;
+    assert!(env.db().pending_write(file).await.unwrap().is_none());
+    assert_eq!(
+        env.object("docs/renamed.xlsx").unwrap().bytes,
+        b"edited during the rename"
+    );
+    // Written on the moved object, not as a copy beside the old name.
+    assert!(env.object("docs/sheet.xlsx").is_none());
+    assert_eq!(
+        env.children(docs).await,
+        [("renamed.xlsx".to_owned(), file)]
+    );
+    let last = env.writes().pop().unwrap();
+    assert_eq!(
+        last,
+        (
+            "PUT".to_owned(),
+            key("docs/renamed.xlsx"),
+            "match".to_owned()
+        )
+    );
+    env.plans_nothing(library).await;
+}
+
+#[tokio::test]
+async fn a_save_made_during_a_folder_move_follows_the_folder() {
+    let env = Env::new().await;
+    env.fake
+        .put(BUCKET, &key("docs/sheet.xlsx"), b"bucket sheet");
+    env.fake.put(BUCKET, &key("archive/"), b"");
+    let library = env.library("Racing folder").await;
+    let docs = env.child(library, "docs").await;
+    let archive = env.child(library, "archive").await;
+    let file = env.child(docs, "sheet.xlsx").await;
+    let editor = FileClient::connect_as(&env.server, DocId(file.0), &env.owner).await;
+    let token = editor.token().expect("the editor holds the seat");
+    let base = env.revision(file).await;
+
+    let paused = env.fake.pause_next_delete();
+    let save = async {
+        paused.reached().await;
+        let saved = env
+            .save(file, &token, &base, b"edited during the move")
+            .await;
+        paused.release();
+        saved
+    };
+    let (moved, saved) = tokio::join!(env.move_to(docs, archive), save);
+    assert_eq!(moved.0, StatusCode::OK, "{}", moved.1);
+    assert_eq!(saved.0, StatusCode::OK, "{}", saved.1);
+
+    env.write_now().await;
+    assert!(env.db().pending_write(file).await.unwrap().is_none());
+    assert_eq!(
+        env.object("archive/docs/sheet.xlsx").unwrap().bytes,
+        b"edited during the move"
+    );
+    assert!(env.object("docs/sheet.xlsx").is_none());
+    assert_eq!(env.children(docs).await, [("sheet.xlsx".to_owned(), file)]);
+    env.plans_nothing(library).await;
 }

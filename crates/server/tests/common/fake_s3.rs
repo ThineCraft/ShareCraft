@@ -134,6 +134,26 @@ struct Model {
     min_part: u64,
     claimed_sizes: HashMap<String, u64>,
     fail_copies: HashMap<String, (u16, String)>,
+    pause_delete: Option<Paused>,
+}
+
+/// A request held before it is answered (see [`FakeS3::pause_next_delete`]).
+#[derive(Clone)]
+pub struct Paused {
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl Paused {
+    /// Waits until the request has arrived (and is held).
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the held request go on.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl Default for Model {
@@ -174,6 +194,7 @@ impl Default for Model {
             min_part: MIN_PART,
             claimed_sizes: HashMap::new(),
             fail_copies: HashMap::new(),
+            pause_delete: None,
         }
     }
 }
@@ -431,6 +452,18 @@ impl FakeS3 {
         self.model()
             .fail_copies
             .insert(key.to_owned(), (status, code.to_owned()));
+    }
+
+    /// The next `DELETE` of an object (not an abort) is held before anything is done or logged,
+    /// until the answer's [`Paused::release`]: a step stopped between its copies and its
+    /// deletes.
+    pub fn pause_next_delete(&self) -> Paused {
+        let paused = Paused {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        self.model().pause_delete = Some(paused.clone());
+        paused
     }
 
     /// Every `PUT` of part number `n` is answered `500 InternalError`.
@@ -742,6 +775,15 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
+    let paused = if method == Method::DELETE && !has("uploadId") {
+        model.lock().unwrap().pause_delete.take()
+    } else {
+        None
+    };
+    if let Some(paused) = paused {
+        paused.reached.notify_one();
+        paused.release.notified().await;
+    }
 
     let mut wait = None;
     let response = {

@@ -92,12 +92,18 @@ impl PendingState {
 pub struct NewPendingWrite<'a> {
     pub node: NodeId,
     pub library: NodeId,
-    /// The path below the library's place, as `source_items.repository_path` writes it.
+    /// The path below the library's place, as `source_items.repository_path` writes it. A
+    /// tracked node's own tracking row overrides it, and a new file's folder is its tracked
+    /// parent's (see [`Db::stage_write`]).
     pub path: &'a str,
     /// The new content, pinned in the cache by the caller.
     pub blob: BlobRef,
     /// The tag the change is based on; `None`: the file is new and must not exist.
     pub base_tag: Option<&'a str>,
+    /// The revision the change was made on, when the caller read one (an editor's save): a
+    /// tracked node still at that revision is based on its tracking row's tag instead of
+    /// `base_tag`, which a move may have changed since without changing the content.
+    pub seen_revision: Option<&'a str>,
     pub by: UserId,
     /// Write without waiting for the throttle.
     pub flush: bool,
@@ -302,6 +308,18 @@ impl Db {
     /// its mode judged in the same transaction as the insert, so a switch to read-only cannot
     /// slip between: a library that is read-only (or has no connection) refuses with
     /// `LibraryReadOnly`, and a switch that wins the lock first is seen here.
+    ///
+    /// Where the change goes is read here, under locks, not trusted from the caller, so a save
+    /// racing a move inside the store lands where the file is now. A node in the recycle bin (or
+    /// gone) refuses with `NotFound`; its `nodes` row is locked `FOR SHARE`, so a delete either
+    /// waits for this stage (and finds its row) or is seen. A tracked node's tracking row is
+    /// locked `FOR UPDATE` and gives the path: [`Db::move_source_items`] and
+    /// [`Db::retag_source_item`] lock it first too, so a move either finished (and its path and
+    /// tag are read here) or waits and then moves this row along. A new file whose parent folder
+    /// is tracked takes that folder's path (its row locked `FOR SHARE`) with the last segment of
+    /// `w.path`. For a new row, `w.base_tag` is replaced by the tracking row's tag when the row
+    /// is still at `w.seen_revision`. Locks are taken in the order tracking row, then pending
+    /// row, as every transaction that touches both does.
     pub async fn stage_write(&self, w: &NewPendingWrite<'_>) -> Result<String, AccessError> {
         let revision = new_external_revision();
         let mut tx = self.pool().begin().await?;
@@ -317,6 +335,56 @@ impl Db {
             .bind(w.blob.hex())
             .fetch_one(&mut *tx)
             .await?;
+        let live: Option<bool> =
+            sqlx::query_scalar("select deleted_at is null from nodes where id = $1 for share")
+                .bind(w.node.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if live != Some(true) {
+            return Err(AccessError::NotFound);
+        }
+        let item: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "select repository_path, blob_sha, revision from source_items \
+             where node_id = $1 and library_id = $2 for update",
+        )
+        .bind(w.node.0)
+        .bind(w.library.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let tracked = item.is_some();
+        let (path, base_tag) = match item {
+            Some((repository_path, tag, current)) => {
+                let unchanged = w
+                    .seen_revision
+                    .is_some_and(|seen| current.as_deref() == Some(seen));
+                let base = if unchanged {
+                    tag
+                } else {
+                    w.base_tag.map(str::to_owned)
+                };
+                (repository_path, base)
+            }
+            None => {
+                let folder: Option<String> = sqlx::query_scalar(
+                    "select p.repository_path from nodes n \
+                     join source_items p on p.node_id = n.parent_id \
+                     where n.id = $1 and p.library_id = $2 and p.blob_sha is null \
+                     for share of p",
+                )
+                .bind(w.node.0)
+                .bind(w.library.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let path = match folder {
+                    Some(folder) => {
+                        let name = w.path.rsplit('/').next().unwrap_or(w.path);
+                        format!("{}/{name}", folder.trim_end_matches('/'))
+                    }
+                    None => w.path.to_owned(),
+                };
+                (path, w.base_tag.map(str::to_owned))
+            }
+        };
         sqlx::query(
             "insert into source_writes \
                  (node_id, library_id, path, sha256, size, revision, base_tag, by_user, state, \
@@ -326,18 +394,20 @@ impl Db {
                  sha256 = excluded.sha256, size = excluded.size, revision = excluded.revision, \
                  by_user = excluded.by_user, staged_at = excluded.staged_at, \
                  flush = source_writes.flush or excluded.flush, \
+                 path = case when $11 then excluded.path else source_writes.path end, \
                  state = 'scanning', error = null, attempts = 0, next_try_at = null",
         )
         .bind(w.node.0)
         .bind(w.library.0)
-        .bind(w.path)
+        .bind(&path)
         .bind(w.blob.hex())
         .bind(column(w.blob.size))
         .bind(&revision)
-        .bind(w.base_tag)
+        .bind(base_tag.as_deref())
         .bind(w.by.0)
         .bind(w.flush)
         .bind(w.now)
+        .bind(tracked)
         .execute(&mut *tx)
         .await?;
         sqlx::query("update source_items set revision = $2 where node_id = $1")
@@ -437,6 +507,11 @@ impl Db {
         modified: OffsetDateTime,
     ) -> Result<bool, DbError> {
         let mut tx = self.pool().begin().await?;
+        // The tracking row first, then the pending row: the order [`Db::stage_write`] takes.
+        sqlx::query("select 1 from source_items where node_id = $1 for update")
+            .bind(node.0)
+            .fetch_optional(&mut *tx)
+            .await?;
         let row: Option<(Uuid, String, String, String)> = sqlx::query_as(
             "select library_id, path, sha256, revision from source_writes \
              where node_id = $1 for update",
@@ -556,8 +631,8 @@ impl Db {
     }
 
     /// Asks for the pending write of `node` not to wait for the throttle (a session ended, or
-    /// the person closed the file). A retry time still holds it back, so `_now` is not used.
-    /// Whether there is a row.
+    /// the room emptied): a row that is not failed loses its retry time and is due at once; a
+    /// failed one keeps its retry time. `_now` is not used. Whether there is a row.
     pub async fn flush_write(&self, node: NodeId, _now: OffsetDateTime) -> Result<bool, DbError> {
         // A row that is not failed is due at once; a failed one keeps its retry time.
         let done = sqlx::query(
@@ -576,6 +651,11 @@ impl Db {
     /// store's again). Whether it was withdrawn.
     pub async fn drop_write(&self, node: NodeId, sha256: &[u8; 32]) -> Result<bool, DbError> {
         let mut tx = self.pool().begin().await?;
+        // The tracking row first, then the pending row: the order [`Db::stage_write`] takes.
+        sqlx::query("select 1 from source_items where node_id = $1 for update")
+            .bind(node.0)
+            .fetch_optional(&mut *tx)
+            .await?;
         let done = sqlx::query("delete from source_writes where node_id = $1 and sha256 = $2")
             .bind(node.0)
             .bind(hex(sha256))
@@ -821,6 +901,11 @@ impl Db {
     /// that does not start with `from` (a case-collision suffix keeps its own tail, so a path
     /// that does not share the prefix is left as it is). A target already taken is a `DbError`
     /// and nothing changes.
+    ///
+    /// The pending writes at or below `from` move along in the same transaction (tracked or a
+    /// new file's), after the tracking rows are locked: a save staged while the store's objects
+    /// were being moved is written at the new place. Their base tags are left to
+    /// [`Db::retag_source_item`].
     pub async fn move_source_items(
         &self,
         library: NodeId,
@@ -840,6 +925,18 @@ impl Db {
         .bind(from)
         .bind(folder)
         .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query(
+            "update source_writes \
+             set path = $4 || substr(path, char_length($2) + 1) \
+             where library_id = $1 \
+               and (path = $2 or ($3 and left(path, char_length($2)) = $2))",
+        )
+        .bind(library.0)
+        .bind(from)
+        .bind(folder)
+        .bind(to)
+        .execute(&mut *tx)
         .await?;
         let rebased = |text: &str| -> Option<String> {
             text.strip_prefix(from).map(|rest| format!("{to}{rest}"))
@@ -886,7 +983,9 @@ impl Db {
     /// store: the copy's tag `new_tag`, `size` and modification time, only if `old_tag` is still
     /// current. The content is the same, so the revision, the content read and its time are
     /// kept (an editor's base stays valid); the object version read is forgotten, since the
-    /// copy is another object. Whether it changed.
+    /// copy is another object. A pending write of `node` based on `old_tag` is based on
+    /// `new_tag` from now on, in the same transaction: it was made on the same content. Whether
+    /// it changed.
     pub async fn retag_source_item(
         &self,
         node: NodeId,
@@ -895,6 +994,7 @@ impl Db {
         size: u64,
         modified: OffsetDateTime,
     ) -> Result<bool, DbError> {
+        let mut tx = self.pool().begin().await?;
         let done = sqlx::query(
             "update source_items set blob_sha = $3, size = $4, modified_at = $5, \
                  version_id = null, missing_since = null \
@@ -905,9 +1005,19 @@ impl Db {
         .bind(new_tag)
         .bind(column(size))
         .bind(modified)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
-        Ok(done.rows_affected() > 0)
+        if done.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query("update source_writes set base_tag = $3 where node_id = $1 and base_tag = $2")
+            .bind(node.0)
+            .bind(old_tag)
+            .bind(new_tag)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// The tracking row of `node` in its connected library, if it has one.

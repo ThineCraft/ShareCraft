@@ -270,6 +270,11 @@ async fn put_multipart(
         return Err(S3Error::Other);
     };
     let upload_id = s3.start_multipart(t, key, &body.sha256).await?;
+    // A crash between the start's answer and the row written in `parts_then_complete` leaves
+    // an upload no row names, which neither this worker nor `abort_stale` can find (there is no
+    // bucket listing of uploads). The window is one insert wide. R2 aborts incomplete
+    // multipart uploads after 7 days by default; any other store needs a lifecycle rule that
+    // aborts incomplete multipart uploads, or the parts stay (and are billed) until removed.
     let outcome = parts_then_complete(s3, t, key, &upload_id, path, body.size, cond, ledger).await;
     match outcome {
         Ok(head) => {
@@ -840,13 +845,6 @@ fn relative<'a>(t: &S3Target, key: &'a str) -> Option<&'a str> {
     key.strip_prefix(t.prefix())
 }
 
-/// Copies every object of the item at `from_key` to `to_key` and, with `delete`, then deletes
-/// the originals. `known` (when given) is what the tree recorded, by library-relative path;
-/// `None` skips the tag checks, for the holding folder that nothing outside writes.
-///
-/// Everything that can refuse the step is asked before the first write: the count, the sizes,
-/// the recorded tags and the destination names. No original is deleted before every copy has
-/// succeeded.
 /// Whether the library-relative `path` is left out by `skip`: a folder's entry (ending `/`)
 /// leaves out itself and everything under it, a file's only itself.
 pub(crate) fn skipped(path: &str, skip: &[String]) -> bool {
@@ -854,6 +852,13 @@ pub(crate) fn skipped(path: &str, skip: &[String]) -> bool {
         .any(|s| path == s || (s.ends_with('/') && path.starts_with(s.as_str())))
 }
 
+/// Copies every object of the item at `from_key` to `to_key` and, with `delete`, then deletes
+/// the originals. `known` (when given) is what the tree recorded, by library-relative path;
+/// `None` skips the tag checks, for the holding folder that nothing outside writes.
+///
+/// Everything that can refuse the step is asked before the first write: the count, the sizes,
+/// the recorded tags and the destination names. No original is deleted before every copy has
+/// succeeded.
 #[allow(clippy::too_many_arguments)]
 async fn relocate(
     s3: &S3,

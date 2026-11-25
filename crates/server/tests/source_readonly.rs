@@ -37,8 +37,8 @@ use common::fake_share::FakeShare;
 use common::{FileClient, TestServer, TestUser, spawn_server_config, start_fake_github};
 use protocol::{FileServerMsg, SeatState};
 use records::{
-    NewSource, NodeKind, Principal, S3_ENDPOINTS, S3Place, SHARE_ROOTS, SealedRow, SourceKind,
-    SourceMode, Tri, Versioning, s3_location,
+    NewPendingWrite, NewSource, NodeKind, Principal, S3_ENDPOINTS, S3Place, SHARE_ROOTS, SealedRow,
+    SourceKind, SourceMode, Tri, Versioning, s3_location,
 };
 use reqwest::header::CONTENT_RANGE;
 use reqwest::{Method, StatusCode};
@@ -814,8 +814,9 @@ const ROWS: &[Row] = &[
         403,
         READ_ONLY,
     ),
-    // Through the bucket like a file's rename, but the uploads and the save above are still
-    // waiting to be written below it.
+    // Through the bucket like a file's rename, but a save below it waits to be written: the
+    // test seeds a failed one of read-me.txt that waits a day, so the answer does not hang on
+    // how long the rows above take.
     row(
         Act::RenameFolder,
         "PATCH /api/nodes/{id}",
@@ -1750,6 +1751,39 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
         .set_source_mode(NodeId(fx.library.parse().unwrap()), SourceMode::ReadWrite)
         .await
         .unwrap();
+    // A save of read-me.txt (no row touches it) that failed and waits a day, so `docs` has a
+    // save waiting below it for the RenameFolder row whatever the worker has written by then.
+    {
+        let db = env.server.records_db();
+        let node = NodeId(fx.item("read-me.txt").parse().unwrap());
+        let item = db.source_item_of(node).await.unwrap().expect("tracked");
+        let blob = BlobRef::of(b"a save that waits");
+        let now = OffsetDateTime::now_utc();
+        db.pin_cached(&blob, now).await.unwrap();
+        db.stage_write(&NewPendingWrite {
+            node,
+            library: NodeId(fx.library.parse().unwrap()),
+            path: &item.repository_path,
+            blob,
+            base_tag: item.blob_sha.as_deref(),
+            seen_revision: None,
+            by: env.olive.id,
+            flush: false,
+            now,
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.fail_write(
+                node,
+                &blob.sha256,
+                "held for the RenameFolder row",
+                now + time::Duration::days(1),
+            )
+            .await
+            .unwrap()
+        );
+    }
     for (user, who) in [
         (&env.olive, "s3 read-write owner"),
         (&env.admin, "s3 read-write administrator"),

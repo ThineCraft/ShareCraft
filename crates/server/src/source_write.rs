@@ -155,7 +155,8 @@ pub enum WriteError {
     Gone,
     /// The store is full (never answered by S3 in slice 1).
     NoSpace,
-    /// The file is larger than one write sends.
+    /// The file is larger than a change to the library may be: 5 GiB, the server's largest
+    /// file or half the external-content cache, whichever is smallest.
     TooLarge,
     /// Anything else.
     Failed,
@@ -305,6 +306,9 @@ pub(crate) struct StageRequest<'a> {
     pub blob: BlobRef,
     /// The tag the file was last seen with; `None` for a new file.
     pub base_tag: Option<&'a str>,
+    /// The revision the change was made on, for an editor's save (see
+    /// [`NewPendingWrite::seen_revision`]).
+    pub seen_revision: Option<&'a str>,
     pub by: UserId,
     /// Write it at once rather than after the coalescing wait.
     pub flush: bool,
@@ -315,7 +319,7 @@ pub(crate) struct StageRequest<'a> {
 pub(crate) enum StageError {
     /// The library's writes are blocked.
     Blocked,
-    /// The content is larger than one write sends or the cache keeps.
+    /// The content is larger than a change to the library may be (see [`write_limit`]).
     TooLarge,
     /// The library no longer takes changes, or the records failed.
     Failed,
@@ -356,14 +360,16 @@ pub(crate) async fn stage(state: &AppState, s: &StageRequest<'_>) -> Result<Stri
             path: s.path,
             blob: s.blob,
             base_tag: s.base_tag,
+            seen_revision: s.seen_revision,
             by: s.by,
             flush: s.flush,
             now,
         })
         .await
         .map_err(|e| match e {
-            // Switched to read-only (or disconnected) since the guard looked.
-            AccessError::LibraryReadOnly => StageError::Failed,
+            // Switched to read-only (or disconnected) since the guard looked, or the file went
+            // to the recycle bin meanwhile.
+            AccessError::LibraryReadOnly | AccessError::NotFound => StageError::Failed,
             e => failed(&e),
         })?;
     state.blobs().claimed().notify_one();
@@ -435,6 +441,7 @@ pub(crate) async fn create_staged(
         path: &path,
         blob,
         base_tag: None,
+        seen_revision: None,
         by: user.id,
         flush: true,
     };
@@ -583,11 +590,18 @@ impl Now {
         })
     }
 
+    /// The revision as the records hold it.
+    fn revision_text(&self) -> Option<&str> {
+        match (&self.pending, &self.item) {
+            (Some(pending), _) => Some(&pending.revision),
+            (None, Some(item)) => Some(&item.revision),
+            (None, None) => None,
+        }
+    }
+
     fn revision(&self) -> Result<Option<RevisionId>, CheckpointError> {
-        let text = match (&self.pending, &self.item) {
-            (Some(pending), _) => &pending.revision,
-            (None, Some(item)) => &item.revision,
-            (None, None) => return Ok(None),
+        let Some(text) = self.revision_text() else {
+            return Ok(None);
         };
         RevisionId::from_str(text)
             .map(Some)
@@ -644,12 +658,16 @@ impl Checkpointer for ExternalCheckpointer {
                 return Err(failure("the library does not take changes"));
             }
             let base_tag = now.item.as_ref().map(|item| item.tag.clone());
+            // The path and tag read here may be moved on before the stage (a rename or move
+            // in the bucket): the stage takes them from the tracking row, and from its tag while
+            // the file is still at this revision.
             let request = StageRequest {
                 library,
                 node,
                 path: &path,
                 blob,
                 base_tag: base_tag.as_deref(),
+                seen_revision: now.revision_text(),
                 by,
                 flush: false,
             };
@@ -2058,6 +2076,11 @@ async fn move_back(state: &AppState, target: &S3Target, plan: &Restructure, move
 /// each moved file the tag its copy was answered with (never one computed here: the next
 /// listing must find the same), keeping its revision and the content already read. A row that
 /// cannot be recorded is left to the listing, which is woken.
+///
+/// Runs under the library's source lock, so no write of the library runs meanwhile. The
+/// pending writes below the item move with its tracking rows, and a write based on a file's old
+/// tag is based on its copy's: a save staged while the bucket step ran is written at the new
+/// place, on the moved object (see [`Db::move_source_items`] and [`Db::retag_source_item`]).
 async fn record_moved(state: &AppState, plan: &Restructure, moved: &Moved) {
     let db = state.db();
     if let Err(e) = db
@@ -2087,10 +2110,30 @@ async fn record_moved(state: &AppState, plan: &Restructure, moved: &Moved) {
         eprintln!("sharecraft-server: the shown paths of a moved item could not be recorded: {e}");
         state.sources().wake(plan.library);
     }
-    let before: HashMap<String, &SourceItem> = plan
-        .items
+    retag_copies(
+        state,
+        plan.library,
+        &plan.items,
+        |path| plan.rebased(path),
+        moved,
+    )
+    .await;
+}
+
+/// Gives each tracked file of `items` the tag its copy in `moved` was answered with, found at
+/// `at(its repository path)`, keeping its revision and content (and moving the base of a
+/// pending write along). A row that cannot be retagged is left to the listing, which is woken.
+async fn retag_copies(
+    state: &AppState,
+    library: NodeId,
+    items: &[SourceItem],
+    at: impl Fn(&str) -> String,
+    moved: &Moved,
+) {
+    let db = state.db();
+    let before: HashMap<String, &SourceItem> = items
         .iter()
-        .map(|item| (plan.rebased(&item.repository_path), item))
+        .map(|item| (at(&item.repository_path), item))
         .collect();
     for (path, seen) in &moved.seen {
         let Some(item) = before.get(path) else {
@@ -2106,10 +2149,10 @@ async fn record_moved(state: &AppState, plan: &Restructure, moved: &Moved) {
             .await
         {
             Ok(true) => {}
-            Ok(false) => state.sources().wake(plan.library),
+            Ok(false) => state.sources().wake(library),
             Err(e) => {
                 eprintln!("sharecraft-server: the tag of a moved file could not be recorded: {e}");
-                state.sources().wake(plan.library);
+                state.sources().wake(library);
             }
         }
     }
@@ -3030,21 +3073,30 @@ async fn delete_allowed(
 
 /// Deletes `node` inside its read-and-write S3 library, for `actor`: its objects are moved into
 /// the holding folder (`.sharecraft-bin/<today, UTC>/<node>/<its path>`, every object copied on
-/// the tag ShareCraft recorded, then every original deleted), then the node goes to the recycle
-/// bin as an entry of its own (id `node`), and a hold row names the root. The tracking rows
+/// the tag ShareCraft recorded, then every original deleted), a hold row names the root, then
+/// the node goes to the recycle bin as an entry of its own (id `node`). The tracking rows
 /// follow the objects into the holding folder, where no listing looks, so Restore knows where
 /// everything was and the bin shows the size.
 ///
 /// Judged as [`delete_allowed`], again under the library's source lock (`409 source_busy` after
-/// ten seconds), which is held until the rows are recorded. If the tree refuses after the bucket
-/// step, the objects are moved back (best effort) and the tree's error is answered. Originals
+/// ten seconds), which is held until the rows are recorded. The hold row is written before the
+/// tree is asked, so an entry in the bin always names its objects; if it cannot be written, or
+/// the tree refuses, the objects are moved back (best effort) and the hold forgotten. Originals
 /// that could not be deleted are counted in `left_behind` and come back as new files at the
 /// listing, which is woken. Records `source.held {node, objects, left_behind}`.
+///
+/// A file with a save not yet written cannot be deleted (`409 source_item_saving`), and saves
+/// take no lock, so one can be staged while the objects are being held. That save refuses the
+/// delete as one staged before it would: it is looked for after the hold (the objects are moved
+/// back) and again after the tree's delete, which from then on refuses every new save of the
+/// deleted items; one staged in between takes the delete back (the entry is restored and the
+/// objects moved back). Either way the save is written where the file still is.
 ///
 /// # Errors
 /// As [`delete_allowed`]; `409 source_too_many_objects {count}`, `409 source_too_large_to_move`,
 /// `409 source_changed` (a listing is woken), `409 source_write_blocked` (the store refused: the
-/// library is blocked) and `source_unavailable` from the bucket.
+/// library is blocked), `409 source_item_saving` (a save arrived meanwhile) and
+/// `source_unavailable` from the bucket.
 pub(crate) async fn delete_to_holding(
     state: &AppState,
     actor: &User,
@@ -3076,38 +3128,41 @@ pub(crate) async fn delete_to_holding(
         Ok(moved) => moved,
         Err(error) => return Err(refusal(state, plan.library, error).await),
     };
-    if let Err(e) = crate::api::nodes::delete_one(state, actor, node).await {
-        let back = unhold(
-            state.s3(),
-            &target,
-            &root,
-            &plan.from,
-            &plan.from,
-            plan.folder(),
-        )
-        .await;
-        match back {
-            Ok(back) if back.left_behind == 0 && moved.left_behind == 0 => {}
-            Ok(_) => state.sources().wake(plan.library),
-            Err(error) => {
-                eprintln!(
-                    "sharecraft-server: objects held for a refused delete could not be moved \
-                     back: {error:?}"
-                );
-                state.sources().wake(plan.library);
-            }
-        }
-        return Err(e);
-    }
-    record_moved(state, &plan, &moved).await;
     if let Err(e) = db
         .hold_record(node, plan.library, &root, moved.objects, now)
         .await
     {
-        // The entry stays in the bin without its objects named: the holding sweep deletes them
-        // once they are 94 days old.
+        // Without its hold row a bin entry could not be restored: no delete then.
         eprintln!("sharecraft-server: the hold of a deleted item could not be recorded: {e}");
+        put_back(state, &target, &root, &plan, &moved).await;
+        return Err(ApiError::unavailable(&e));
     }
+    let undo = Undo {
+        entry: node,
+        target: &target,
+        root: &root,
+        plan: &plan,
+        moved: &moved,
+    };
+    match saving_below(db, &plan).await {
+        Ok(false) => {}
+        Ok(true) => return Err(undo.run(state, ApiError::SourceItemSaving).await),
+        Err(e) => return Err(undo.run(state, e).await),
+    }
+    if let Err(e) = crate::api::nodes::delete_one(state, actor, node).await {
+        return Err(undo.run(state, e).await);
+    }
+    // A save staged after the look above and before the tree's delete took its node.
+    if !matches!(saving_below(db, &plan).await, Ok(false)) {
+        match tree::apply(state, actor, TreeOp::Restore { id: node }).await {
+            Ok(_) => return Err(undo.run(state, ApiError::SourceItemSaving).await),
+            Err(e) => eprintln!(
+                "sharecraft-server: a delete with a save staged meanwhile could not be taken \
+                 back ({e}); the save stays with the deleted item"
+            ),
+        }
+    }
+    record_moved(state, &plan, &moved).await;
     drop(lock);
     if moved.left_behind > 0 {
         state.sources().wake(plan.library);
@@ -3128,6 +3183,74 @@ pub(crate) async fn delete_to_holding(
         node,
         left_behind: moved.left_behind,
     })
+}
+
+/// A delete given up after its objects were held and its hold recorded.
+struct Undo<'a> {
+    entry: NodeId,
+    target: &'a S3Target,
+    root: &'a str,
+    plan: &'a Restructure,
+    moved: &'a Moved,
+}
+
+impl Undo<'_> {
+    /// Moves the held objects back and forgets the hold; answers `error`.
+    async fn run(&self, state: &AppState, error: ApiError) -> ApiError {
+        put_back(state, self.target, self.root, self.plan, self.moved).await;
+        if let Err(e) = state.db().forget_held(self.entry).await {
+            eprintln!(
+                "sharecraft-server: the hold of an item not deleted could not be forgotten: {e}"
+            );
+        }
+        error
+    }
+}
+
+/// Whether a save of the item `plan` deletes, or of anything inside it, waits to be written.
+async fn saving_below(db: &Db, plan: &Restructure) -> Result<bool, ApiError> {
+    Ok(db
+        .writes_below(plan.library, &plan.from)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        > 0)
+}
+
+/// Moves the objects a delete held back where they were, best effort, for a delete that does
+/// not go ahead; the tracking rows take the tags of the copies back (and a save staged
+/// meanwhile its base), so the next listing finds nothing new. What cannot be moved back stays
+/// held, and a listing is woken.
+async fn put_back(
+    state: &AppState,
+    target: &S3Target,
+    root: &str,
+    plan: &Restructure,
+    moved: &Moved,
+) {
+    let back = unhold(
+        state.s3(),
+        target,
+        root,
+        &plan.from,
+        &plan.from,
+        plan.folder(),
+    )
+    .await;
+    match back {
+        Ok(back) => {
+            retag_copies(state, plan.library, &plan.items, str::to_owned, &back).await;
+            if back.left_behind > 0 || moved.left_behind > 0 {
+                state.sources().wake(plan.library);
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "sharecraft-server: objects held for a refused delete could not be moved back: \
+                 {error:?}"
+            );
+            state.sources().wake(plan.library);
+        }
+    }
 }
 
 /// What a restore from the holding folder did.
@@ -3397,7 +3520,10 @@ const HELD_RETRY: time::Duration = time::Duration::hours(1);
 ///   `source.held_purged {node, objects}`, `true`;
 /// - a library read-only, blocked or disconnected by now: nothing is written, the hold is forgotten,
 ///   `source.held_left {node, objects}` (the objects stay), `true`;
-/// - the bucket offline or failing: the hold waits an hour (`retry_at`), `false`.
+/// - the bucket offline or failing, or the library's source lock busy for ten seconds: the hold
+///   waits an hour (`retry_at`), `false`.
+///
+/// The held objects are deleted under the library's source lock, as every holding step is.
 ///
 /// # Errors
 /// A database failure (`503`).
@@ -3435,12 +3561,29 @@ pub(crate) async fn release_held(
         );
         return Ok(true);
     }
+    // Under the library's source lock, as every other step of the holding folder: a busy
+    // library waits as an offline one does.
+    let lock = match lock_source(db, held.library).await {
+        Ok(lock) => lock,
+        Err(ApiError::SourceBusy) => {
+            db.defer_held(entry, now + HELD_RETRY)
+                .await
+                .map_err(unavailable)?;
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    // A restore may have taken the entry back while the lock was awaited.
+    let Some(held) = db.held(entry).await.map_err(unavailable)? else {
+        return Ok(true);
+    };
     let deleted = match state.s3().target(state, held.library).await {
         Ok(target) => delete_held(state.s3(), &target, &held.root)
             .await
             .map_err(|error| format!("{error:?}")),
         Err(error) => Err(format!("{error:?}")),
     };
+    drop(lock);
     match deleted {
         Ok(objects) => {
             db.forget_held(entry).await.map_err(unavailable)?;
