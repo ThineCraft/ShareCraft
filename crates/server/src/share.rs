@@ -616,6 +616,22 @@ impl StorageSource for ShareSource {
         drop(progress);
         let mut listed = listed.map_err(|error| listing_failed(error, &settings))?;
 
+        // A folder that shows nothing at all while the library holds items is far more often
+        // an unmounted mount point (an empty local folder) or a share that came back empty
+        // than a folder whose every file was deleted: nothing is removed on its word.
+        if listed.entries.is_empty()
+            && listed.unreadable.is_empty()
+            && listed.hidden.total() == 0
+            && !state
+                .db()
+                .source_items(config.library)
+                .await
+                .map_err(database_failed)?
+                .is_empty()
+        {
+            return Err(SyncError::Failed(EMPTY_LISTING.to_owned()));
+        }
+
         let mut protected = HashSet::new();
         if !listed.unreadable.is_empty() {
             let known = state
@@ -697,6 +713,9 @@ impl StorageSource for ShareSource {
         Ok(HashMap::new())
     }
 }
+
+/// The failure recorded when a listing finds nothing at all while the library holds items.
+pub const EMPTY_LISTING: &str = "The folder is empty or not mounted; nothing was removed.";
 
 fn not_approved() -> SyncError {
     SyncError::NotConnected(

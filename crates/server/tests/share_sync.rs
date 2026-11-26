@@ -801,6 +801,8 @@ async fn two_files_with_one_tag_are_not_mistaken_for_a_move() {
 async fn a_missing_file_stays_for_one_poll_then_goes_to_the_bin() {
     let env = Env::new().await;
     env.fake.put("gone.txt", b"gone");
+    // Not the only file: a listing that finds nothing at all removes nothing.
+    env.fake.put("stays.txt", b"stays");
     env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
     let node = env.item("gone.txt").await.node;
     env.fake.remove("gone.txt");
@@ -819,6 +821,8 @@ async fn a_missing_file_stays_for_one_poll_then_goes_to_the_bin() {
 async fn a_file_that_comes_back_within_the_grace_keeps_its_node() {
     let env = Env::new().await;
     env.fake.put_at("back.txt", b"back", 3);
+    // Not the only file: a listing that finds nothing at all removes nothing.
+    env.fake.put("stays.txt", b"stays");
     env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
     let node = env.item("back.txt").await.node;
     env.fake.remove("back.txt");
@@ -1388,4 +1392,79 @@ async fn measure_first_listing_of_2000_files() {
         took.as_secs_f64(),
         2_000.0 / took.as_secs_f64()
     );
+}
+
+#[tokio::test]
+async fn a_share_that_lists_empty_keeps_every_item_and_says_why() {
+    let env = Env::new().await;
+    env.fake.put("a.txt", b"a");
+    env.fake.put("docs/b.txt", b"b");
+    env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
+    let before = env
+        .server
+        .records_db()
+        .source_items(env.library)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 3);
+    // An unmounted mount point, or a share that came back empty: nothing at all is listed.
+    env.fake.remove("a.txt");
+    env.fake.remove("docs");
+
+    for later in [60, 120, 3_600] {
+        let answer = env
+            .sync_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(later))
+            .await;
+        assert_eq!(
+            answer,
+            Err(SyncError::Failed(server::share::EMPTY_LISTING.to_owned()))
+        );
+    }
+
+    let status = env.status().await;
+    assert_eq!(status.state, records::SourceState::Failed);
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("The folder is empty or not mounted; nothing was removed.")
+    );
+    let after = env
+        .server
+        .records_db()
+        .source_items(env.library)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 3);
+    for item in after {
+        assert!(
+            !env.in_bin(item.node).await,
+            "{} went to the bin",
+            item.path
+        );
+    }
+
+    // Mounted again: listed as before, nothing re-added.
+    env.fake.put("a.txt", b"a");
+    env.fake.put("docs/b.txt", b"b");
+    assert_eq!(
+        env.sync_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(7_200))
+            .await,
+        Ok(None)
+    );
+    assert_eq!(env.status().await.state, records::SourceState::Ok);
+}
+
+#[tokio::test]
+async fn a_share_that_was_empty_and_stays_empty_is_fine() {
+    let env = Env::new().await;
+
+    for later in [0, 60] {
+        let answer = env
+            .sync_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(later))
+            .await;
+        assert_eq!(answer, Ok(None));
+    }
+
+    let status = env.status().await;
+    assert_eq!(status.state, records::SourceState::Ok);
+    assert_eq!(status.last_error, None);
 }
