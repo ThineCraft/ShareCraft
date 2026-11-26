@@ -35,6 +35,7 @@ import {
   blockedText,
   overwriteNote,
   sourceName,
+  sourceSummary,
   sourceWriteErrorText,
   webhookInstructions,
   writeCountsText,
@@ -43,6 +44,8 @@ import {
 const $ = (id) => document.getElementById(id);
 const error = $('error');
 // The GitHub wording, kept so that showing an S3 library and then a GitHub one restores it exactly.
+const SHARE_DISCONNECT =
+  'Disconnect this file share? Its files leave this library and go to the recycle bin without their content. Nothing on the share is changed.';
 const githubIntro = $('source-intro').textContent;
 const githubDisconnect = $('disconnect-text').textContent;
 const githubDisconnectButton = $('source-disconnect').textContent;
@@ -361,20 +364,27 @@ function showSource() {
   $('source-section').hidden = source === null;
   if (source === null) return;
   const s3 = source.kind === 's3';
+  const share = source.kind === 'share';
   const writable = s3 && source.mode === 'read_write';
-  $('source-intro').textContent = s3
+  $('share-source').hidden = !share;
+  $('source-intro').textContent = share
+    ? 'This library shows the files in a file share. Files stay on the share and open from it when someone asks for them. In this release the library is read-only.'
+    : s3
     ? writable
       ? 'This library shows the files in an S3 bucket. You can add files and folders here, and they are saved to the bucket. Renaming, moving, copying and deleting are not available yet.'
       : 'This library shows the files in an S3 bucket. Its files cannot be changed in ShareCraft.'
     : githubIntro;
-  $('disconnect-text').textContent = s3
+  $('disconnect-text').textContent = share
+    ? SHARE_DISCONNECT
+    : s3
     ? 'Disconnecting stops updates from S3 storage. The files stay in this library. Nothing in the bucket is changed.'
     : githubDisconnect;
-  $('source-disconnect').textContent = s3 ? 'Disconnect' : githubDisconnectButton;
-  $('github-repo-line').hidden = s3;
-  $('source-settings').hidden = s3;
-  $('webhook-box').hidden = s3;
+  $('source-disconnect').textContent = s3 || share ? 'Disconnect' : githubDisconnectButton;
+  $('github-repo-line').hidden = s3 || share;
+  $('source-settings').hidden = s3 || share;
+  $('webhook-box').hidden = s3 || share;
   $('s3-source').hidden = !s3;
+  if (share) return showShareSource();
   if (s3) return showS3Source();
   $('source-repository').textContent = `github.com/${source.repository}`;
   $('source-branch').value = source.branch;
@@ -452,6 +462,82 @@ $('source-token-remove').addEventListener('click', async () => {
   source = result.data;
   showSource();
   showMessage($('source-saved'), 'Token removed. An update has started.');
+});
+
+/** When the share is next checked, in words; '' when the server gave no time. */
+function nextCheckText(iso) {
+  if (typeof iso !== 'string' || iso === '') return '';
+  const at = new Date(iso).getTime();
+  if (!Number.isFinite(at)) return '';
+  const seconds = Math.round((at - Date.now()) / 1000);
+  if (seconds <= 5) return 'Due now';
+  if (seconds < 60) return `In ${seconds} seconds`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `In ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
+  const hours = Math.round(minutes / 60);
+  return hours < 24 ? `In ${hours} ${hours === 1 ? 'hour' : 'hours'}` : `In ${Math.round(hours / 24)} days`;
+}
+
+/** The file-share facts, as the server answered them; the path is there for owners only. */
+function showShareSource() {
+  const hasPath = typeof source.path === 'string' && source.path !== '';
+  $('share-path-line').hidden = !hasPath;
+  $('share-path-text').textContent = hasPath ? source.path : '';
+  const files = Number(source.files);
+  const bytes = Number(source.bytes);
+  const hidden = Number(source.hidden);
+  const fileText = Number.isFinite(files) ? `${files.toLocaleString('en-GB')} ${files === 1 ? 'file' : 'files'}` : 'Not counted yet';
+  const sizeText = Number.isFinite(bytes) && bytes > 0 ? `, ${formatSize(bytes)}` : '';
+  const hiddenText = Number.isFinite(hidden) && hidden > 0 ? `; ${hidden.toLocaleString('en-GB')} not shown` : '';
+  $('share-counts').textContent = Number.isFinite(files) ? `${fileText}${sizeText}${hiddenText}` : fileText;
+  const summary = sourceSummary(source);
+  $('share-state').textContent = summary.headline;
+  $('share-next').textContent = ['connecting', 'syncing'].includes(source.state)
+    ? 'Being listed now'
+    : nextCheckText(source.next_check_at) || 'Not scheduled';
+  $('share-poll').value = String(source.poll_seconds);
+}
+
+/** Reads the share's answer again after a change, so the page shows what the server holds. */
+async function readShare() {
+  const answer = await api('GET', `/libraries/${seg(libraryId)}/source`);
+  if (answer.ok) {
+    source = answer.data;
+    showSource();
+  }
+  return answer;
+}
+
+$('share-settings').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (source === null || source.kind !== 'share') return;
+  showMessage($('share-error'), '');
+  showMessage($('share-saved'), '');
+  const pollSeconds = Number($('share-poll').value);
+  if (!Number.isInteger(pollSeconds) || pollSeconds < 60 || pollSeconds > 86_400) {
+    showMessage($('share-error'), 'Check every must be a whole number from 60 to 86,400 seconds.');
+    $('share-poll').focus();
+    return;
+  }
+  if (pollSeconds === source.poll_seconds) return showMessage($('share-saved'), 'Nothing has changed.');
+  const result = await api('PATCH', `/libraries/${seg(libraryId)}/source`, { poll_seconds: pollSeconds });
+  if (!result.ok) {
+    showMessage($('share-error'), result.error === 'invalid_request' ? 'Check every must be a whole number from 60 to 86,400 seconds.' : messageFor(result.error));
+    $('share-error').focus?.();
+    return;
+  }
+  await readShare();
+  showMessage($('share-saved'), 'Check interval saved.');
+});
+
+$('share-update').addEventListener('click', async () => {
+  if (source === null || source.kind !== 'share') return;
+  showMessage($('share-error'), '');
+  showMessage($('share-saved'), '');
+  const result = await api('POST', `/libraries/${seg(libraryId)}/source/sync`);
+  if (!result.ok) return showMessage($('share-error'), messageFor(result.error));
+  await readShare();
+  showMessage($('share-saved'), 'A check has started.');
 });
 
 /** The S3 storage facts, as the server answered them (the key's last four characters only). */
@@ -632,21 +718,30 @@ $('source-disconnect').addEventListener('click', async () => {
   if (source === null) return;
   showMessage($('disconnect-error'), '');
   const s3 = source.kind === 's3';
+  const share = source.kind === 'share';
   const sure = await confirmDialog(
-    s3
+    share
+      ? SHARE_DISCONNECT
+      : s3
       ? `Disconnect ${sourceName(source)}? Updates from S3 storage stop, but the files stay in this library. Nothing in the bucket is changed.`
       : `Disconnect github.com/${source.repository}? Updates from GitHub stop, but the files stay in this library.`,
-    s3 ? 'Disconnect storage' : 'Disconnect repository',
+    share ? 'Disconnect file share' : s3 ? 'Disconnect storage' : 'Disconnect repository',
   );
   if (!sure) return $('source-disconnect').focus();
   const result = await api('DELETE', `/libraries/${seg(libraryId)}/source`);
-  if (!result.ok) return showMessage($('disconnect-error'), messageFor(result.error));
+  if (!result.ok) {
+    showMessage($('disconnect-error'), messageFor(result.error));
+    $('disconnect-error').focus();
+    return;
+  }
   source = null;
   hideWebhookSecret();
   clearKeyForm();
   showSource();
   showMessage(
     $('saved'),
-    s3 ? 'Disconnected from S3 storage. The files stay in this library.' : 'Disconnected from GitHub. The files stay in this library.',
+    share
+      ? 'Disconnected from the file share. Its files went to the recycle bin without their content. Nothing on the share was changed.'
+      : s3 ? 'Disconnected from S3 storage. The files stay in this library.' : 'Disconnected from GitHub. The files stay in this library.',
   );
 });

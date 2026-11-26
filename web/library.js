@@ -75,6 +75,7 @@ import {
   mayResolve,
   discardQuestion,
   writeCountsText,
+  hiddenLines,
   sourceName,
   sourceStateText,
   sourceSummary,
@@ -278,7 +279,14 @@ if (location.hash === '#upload') {
 function showAccepts() {
   const hidden = Number(source?.hidden) > 0 ? Number(source.hidden) : 0;
   $('source-hidden').hidden = hidden === 0;
-  $('source-hidden-summary').textContent = hidden === 1 ? '1 file hidden by file rules' : `${hidden} files hidden by file rules`;
+  const share = source?.kind === 'share';
+  $('source-hidden-summary').textContent = share
+    ? hidden === 1 ? '1 file not shown' : `${hidden.toLocaleString('en-GB')} files not shown`
+    : hidden === 1 ? '1 file hidden by file rules' : `${hidden} files hidden by file rules`;
+  // A file share says what each kind of hidden item is, from the server's counts.
+  $('source-hidden-rules').hidden = share;
+  $('source-hidden-share').hidden = !share;
+  $('source-hidden-lines').replaceChildren(...(share ? hiddenLines(source.hidden_by).map((line) => h('li', {}, line)) : []));
   $('accepts-text').textContent = canAdd ? accepts.join(' ') : '';
   $('accepts').hidden = !(canAdd && accepts.length > 0) && hidden === 0;
 }
@@ -650,7 +658,7 @@ function setupPhotos() {
  * reason in words (never colour alone). The unavailable mark has an id the name links describe.
  */
 function markNodes(item) {
-  const unavailable = unavailableMarkFor(item);
+  const unavailable = unavailableMarkFor(item, source?.kind);
   return [
     ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark)),
     ...writeNodes(item),
@@ -736,7 +744,7 @@ function focusWriteButton(id, which) {
 
 /** The description of a name link: the unavailable mark's text, when there is one. */
 function describedBy(item) {
-  return unavailableMarkFor(item) === '' ? {} : { 'aria-describedby': `unavail-${item.id}` };
+  return unavailableMarkFor(item, source?.kind) === '' ? {} : { 'aria-describedby': `unavail-${item.id}` };
 }
 
 function tile(item) {

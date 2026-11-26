@@ -161,6 +161,43 @@
    <p id="s3-msg" role="alert" class="msg"></p>
   </form>
  </section>
+ <section id="shares" aria-labelledby="shares-heading" hidden>
+  <h2 id="shares-heading">File shares</h2>
+  <p class="note" id="shares-runs-as">ShareCraft reads these folders as the account the server runs under<span id="shares-runs-as-name"></span>.</p>
+  <p class="meta">ShareCraft's own permissions decide who sees a file; the share's permissions are not read. Approve only folders whose whole content may be shown to whoever a site manager chooses.</p>
+  <h3 id="shares-roots-heading">Approved folders</h3>
+  <ul id="shares-roots" class="list" aria-labelledby="shares-roots-heading"></ul>
+  <p id="shares-none" class="meta" hidden>No folder is approved yet. Libraries cannot connect to a file share until one is added.</p>
+  <form id="shares-add" class="stack" aria-labelledby="shares-add-heading">
+   <h3 id="shares-add-heading">Approve a folder</h3>
+   <div class="field">
+    <label for="shares-path">Folder</label>
+    <input type="text" id="shares-path" autocomplete="off" spellcheck="false" placeholder="\\server\share\folder" aria-describedby="shares-path-note shares-path-error">
+    <small id="shares-path-note" class="meta">A network path such as \\server\share\folder, or a folder on this server. Every folder inside it is approved with it.</small>
+    <small id="shares-path-error" role="alert" class="msg" tabindex="-1"></small>
+   </div>
+   <div><button type="submit">Approve folder</button></div>
+  </form>
+  <form id="shares-limits" class="stack" aria-labelledby="shares-limits-heading">
+   <h3 id="shares-limits-heading">Cache and listing limits</h3>
+   <p id="shares-cache-use" class="meta"></p>
+   <div class="field">
+    <label for="shares-cache">Cache size (MB, at least 256)</label>
+    <input type="text" id="shares-cache" inputmode="decimal" autocomplete="off" aria-describedby="shares-cache-note">
+    <small id="shares-cache-note" class="meta">Files opened from a share are kept here so the next person does not wait. The oldest are removed when it is full.</small>
+   </div>
+   <div class="field">
+    <label for="shares-list-seconds">Longest a listing may take (seconds, 30 to 3600)</label>
+    <input type="text" id="shares-list-seconds" inputmode="numeric" autocomplete="off">
+   </div>
+   <div class="field">
+    <label for="shares-max-files">Most files one library may show</label>
+    <input type="text" id="shares-max-files" inputmode="numeric" autocomplete="off">
+   </div>
+   <div><button type="submit">Save limits</button></div>
+  </form>
+  <p id="shares-msg" role="alert" class="msg" tabindex="-1"></p>
+ </section>
  <section id="global" aria-labelledby="global-heading" hidden>
   <h2 id="global-heading">Global navigation</h2>
   <p class="meta">The bar at the top of every page. A link to a place is shown only to people who can open it.</p>

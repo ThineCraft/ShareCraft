@@ -127,6 +127,25 @@
     <p id="s3-key-error" role="alert" class="msg"></p>
    </form>
   </section>
+  <section id="share-source" aria-label="File share" hidden>
+   <p id="share-path-line"><strong>Folder</strong><br><span id="share-path-text"></span></p>
+   <p><strong>Files</strong><br><span id="share-counts"></span></p>
+   <p><strong>State</strong><br><span id="share-state"></span></p>
+   <p><strong>Next check</strong><br><span id="share-next"></span></p>
+   <form id="share-settings" class="stack">
+    <div class="field">
+     <label for="share-poll">Check every (seconds)</label>
+     <input type="number" id="share-poll" min="60" max="86400" step="1" required aria-describedby="share-poll-note">
+     <small id="share-poll-note" class="meta">From 60 seconds to 86,400 seconds.</small>
+    </div>
+    <div class="row">
+     <button type="submit">Save check interval</button>
+     <button type="button" id="share-update" class="plain">Update now</button>
+    </div>
+    <p id="share-saved" role="status" class="msg ok"></p>
+    <p id="share-error" role="alert" class="msg" tabindex="-1"></p>
+   </form>
+  </section>
   <p id="github-repo-line"><strong>Repository</strong><br><span id="source-repository"></span></p>
   <form id="source-settings" class="stack">
    <div class="field">
@@ -174,7 +193,7 @@
    <h3 id="disconnect-heading">Disconnect</h3>
    <p id="disconnect-text">Disconnecting stops updates from GitHub. The files stay in this library.</p>
    <button type="button" id="source-disconnect" class="danger">Disconnect repository</button>
-   <p id="disconnect-error" role="alert" class="msg"></p>
+   <p id="disconnect-error" role="alert" class="msg" tabindex="-1"></p>
   </section>
  </section>
 </div>

@@ -44,7 +44,17 @@ import { downloadNote, liveLook, liveStatus, setupEditorFrame } from './editor-f
 import { connectLive, liveNotice, onlyEditor, pickBanner, shownBanner, trackUnsaved, warnOnLeave } from './live-host.js';
 import { createViewer } from './file-viewer.js';
 import { viewerList } from './viewer.js';
-import { discardQuestion, mayResolve, savingMark, sourceWriteErrorText } from './source-panel.js';
+import {
+  FETCHING_TEXT,
+  SHARE_RETRIES,
+  SHARE_RETRY_MS,
+  discardQuestion,
+  fetchingFromShare,
+  mayResolve,
+  openRefusedText,
+  savingMark,
+  sourceWriteErrorText,
+} from './source-panel.js';
 
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
@@ -324,46 +334,134 @@ async function openAsChosen() {
   return showNoPreview();
 }
 
-function showPreview(kind, gen) {
+function showPreview(kind, gen, again = false) {
   if (kind === 'text') return showTextPreview(gen);
   const url = previewUrl();
   // A preview the browser cannot show (or that the server refuses) says why, or offers the download.
   const failed = () => {
-    if (!stale(gen)) previewFailed(url, gen);
+    if (!stale(gen)) previewFailed(url, gen, kind, again);
   };
   if (kind === 'image') viewer.showImage({ url, name: doc.name, onError: failed });
   else viewer.showMedia(kind, { url, name: doc.name, onError: failed });
 }
 
-// Why a picture, sound or film did not show: the server is asked once (for one byte of it).
-async function previewFailed(url, gen) {
-  let code = 0;
-  try {
-    code = (await fetch(url, { credentials: 'same-origin', headers: { Range: 'bytes=0-0' } })).status;
-  } catch {
-    code = 0;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---- a file that is read from a file share when it is opened ----
+
+/** Says that the share is being read for this file; read out as a status, and nothing takes the focus. */
+function showFetching() {
+  statusPill.hidden = false;
+  frameBox.dataset.state = 'connecting';
+  chrome.setStatus({ tone: 'connecting', word: FETCHING_TEXT });
+  viewer.showMessage({ name: doc?.name ?? '', text: FETCHING_TEXT });
+}
+
+/** The file cannot be read from where it is kept: the server's sentence, in the viewer. */
+function showSourceRefused(text) {
+  statusPill.hidden = true;
+  frameBox.dataset.state = 'view';
+  viewer.showMessage({ name: doc?.name ?? '', text });
+}
+
+/** The share did not answer in the time asked for: say so, and offer another try. */
+function showShareRetry() {
+  statusPill.hidden = true;
+  frameBox.dataset.state = 'view';
+  const again = h('button', { type: 'button', class: 'plain' }, 'Try again');
+  again.addEventListener('click', () => {
+    if (removed) return;
+    viewGen += 1;
+    openAsChosen();
+  });
+  viewer.showMessage({
+    name: doc?.name ?? '',
+    node: h('div', {}, h('p', {}, 'The share did not answer in time, so this file is not open yet.'), again),
+  });
+}
+
+/**
+ * Asks `request()` (it answers `{status, data, ...}`) and, while the answer says the share is
+ * being read, again: at most SHARE_RETRIES more times, SHARE_RETRY_MS apart. Answers null when
+ * the page moved on meanwhile.
+ */
+async function untilReadable(gen, request, onWait) {
+  let result = await request();
+  let waited = false;
+  for (let tries = 0; tries < SHARE_RETRIES && readingShare(result.status, result.data); tries += 1) {
+    if (stale(gen)) return null;
+    if (tries === 0) onWait();
+    waited = true;
+    await sleep(SHARE_RETRY_MS);
+    if (stale(gen)) return null;
+    result = await request();
   }
-  if (stale(gen)) return;
-  if (code === 404) return showMissing();
-  if (code === 423) return recheck(gen);
-  return showNoPreview(code === 0 ? messageFor('network') : '');
+  return stale(gen) ? null : { ...result, waited };
+}
+
+/** Whether an answer says the share is being read for this file (only a file on a share can). */
+function readingShare(status, data) {
+  return Boolean(doc?.external) && fetchingFromShare(status, data);
+}
+
+/** What a refused open of an external file shows; false when the answer is not one of those. */
+function showShareFailure(status, data) {
+  const refused = openRefusedText(status, data);
+  if (refused) {
+    showSourceRefused(refused);
+    return true;
+  }
+  if (readingShare(status, data)) {
+    showShareRetry();
+    return true;
+  }
+  return false;
+}
+
+// Why a picture, sound or film did not show: the server is asked (for one byte of it), and asked
+// again while a share is still being read.
+async function previewFailed(url, gen, kind, again) {
+  const result = await untilReadable(gen, async () => {
+    try {
+      const response = await fetch(url, { credentials: 'same-origin', headers: { Range: 'bytes=0-0' } });
+      const data = response.ok ? null : await response.json().catch(() => null);
+      return { status: response.status, data };
+    } catch {
+      return { status: 0, data: null };
+    }
+  }, showFetching);
+  if (!result || stale(gen)) return;
+  const { status, data } = result;
+  // The share answered now: show the file again (once, so a file the browser cannot show ends here).
+  if (status >= 200 && status < 300 && result.waited && !again) return showPreview(kind, gen, true);
+  if (status === 404) return showMissing();
+  if (showShareFailure(status, data)) return;
+  if (status === 423) return recheck(gen);
+  return showNoPreview(status === 0 ? messageFor('network') : '');
 }
 
 // Text is fetched and put in as text: never as markup, whatever the file holds.
 async function showTextPreview(gen) {
-  let response;
-  try {
-    response = await fetch(previewUrl(), { credentials: 'same-origin' });
-  } catch {
-    if (!stale(gen)) showNoPreview(messageFor('network'));
-    return;
+  const result = await untilReadable(gen, async () => {
+    try {
+      const response = await fetch(previewUrl(), { credentials: 'same-origin' });
+      if (response.ok) return { status: response.status, response };
+      return { status: response.status, data: await response.json().catch(() => null) };
+    } catch {
+      return { status: 0, data: null };
+    }
+  }, showFetching);
+  if (!result || stale(gen)) return;
+  if (!result.response) {
+    if (result.status === 0) return showNoPreview(messageFor('network'));
+    if (result.status === 404) return showMissing();
+    if (showShareFailure(result.status, result.data)) return;
+    if (result.status === 423) return recheck(gen);
+    return showNoPreview(result.status === 415 ? '' : messageFor('unavailable'));
   }
-  if (stale(gen)) return;
-  if (!response.ok) {
-    if (response.status === 404) return showMissing();
-    if (response.status === 423) return recheck(gen);
-    return showNoPreview(response.status === 415 ? '' : messageFor('unavailable'));
-  }
+  const response = result.response;
   const blob = await response.blob();
   const text = await blob.text();
   if (stale(gen)) return;
@@ -867,10 +965,29 @@ function stopSaving(text) {
 async function loadEditor() {
   let bytes = null;
   if (knownRevision) {
-    const result = await fetchContent(knownRevision);
-    if (removed) return;
+    const gen = viewGen;
+    // A file on a share is read when it is first asked for: ask again while that is under way.
+    const result = await untilReadable(
+      gen,
+      () => fetchContent(knownRevision),
+      () => setNotice({ role: 'status', text: FETCHING_TEXT }),
+    );
+    if (removed || !result) return;
+    if (result.waited) {
+      notice = null;
+      render();
+    }
     if (!result.ok) {
       if (result.status === 404) checkStillAllowed();
+      if (readingShare(result.status, result.data)) {
+        setNotice({ text: 'The share did not answer in time, so this file is not open yet.', actions: ['reopen', 'reload'] });
+        return;
+      }
+      const refused = openRefusedText(result.status, result.data);
+      if (refused) {
+        setNotice({ text: refused, actions: ['reopen'] });
+        return;
+      }
       setNotice({ text: `The file could not be downloaded. ${messageFor(result.error)}`, actions: ['reload'] });
       return;
     }
@@ -892,7 +1009,7 @@ async function fetchContent(revision) {
     const data = await response.json().catch(() => null);
     const error = typeof data?.error === 'string' ? data.error : 'unknown';
     if (response.status === 401 && error === 'not_signed_in') goToSignIn();
-    return { ok: false, status: response.status, error };
+    return { ok: false, status: response.status, error, data };
   }
   try {
     return { ok: true, bytes: new Uint8Array(await response.arrayBuffer()) };
@@ -1317,6 +1434,12 @@ function actionControl(kind, shown) {
     retry: ['Try again', () => queue.retry()],
     mycopy: ['Download my copy', downloadMyCopy],
     reload: ['Reload', () => location.reload()],
+    reopen: ['Try again', () => {
+      if (removed) return;
+      notice = null;
+      render();
+      loadEditor();
+    }],
     reloadEditor: ['Reload editor', reloadLiveEditor],
     copy: ['Copy text', (event) => copyKeptText(shown, event.currentTarget)],
     activity: ['Open Activity', (event) => {

@@ -7,7 +7,7 @@ const LAST_UPDATE = `Files shown are from the last update. ${READ_ONLY}`;
 export function sourceAccess(result) {
   if (!result?.ok) return result?.status === 404 ? 'none' : 'unknown';
   const source = result.data;
-  if (source !== null && typeof source === 'object' && source.kind === 's3') {
+  if (source !== null && typeof source === 'object' && (source.kind === 's3' || source.kind === 'share')) {
     return typeof source.state === 'string' ? 'connected' : 'unknown';
   }
   return source !== null && typeof source === 'object' && typeof source.repository === 'string' &&
@@ -162,10 +162,53 @@ function s3Summary(source, now) {
   return { headline: sourceStateText(state), detail: lastUpdate, tone: 'attention' };
 }
 
+const SHARE_UNREACHABLE = 'The share could not be reached. Files already opened still open; others will not until it is back.';
+const SHARE_NOT_APPROVED = 'This folder is no longer approved, so its files cannot be opened.';
+
+/** The file-share headline, supporting sentence and tone; the share is read-only in this release. */
+function shareSummary(source, now) {
+  const state = source.state;
+  if (state === 'ok') {
+    const age = relativeTime(source.last_checked_at, now);
+    return {
+      headline: `Shows the files in ${sourceName(source)}.`,
+      detail: `${age ? `Checked ${age}. ` : ''}Files open from the share when you ask for them; this library cannot be changed here.`,
+      tone: 'ok',
+    };
+  }
+  if (state === 'connecting') {
+    return {
+      headline: sourceStateText(state),
+      detail: `Files will appear after the first listing. ${READ_ONLY}`,
+      tone: 'working',
+    };
+  }
+  if (state === 'syncing') {
+    const files = Number(source.listing_now?.files_so_far);
+    return {
+      headline: Number.isFinite(files) && files >= 0
+        ? `Listing the share… ${files.toLocaleString('en-GB')} files so far`
+        : 'Listing the share…',
+      detail: LAST_UPDATE,
+      tone: 'working',
+    };
+  }
+  if (state === 'not_connected') return { headline: SHARE_NOT_APPROVED, detail: LAST_UPDATE, tone: 'attention' };
+  if (state === 'failed') {
+    // The worker's own sentence says why a listing was refused (over its limits, not allowed to
+    // read the folder); an unreachable share has the fixed sentence.
+    const why = sentence(source.last_error);
+    const unreachable = why === '' || /^The share could not be reached/.test(why);
+    return { headline: unreachable ? SHARE_UNREACHABLE : why, detail: LAST_UPDATE, tone: 'attention' };
+  }
+  return { headline: SHARE_UNREACHABLE, detail: LAST_UPDATE, tone: 'attention' };
+}
+
 /** The headline, supporting sentence and non-colour tone for a connected-library banner. */
 export function sourceSummary(source, now = Date.now()) {
   const state = source?.state;
   if (source?.kind === 's3') return s3Summary(source, now);
+  if (source?.kind === 'share') return shareSummary(source, now);
   if (state === 'ok') {
     const age = relativeTime(source.last_synced_at, now);
     return {
@@ -209,6 +252,10 @@ export function validRepository(text) {
 
 /** The name of a connected source for its owners: `github.com/owner/repo`, or `bucket/folder` for S3. */
 export function sourceName(source) {
+  if (source?.kind === 'share') {
+    // The path is the server's to give (owners only); without one, never a guess.
+    return typeof source.path === 'string' && source.path !== '' ? source.path : 'a file share';
+  }
   if (source?.kind === 's3') {
     if (typeof source.bucket !== 'string' || source.bucket === '') return 'S3 storage';
     const folder = typeof source.prefix === 'string' ? source.prefix.replace(/\/+$/, '') : '';
@@ -224,15 +271,107 @@ const UNAVAILABLE_TEXT = {
   budget: 'Over the request budget',
 };
 
-/** The text mark for a file the listing reports as unavailable; never colour alone. */
-export function unavailableText(reason) {
-  return Object.hasOwn(UNAVAILABLE_TEXT, reason) ? UNAVAILABLE_TEXT[reason] : 'Unavailable';
+const SHARE_UNAVAILABLE_TEXT = {
+  gone: 'Not on the share',
+  denied: 'Access refused',
+  offline: 'Share not reachable',
+  changing: 'Changing, try again',
+  too_large: 'Too large to open',
+  not_approved: 'Folder not approved',
+};
+
+/**
+ * The text mark for a file the listing reports as unavailable; never colour alone. `kind` is the
+ * source's kind: `share` for a file share; anything else keeps the bucket wording.
+ */
+export function unavailableText(reason, kind) {
+  if (kind === 'share' && Object.hasOwn(SHARE_UNAVAILABLE_TEXT, reason)) return SHARE_UNAVAILABLE_TEXT[reason];
+  if (kind !== 'share' && Object.hasOwn(UNAVAILABLE_TEXT, reason)) return UNAVAILABLE_TEXT[reason];
+  if (kind === 'share' && (reason === 'archived' || reason === 'budget')) return UNAVAILABLE_TEXT[reason];
+  return 'Unavailable';
 }
 
 /** The text mark for a listed item the server reports as unavailable (`unavailable`), or ''. */
-export function unavailableMarkFor(item) {
+export function unavailableMarkFor(item, kind) {
   if (item?.unavailable === undefined || item?.unavailable === null || item.unavailable === '') return '';
-  return unavailableText(item.unavailable);
+  return unavailableText(item.unavailable, kind);
+}
+
+/** A first check of the folder path of a file share; the server decides. */
+export function validSharePath(text) {
+  const refuse = (reason) => ({ ok: false, reason });
+  if (typeof text !== 'string' || text.trim() === '') return refuse('Write the folder as a network path.');
+  const path = text.trim();
+  if (path.length > 1024) return refuse('Use at most 1,024 characters.');
+  if (/[\u0000-\u001f\u007f]/.test(path)) return refuse('Do not use control characters.');
+  if (/^[\\/]{2}[?.][\\/]/.test(path)) return refuse('Device paths cannot be used as file shares.');
+  let names;
+  if (/^[\\/]{2}/.test(path)) {
+    names = path.slice(2).split(/[\\/]/);
+    if (names.length < 2 || names[0] === '' || names[1] === '') {
+      return refuse('Write the server and the share, like \\\\server\\share\\folder.');
+    }
+  } else if (/^[A-Za-z]:[\\/]/.test(path)) {
+    names = path.slice(3).split(/[\\/]/);
+    if (names.every((name) => name === '')) return refuse('Choose a folder, not a whole drive.');
+  } else if (path.startsWith('/')) {
+    names = path.slice(1).split(/[\\/]/);
+  } else {
+    return refuse('Write the full path, starting with \\\\server\\share or a drive letter.');
+  }
+  // One trailing separator is fine; an empty name anywhere else is not.
+  if (names.length > 1 && names.at(-1) === '') names = names.slice(0, -1);
+  if (names.some((name) => name === '')) return refuse('Do not leave an empty folder name between separators.');
+  if (names.some((name) => name === '.' || name === '..')) return refuse('Do not use . or .. in the path.');
+  if (names.some((name) => /[<>"|?*:]/.test(name))) return refuse('A folder name cannot hold any of < > " | ? * :');
+  return { ok: true, reason: '' };
+}
+
+const HIDDEN_WORDS = [
+  ['links', 'link to another place, not followed', 'links to other places, not followed'],
+  ['submodules', 'submodule', 'submodules'],
+  ['system', 'hidden or system file', 'hidden or system files'],
+  ['offline', 'cloud-only file that is not on the share itself', 'cloud-only files that are not on the share itself'],
+  ['names', 'file with a name ShareCraft cannot use', 'files with names ShareCraft cannot use'],
+  ['types', 'file of a type this library does not take', 'files of types this library does not take'],
+  ['size', 'file that is too large', 'files that are too large'],
+  ['long', 'file with a path that is too long', 'files with paths that are too long'],
+  ['unreadable', 'folder the server may not read', 'folders the server may not read'],
+];
+
+/** One plain line for each kind of hidden item the server counted; kinds with a zero count are left out. */
+export function hiddenLines(hiddenBy) {
+  if (hiddenBy === null || typeof hiddenBy !== 'object') return [];
+  const lines = [];
+  for (const [key, one, many] of HIDDEN_WORDS) {
+    const count = Number(hiddenBy[key]);
+    if (Number.isFinite(count) && count > 0) lines.push(`${count.toLocaleString('en-GB')} ${count === 1 ? one : many}`);
+  }
+  return lines;
+}
+
+/** How many times a page asks again while the share is being read, and the wait between asks. */
+export const SHARE_RETRIES = 5;
+export const SHARE_RETRY_MS = 2000;
+export const FETCHING_TEXT = 'Fetching from the share…';
+
+/**
+ * Whether an answer to opening a file means "the share is being read: ask again": the server is
+ * busy (503 `busy`) or the content waits for the scanner after it was fetched (423 with
+ * `scan: pending`). A held or infected file is not this.
+ */
+export function fetchingFromShare(status, data) {
+  if (status === 503) return data?.error === 'busy';
+  return status === 423 && data?.scan === 'pending';
+}
+
+/** The words for a refused open of a file that lives outside ShareCraft, or '' for any other answer. */
+export function openRefusedText(status, data) {
+  if (status !== 409 || data === null || typeof data !== 'object') return '';
+  const message = typeof data.message === 'string' ? data.message.trim() : '';
+  if (data.error === 'source_unavailable') return message || `${unavailableText(data.reason, 'share')}.`;
+  if (data.error === 'source_copy_unavailable') return message;
+  return '';
 }
 
 /** A first check of an S3 bucket name; the server decides. */
