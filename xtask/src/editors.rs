@@ -357,7 +357,7 @@ struct ManifestData {
 fn manifest_json(data: &ManifestData) -> Result<String> {
     let live = data.live_format.as_ref().map(|format| {
         serde_json::json!({
-            "protocol": 1,
+            "protocol": protocol::live::LIVE_PROTOCOL,
             "format": format,
         })
     });
@@ -1465,7 +1465,7 @@ live_format = "gridcraft/1"
         let json =
             serde_json::from_str::<serde_json::Value>(&manifest_json(&fixed_manifest()).unwrap())
                 .unwrap();
-        assert_eq!(json["live"]["protocol"], 1);
+        assert_eq!(json["live"]["protocol"], protocol::live::LIVE_PROTOCOL);
         assert_eq!(json["live"]["format"], "gridcraft/1");
     }
 
