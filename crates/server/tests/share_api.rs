@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use collab_core::ids::NodeId;
-use common::fake_share::{FakeShare, native};
+use common::fake_share::{FakeShare, IDENTITY_FAILURE, native};
 use common::{TestServer, TestUser, spawn_server_config_without_workers};
 use records::{Principal, SHARE_LIST_SECONDS, SHARE_ROOTS, SourceKind, SourceState};
 use reqwest::{Method, StatusCode};
@@ -1376,4 +1376,32 @@ async fn folders_without_identity_fall_back_to_path_checks() {
 
     assert_eq!(status, StatusCode::CONFLICT, "{answer}");
     assert_eq!(answer["error"], "share_location_in_use");
+}
+
+#[tokio::test]
+async fn a_failed_identity_lookup_falls_back_to_path_checks_without_leaking_its_text() {
+    let env = Env::new().await;
+    env.fake.mkdir("Projects/Plans");
+    env.fake.mkdir("Mirror");
+    env.fake.alias(&["Projects", "Mirror"]);
+    env.fake.fail_identity("Mirror");
+    env.fake.fail_identity("Projects/Plans");
+    let (status, answer) = connect_at(&env, "First", r"C:\approved\Projects").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    // The alias cannot be told: the paths do not overlap, so it is connected.
+    let (status, answer) = connect_at(&env, "Second", r"C:\approved\Mirror").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    assert!(!answer.to_string().contains("injected"), "{answer}");
+
+    // The path check still refuses a folder inside a connected one, in our words only.
+    let (status, answer) = connect_at(&env, "Third", r"C:\approved\Projects\Plans").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+    let text = answer.to_string();
+    assert!(
+        !text.contains("injected") && !text.contains("fileserver"),
+        "{answer}"
+    );
+    assert!(!text.contains(IDENTITY_FAILURE), "{answer}");
 }

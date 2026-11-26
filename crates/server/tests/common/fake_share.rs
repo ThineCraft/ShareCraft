@@ -45,6 +45,7 @@ struct Inner {
     stat_delayed: AtomicUsize,
     opened_paths: Mutex<Vec<PathBuf>>,
     identities: Mutex<HashMap<PathBuf, FileIdentity>>,
+    failing_identities: Mutex<HashSet<PathBuf>>,
     next_inode: AtomicU64,
 }
 
@@ -97,6 +98,7 @@ impl FakeShare {
                 stat_delayed: AtomicUsize::new(0),
                 opened_paths: Mutex::new(Vec::new()),
                 identities: Mutex::new(HashMap::new()),
+                failing_identities: Mutex::new(HashSet::new()),
                 next_inode: AtomicU64::new(1),
             }),
         }
@@ -206,6 +208,17 @@ impl FakeShare {
         for path in paths {
             identities.insert(self.path(path), identity);
         }
+    }
+
+    /// Makes every identity lookup of `path` fail with operating-system text that must never
+    /// reach an answer, while its canonical lookup still works.
+    #[allow(dead_code)]
+    pub fn fail_identity(&self, path: &str) {
+        self.inner
+            .failing_identities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(self.path(path));
     }
 
     pub fn deny(&self, path: &str) {
@@ -520,6 +533,10 @@ impl Drop for ActiveList<'_> {
     }
 }
 
+/// The operating-system text of an injected identity failure.
+#[allow(dead_code)]
+pub const IDENTITY_FAILURE: &str = "injected identity failure at \\\\fileserver\\secret";
+
 fn path_refused() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "path refused")
 }
@@ -766,6 +783,15 @@ impl ShareFs for FakeShare {
 
     fn identity(&self, approved_root: &Path, path: &Path) -> io::Result<Option<FileIdentity>> {
         self.unavailable(path)?;
+        if self
+            .inner
+            .failing_identities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(path)
+        {
+            return Err(io::Error::other(IDENTITY_FAILURE));
+        }
         let canonical = self.contained(approved_root, path)?;
         let identities = self
             .inner

@@ -1062,11 +1062,13 @@ async fn start_worker_sync(state: &AppState, library: NodeId, now: OffsetDateTim
 /// the count over. Whether it is to be tried again soon: it was busy (`Ok(None)` while
 /// another sync of it ran), or changed meanwhile (due again at once).
 async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> bool {
+    let waiting = std::time::Instant::now();
     let Ok(_turn) = Arc::clone(&state.sources().turns).acquire_owned().await else {
         return false;
     };
     let outcome = match start_worker_sync(state, library, now).await {
         WorkerStart::Started(started) => {
+            let queued = waiting.elapsed();
             let StartedSync {
                 source_lock,
                 config,
@@ -1082,7 +1084,7 @@ async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> boo
                 }
                 SourceKind::S3 => run(&S3Source, state, &config, &status, now, generation).await,
             };
-            let finished = finish(state, &config, status, now, outcome, generation).await;
+            let finished = finish(state, &config, status, now, queued, outcome, generation).await;
             drop(source_lock);
             finished
         }
@@ -1209,7 +1211,16 @@ pub async fn sync_once(
         SourceKind::Share => run(&ShareSource, state, &config, &status, now, generation).await,
         SourceKind::S3 => run(&S3Source, state, &config, &status, now, generation).await,
     };
-    finish(state, &config, status, now, outcome, generation).await
+    finish(
+        state,
+        &config,
+        status,
+        now,
+        std::time::Duration::ZERO,
+        outcome,
+        generation,
+    )
+    .await
 }
 
 /// What a sync that did not fail found.
@@ -1235,11 +1246,13 @@ enum Outcome {
 /// status is written only if the connection is still at `generation`: a change made meanwhile
 /// (another branch or folder, a token, "Sync now") must not be undone by this sync's bookmark.
 /// Then the connection is only made due again at once, marked half applied when it is.
+/// `queued` is how long the sync waited after `now` before it started listing.
 async fn finish(
     state: &AppState,
     config: &SourceConfig,
     before: SourceStatus,
     now: OffsetDateTime,
+    queued: std::time::Duration,
     outcome: Result<Outcome, Failure>,
     generation: i64,
 ) -> Result<Option<SyncReport>, SyncError> {
@@ -1258,7 +1271,16 @@ async fn finish(
     let next_check = |changed: bool, took: std::time::Duration| {
         share.then(|| {
             let quiet = sources.quiet_after(library, changed);
-            next_share_check(now, config.poll_seconds, quiet, took)
+            // Counted from when the listing finished, not from `now`: a sync that waited for a
+            // turn must not find its next check already past. Whole seconds, so a quick listing
+            // keeps the times a tick was given.
+            let listed = time::Duration::try_from(std::time::Duration::from_secs(
+                queued.saturating_add(took).as_secs(),
+            ))
+            .ok()
+            .and_then(|elapsed| now.checked_add(elapsed))
+            .unwrap_or(now);
+            next_share_check(listed, config.poll_seconds, quiet, took)
         })
     };
     let answer = match outcome {

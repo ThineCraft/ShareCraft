@@ -395,13 +395,38 @@ async fn a_slow_listing_spaces_out_the_next_one() {
         .shares()
         .set_listing_took_for_tests(Duration::from_secs(600));
 
+    // Four times the listing, counted from when the listing finished.
     assert!(env.listed_at(t0()).await);
-    let next = t0() + secs(2_400);
+    let next = t0() + secs(600 + 2_400);
     assert_eq!(env.status().await.next_check_at, Some(next));
     assert!(!env.listed_at(next - secs(1)).await);
     assert!(env.listed_at(next).await);
     // Quiet now, and still four times the listing at least, even past the hour.
-    assert_eq!(env.status().await.next_check_at, Some(next + secs(2_400)));
+    assert_eq!(
+        env.status().await.next_check_at,
+        Some(next + secs(600 + 2_400))
+    );
+}
+
+#[tokio::test]
+async fn a_sync_that_waited_for_a_turn_counts_its_next_check_from_when_it_listed() {
+    let env = Env::new().await;
+    env.fake.put("a.txt", b"a");
+    // The sync takes its turn and is held before it starts listing.
+    let held = env.state.sources().hold_starts().await;
+    let state = env.state.clone();
+    let tick = tokio::spawn(async move { server::source_tick_once(&state, t0()).await });
+    tokio::time::timeout(TIMEOUT, env.state.sources().wait_start_held())
+        .await
+        .expect("the sync never reached its start");
+    // A measured wait: the sync now starts listing at least a whole second after `t0`.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    drop(held);
+    assert_eq!(tick.await.unwrap(), 1);
+
+    let next = env.status().await.next_check_at.unwrap();
+    assert!(next >= t0() + secs(61), "{next} is counted from the tick");
+    assert!(next <= t0() + secs(60) + TIMEOUT, "{next}");
 }
 
 #[tokio::test]

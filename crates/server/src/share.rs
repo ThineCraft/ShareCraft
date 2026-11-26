@@ -179,6 +179,11 @@ impl ShareFs for OsFs {
     }
 
     fn identity(&self, approved_root: &Path, path: &Path) -> io::Result<Option<FileIdentity>> {
+        // Where there is no identity to read, nothing touches the share: each lookup here runs
+        // inside a connect's timed canonical lookup.
+        if cfg!(not(unix)) {
+            return Ok(None);
+        }
         let canonical = canonical_within(approved_root, path)?;
         os_identity(&canonical)
     }
