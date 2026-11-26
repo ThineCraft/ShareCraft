@@ -2730,3 +2730,60 @@ async fn behind_mark_follows_the_stored_checkpoints() {
         mark(true, 3, 2)
     );
 }
+
+/// Checkpoints recorded before 0028 get the stamp of the entry at their position, which then
+/// outlives the entry; one at position 0 has none.
+#[tokio::test]
+async fn migration_0028_keeps_the_entry_stamp_on_existing_checkpoints() {
+    // 0027 is the migration before 0028.
+    let test = TestDb::create_at(Some(27)).await;
+    let ann = user(&test, "Ann", false).await.id;
+    let doc = tree(&test, ann).await.doc;
+    let session = Uuid::new_v4();
+    test.db
+        .start_live_session(doc, session, FORMAT, at(0))
+        .await
+        .unwrap();
+    let one = client();
+    test.db
+        .add_live_participant(doc, session, one, ann, at(0))
+        .await
+        .unwrap();
+    for seq in 1..=2 {
+        test.db
+            .append_live_change(doc, &change(seq, session, one, ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+    }
+    // Written with the columns before 0028.
+    let mut conn = sqlx::PgConnection::connect(&test.url()).await.unwrap();
+    for (revision, through) in [("r-two", 2_i64), ("r-zero", 0)] {
+        sqlx::query(
+            "insert into live_checkpoints \
+                 (document_id, revision, through, sha256, session_id, session_data, created_at) \
+             values ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(doc.0)
+        .bind(revision)
+        .bind(through)
+        .bind([7_u8; 32].as_slice())
+        .bind(session)
+        .bind(b"identities".as_slice())
+        .bind(at(3))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    test.db.migrate().await.unwrap();
+    sqlx::query("delete from live_entries where document_id = $1")
+        .bind(doc.0)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        test.db.live_base_stamp(doc, Seq(2)).await.unwrap(),
+        Some((at(2), u32::MAX - 2))
+    );
+    assert_eq!(test.db.live_base_stamp(doc, Seq(0)).await.unwrap(), None);
+}

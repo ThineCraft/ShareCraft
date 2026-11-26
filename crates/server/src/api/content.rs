@@ -450,9 +450,11 @@ pub(crate) async fn live_base(
             );
             // The checkpoint loads under the stamp of the entry at its position, as the editors
             // that applied that entry calculated under it; the page needs both headers.
-            // A purged entry leaves the headers out: the page then cannot load this base.
+            // The checkpoint keeps its own copy, so the 30-day sweep of the entry leaves the
+            // headers in; only a checkpoint recorded without one leaves them out, and the page
+            // then cannot load this base.
             let stamp = db
-                .live_entry_stamp(doc, at)
+                .live_base_stamp(doc, at)
                 .await
                 .map_err(|e| ApiError::unavailable(&e))?
                 .map(|(stamped, seed)| (stamped.unix_timestamp_nanos() / 1_000_000, seed));
