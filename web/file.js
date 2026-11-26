@@ -363,7 +363,10 @@ function showFetching() {
 function showSourceRefused(text) {
   statusPill.hidden = true;
   frameBox.dataset.state = 'view';
-  viewer.showMessage({ name: doc?.name ?? '', text });
+  const box = viewer.showMessage({ name: doc?.name ?? '', text });
+  // Said out loud: the message takes the focus (it has no live region of its own).
+  box.tabIndex = -1;
+  box.focus();
 }
 
 /** The share did not answer in the time asked for: say so, and offer another try. */
@@ -380,6 +383,13 @@ function showShareRetry() {
     name: doc?.name ?? '',
     node: h('div', {}, h('p', {}, 'The share did not answer in time, so this file is not open yet.'), again),
   });
+  again.focus();
+}
+
+/** The file opened after waiting for the share: the fetching status goes and the frame is ready. */
+function doneFetching() {
+  statusPill.hidden = true;
+  frameBox.dataset.state = 'view';
 }
 
 /**
@@ -435,7 +445,10 @@ async function previewFailed(url, gen, kind, again) {
   if (!result || stale(gen)) return;
   const { status, data } = result;
   // The share answered now: show the file again (once, so a file the browser cannot show ends here).
-  if (status >= 200 && status < 300 && result.waited && !again) return showPreview(kind, gen, true);
+  if (status >= 200 && status < 300 && result.waited && !again) {
+    doneFetching();
+    return showPreview(kind, gen, true);
+  }
   if (status === 404) return showMissing();
   if (showShareFailure(status, data)) return;
   if (status === 423) return recheck(gen);
@@ -461,6 +474,7 @@ async function showTextPreview(gen) {
     if (result.status === 423) return recheck(gen);
     return showNoPreview(result.status === 415 ? '' : messageFor('unavailable'));
   }
+  if (result.waited) doneFetching();
   const response = result.response;
   const blob = await response.blob();
   const text = await blob.text();

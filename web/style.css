@@ -2068,3 +2068,4 @@ html:has(dialog.photo-viewer[open]){overflow:hidden}
  .photo-viewer{background:Canvas;color:CanvasText}
  .photo.selected::after{box-shadow:none;outline:3px solid Highlight;outline-offset:-3px}
 }
+dialog p,.msg{overflow-wrap:anywhere}
