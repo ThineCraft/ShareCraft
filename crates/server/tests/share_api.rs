@@ -1307,3 +1307,73 @@ async fn lookups_against_a_hanging_share_are_bounded_across_connects() {
         server::share::SHARE_LOOKUPS
     );
 }
+
+/// Connects `path` (written in Windows form, see [`native`]) as a library named `name`.
+async fn connect_at(env: &Env, name: &str, path: &str) -> (StatusCode, Value) {
+    env.connect(json!({"name": name, "path": native(path)}))
+        .await
+}
+
+#[tokio::test]
+async fn a_case_different_alias_of_a_connected_folder_is_refused() {
+    let env = Env::new().await;
+    env.fake.mkdir("Projects");
+    env.fake.mkdir("projects");
+    env.fake.alias(&["Projects", "projects"]);
+    let (status, answer) = connect_at(&env, "First", r"C:\approved\Projects").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    let (status, answer) = connect_at(&env, "Second", r"C:\approved\projects").await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+}
+
+#[tokio::test]
+async fn a_folder_inside_an_alias_of_a_connected_folder_is_refused() {
+    let env = Env::new().await;
+    env.fake.mkdir("Projects");
+    env.fake.mkdir("Mirror/Plans");
+    env.fake.alias(&["Projects", "Mirror"]);
+    let (status, answer) = connect_at(&env, "First", r"C:\approved\Projects").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    let (status, answer) = connect_at(&env, "Second", r"C:\approved\Mirror\Plans").await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+    assert!(!answer.to_string().contains("Projects"));
+}
+
+#[tokio::test]
+async fn a_folder_around_an_alias_of_a_connected_folder_is_refused() {
+    let env = Env::new().await;
+    env.fake.mkdir("Projects/Plans");
+    env.fake.mkdir("Mirror");
+    env.fake.alias(&["Projects", "Mirror"]);
+    let (status, answer) = connect_at(&env, "First", r"C:\approved\Projects\Plans").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    let (status, answer) = connect_at(&env, "Second", r"C:\approved\Mirror").await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+}
+
+#[tokio::test]
+async fn folders_without_identity_fall_back_to_path_checks() {
+    let env = Env::new().await;
+    env.fake.mkdir("Projects/Plans");
+    env.fake.mkdir("Mirror");
+    // No identities: two names for one folder cannot be told from two folders, so only the
+    // paths are compared.
+    let (status, answer) = connect_at(&env, "First", r"C:\approved\Projects").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let (status, answer) = connect_at(&env, "Second", r"C:\approved\Mirror").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    let (status, answer) = connect_at(&env, "Third", r"C:\approved\Projects\Plans").await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+}

@@ -38,7 +38,7 @@ use crate::s3::{S3Error, S3Target};
 use crate::s3_sign::Credentials;
 use crate::s3_write;
 use crate::secrets::Secret;
-use crate::share::{FsBudget, canonical_share_path};
+use crate::share::{FileIdentity, FsBudget, canonical_share_path};
 use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
 use crate::source_write::{self, Probe};
 use crate::tree::{self, TreeOp};
@@ -529,16 +529,40 @@ enum Lookup {
     Failed(ApiError),
 }
 
+/// Where a connected or new share folder really is.
+#[derive(Clone)]
+struct Resolved {
+    /// Its canonical location.
+    canonical: SharePath,
+    /// Its own file-system identity, when the platform gives one.
+    own: Option<FileIdentity>,
+    /// The identities of the folder and of each folder above it up to its approved root, those
+    /// the platform gives: a folder whose identity is here is the folder or one around it.
+    chain: Vec<FileIdentity>,
+}
+
+impl Resolved {
+    /// Whether, by file-system identity, one of `self` and `other` is the other or inside it,
+    /// whatever names reach them (a case-insensitive mount, another alias of one folder).
+    /// `false` when either identity is unknown: the path comparisons then decide alone.
+    fn aliases(&self, other: &Resolved) -> bool {
+        self.own.is_some_and(|own| other.chain.contains(&own))
+            || other.own.is_some_and(|own| self.chain.contains(&own))
+    }
+}
+
 /// The canonical location of `path` within `root`, through the contained [`crate::share::ShareFs`] seam,
-/// waiting no later than `deadline`. The blocking call holds one of the server's lookup permits
-/// until it returns, even after this caller stops waiting for it. A failure never carries the
-/// canonical path into an answer or a log.
+/// waiting no later than `deadline`, with the file-system identities of the folder and the
+/// folders above it within `root` (an identity that cannot be read is left out). The blocking
+/// call holds one of the server's lookup permits until it returns, even after this caller stops
+/// waiting for it. A failure never carries the canonical path or operating-system text into an
+/// answer or a log.
 async fn resolve_canonical(
     state: &AppState,
     root: &SharePath,
     path: &SharePath,
     deadline: tokio::time::Instant,
-) -> Result<SharePath, Lookup> {
+) -> Result<Resolved, Lookup> {
     let permit = tokio::time::timeout_at(deadline, state.shares().lookups().acquire_owned())
         .await
         .map_err(|_| Lookup::Busy)?
@@ -546,20 +570,46 @@ async fn resolve_canonical(
     let fs = state.shares().fs();
     let root = root.to_path_buf();
     let candidate = path.to_path_buf();
-    let resolved = tokio::time::timeout_at(
+    let (resolved, own, chain) = tokio::time::timeout_at(
         deadline,
         tokio::task::spawn_blocking(move || {
             let resolved = fs.canonical(&root, &candidate);
+            let mut own = None;
+            let mut chain = Vec::new();
+            if resolved.is_ok() {
+                // The folder, then each folder above it, as far as the approved root.
+                let depth = candidate
+                    .components()
+                    .count()
+                    .saturating_sub(root.components().count());
+                for (step, folder) in candidate
+                    .ancestors()
+                    .take(depth.saturating_add(1))
+                    .enumerate()
+                {
+                    if let Ok(Some(identity)) = fs.identity(&root, folder) {
+                        if step == 0 {
+                            own = Some(identity);
+                        }
+                        chain.push(identity);
+                    }
+                }
+            }
             drop(permit);
-            resolved
+            resolved.map(|resolved| (resolved, own, chain))
         }),
     )
     .await
     .map_err(|_| Lookup::Failed(ApiError::ShareUnreachable("offline")))?
     .map_err(|_| Lookup::Failed(ApiError::ShareUnreachable("offline")))?
     .map_err(|error| Lookup::Failed(share_probe_error(&error)))?;
-    canonical_share_path(&resolved)
-        .map_err(|_| Lookup::Failed(ApiError::ShareUnreachable("offline")))
+    let canonical = canonical_share_path(&resolved)
+        .map_err(|_| Lookup::Failed(ApiError::ShareUnreachable("offline")))?;
+    Ok(Resolved {
+        canonical,
+        own,
+        chain,
+    })
 }
 
 /// Makes a new read-only library backed by an administrator-approved file-share folder.
@@ -657,8 +707,8 @@ pub(crate) async fn connect_share(
     // deadline), and the comparison is repeated; after a few rounds of that the answer is a
     // retryable `503`. So is a root change that moves the folder under a different approved root
     // meanwhile: its own location is then resolved again within the new root.
-    let mut resolved: HashMap<String, Option<SharePath>> = HashMap::new();
-    let mut own_canonical: Option<SharePath> = None;
+    let mut resolved: HashMap<String, Option<Resolved>> = HashMap::new();
+    let mut own_canonical: Option<Resolved> = None;
     let mut held = None;
     for _ in 0..SHARE_RESOLVE_ROUNDS {
         let deadline = tokio::time::Instant::now() + max_time;
@@ -710,9 +760,10 @@ pub(crate) async fn connect_share(
         for (location, canonical) in newly {
             resolved.insert(location, canonical?);
         }
-        let Some(canonical_path) = own_canonical.clone() else {
+        let Some(own) = own_canonical.clone() else {
             return Err(ApiError::ShareUnreachable("offline"));
         };
+        let canonical_path = &own.canonical;
 
         // The wait for the turn is bounded; a timeout is a retryable `503`. The turn is then
         // held through the source insert, so a concurrent root change or connect linearises
@@ -749,7 +800,9 @@ pub(crate) async fn connect_share(
             let lexical_conflict = path.is_within(&lexical) || lexical.is_within(&path);
             let conflict = match resolved.get(&location) {
                 Some(Some(existing)) => {
-                    canonical_path.is_within(existing) || existing.is_within(&canonical_path)
+                    canonical_path.is_within(&existing.canonical)
+                        || existing.canonical.is_within(canonical_path)
+                        || own.aliases(existing)
                 }
                 Some(None) => lexical_conflict,
                 None => {

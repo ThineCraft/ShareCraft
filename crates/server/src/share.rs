@@ -75,6 +75,20 @@ pub trait ShareFs: Send + Sync + 'static {
     fn open(&self, approved_root: &Path, path: &Path) -> io::Result<Box<dyn Read + Send>>;
     /// Resolves links and refuses a result outside `approved_root`.
     fn canonical(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf>;
+    /// The file-system identity of a contained `path` (read only), so two names for one folder
+    /// can be told apart from two folders: a case-insensitive CIFS mount on Linux gives
+    /// `/mnt/s/Projects` and `/mnt/s/projects` different canonical paths. `None` where the
+    /// platform offers no stable identity; callers then rely on path comparisons alone.
+    fn identity(&self, _approved_root: &Path, _path: &Path) -> io::Result<Option<FileIdentity>> {
+        Ok(None)
+    }
+}
+
+/// What identifies a file or folder on its file system, whatever name reaches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
 }
 
 /// A deadline and shared entry allowance used by all folder reads in one listing.
@@ -163,6 +177,29 @@ impl ShareFs for OsFs {
     fn canonical(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
         canonical_within(approved_root, path)
     }
+
+    fn identity(&self, approved_root: &Path, path: &Path) -> io::Result<Option<FileIdentity>> {
+        let canonical = canonical_within(approved_root, path)?;
+        os_identity(&canonical)
+    }
+}
+
+/// On Unix the device and inode numbers.
+#[cfg(unix)]
+fn os_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path)?;
+    Ok(Some(FileIdentity {
+        device: meta.dev(),
+        inode: meta.ino(),
+    }))
+}
+
+/// Elsewhere none: Windows canonical paths already come back in on-disk case, and its file
+/// index is not stable on every file system (and reading it needs unsafe code).
+#[cfg(not(unix))]
+fn os_identity(_path: &Path) -> io::Result<Option<FileIdentity>> {
+    Ok(None)
 }
 
 fn canonical_within(approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
