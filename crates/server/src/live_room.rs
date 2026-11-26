@@ -821,10 +821,19 @@ impl<S: LiveStore> LiveRoom<S> {
         loaded: LiveLoaded,
         current_revision: Option<String>,
     ) -> Result<Self, RoomFailed> {
+        // A log with no verified checkpoint and no entries has nothing built on any base yet:
+        // its first session starts from the document's stored file, which the page loads as a
+        // plain file with fresh identities (live-base answers 204 without session data). With
+        // entries, they were made on the empty base, which stays theirs.
         let base_revision = loaded
             .verified_checkpoint
             .as_ref()
-            .map(|checkpoint| checkpoint.revision.clone());
+            .map(|checkpoint| checkpoint.revision.clone())
+            .or_else(|| {
+                (loaded.head == Seq(0))
+                    .then(|| current_revision.clone())
+                    .flatten()
+            });
         let base_session_data = loaded
             .verified_checkpoint
             .as_ref()
@@ -5392,6 +5401,46 @@ mod tests {
         assert_eq!(started.kind, "live.session_started");
         assert_eq!(started.detail, serde_json::json!({ "format": FORMAT }));
         assert!(room.has_session());
+    }
+
+    /// The revision a joiner's catch-up names as its base.
+    fn catchup_revision(joined: &Joined) -> Option<Option<String>> {
+        joined.initial.iter().find_map(|message| match message {
+            LiveServerMsg::Catchup { revision, .. } => Some(revision.clone()),
+            _ => None,
+        })
+    }
+
+    /// A document never edited together starts its first session from its stored file, not
+    /// from the empty workbook; a log already built on the empty base keeps that base.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_session_starts_from_the_stored_file() {
+        let store = MemStore::new();
+        let doc = DocId(id(100));
+        let uploaded = store.write_outside(doc, [7; 32]);
+        let (events, _) = EventSink::channel();
+        let mut room = LiveRoom::load(doc, store, events, timing()).await.unwrap();
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        assert_eq!(catchup_revision(&ann), Some(Some(uploaded)));
+
+        // Entries made on the empty base (a document with no file) stay on it after a file
+        // arrives, so they are never replayed on top of other content.
+        let store = MemStore::new();
+        let doc = DocId(id(101));
+        let (events, _) = EventSink::channel();
+        let mut room = LiveRoom::load(doc, store.clone(), events, timing())
+            .await
+            .unwrap();
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        assert_eq!(catchup_revision(&ann), Some(None));
+        entry(&mut room, &ann, 1, 0, FORMAT, "{\"raw\":1}".into())
+            .await
+            .unwrap();
+        store.write_outside(doc, [8; 32]);
+        let (events, _) = EventSink::channel();
+        let mut reloaded = LiveRoom::load(doc, store, events, timing()).await.unwrap();
+        let bob = join_as(&mut reloaded, 2, 2, 12, "editor", FORMAT, None, None).await;
+        assert_eq!(catchup_revision(&bob), Some(None));
     }
 
     #[tokio::test(start_paused = true)]
