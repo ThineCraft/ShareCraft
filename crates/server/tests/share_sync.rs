@@ -1233,50 +1233,49 @@ async fn a_generation_change_stops_folder_heavy_apply_and_next_sync_completes() 
     for number in 0..200 {
         env.fake.put(&format!("folder-{number:03}/file.txt"), b"x");
     }
-    let state = env.state.clone();
-    let library = env.library;
-    let task =
-        tokio::spawn(async move { sync_once(&state, library, OffsetDateTime::UNIX_EPOCH).await });
-    let deadline = tokio::time::Instant::now() + common::TIMEOUT;
-    loop {
-        let folders = env
-            .server
-            .records_db()
-            .source_items(env.library)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|item| item.blob_sha.is_none())
-            .count();
-        if folders >= 20 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "folder apply did not start"
-        );
-        tokio::task::yield_now().await;
-    }
-    env.server
-        .records_db()
-        .bump_source_generation(env.library)
+    // The connection changes inside the first batch's own transaction (a trigger on the items
+    // it records), so the change is in place exactly when the first batch commits.
+    let pool = env.server.records_db().test_pool().clone();
+    sqlx::query(
+        "create function bump_after_first_batch() returns trigger language plpgsql as $$ \
+         begin \
+           if (select count(*) from source_items where library_id = new.library_id) >= 20 then \
+             update library_sources set generation = generation + 1 \
+              where library_id = new.library_id; \
+           end if; \
+           return new; \
+         end $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "create trigger bump_after_first_batch after insert on source_items \
+         for each row execute function bump_after_first_batch()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let stopped = sync_once(&env.state, env.library, OffsetDateTime::UNIX_EPOCH).await;
+
+    assert!(matches!(stopped, Err(SyncError::Failed(_))), "{stopped:?}");
+    sqlx::query("drop trigger bump_after_first_batch on source_items")
+        .execute(&pool)
         .await
         .unwrap();
-
-    assert!(matches!(task.await.unwrap(), Err(SyncError::Failed(_))));
     let after_stop = env
         .server
         .records_db()
         .source_items(env.library)
         .await
         .unwrap();
-    let folders_after_stop = after_stop
-        .iter()
-        .filter(|item| item.blob_sha.is_none())
-        .count();
-    assert!(
-        folders_after_stop <= 40,
-        "created {folders_after_stop} of 200 folders after the generation changed"
+    // Exactly the first batch of 20 (folders and their files, in path order) and no more.
+    assert_eq!(
+        after_stop.len(),
+        20,
+        "created {} items after the generation changed",
+        after_stop.len()
     );
 
     env.synced_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60))
