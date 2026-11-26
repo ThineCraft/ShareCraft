@@ -1340,6 +1340,9 @@ pub(crate) async fn disconnect(
     // generation moves on and the disconnect waits for the pass to give up its turn.
     let external = config.kind != SourceKind::Github;
     to_completion(async move {
+        // While this runs no sync of the library starts, a listing under way gives up at its
+        // next folder, and one that ends is not made due again.
+        let stopping = external.then(|| state.sources().stop(library));
         if external {
             state
                 .db()
@@ -1369,26 +1372,42 @@ pub(crate) async fn disconnect(
         // moved, or it waits and then finds the library read-only and is refused). No change
         // can be accepted once the children are being moved. A disconnect that fails after
         // this leaves the library read-only, which an owner may choose anyway.
-        let closed = state
-            .db()
-            .set_source_mode(library, SourceMode::ReadOnly)
-            .await?;
-        if closed {
-            recheck_below(&state, library).await;
+        let ended = async {
+            let closed = state
+                .db()
+                .set_source_mode(library, SourceMode::ReadOnly)
+                .await?;
+            if closed {
+                recheck_below(&state, library).await;
+            }
+            let removed = if external {
+                tree::delete_source_children(&state, &actor, library).await?
+            } else {
+                0
+            };
+            // The library-level authorisation is judged again in the disconnect's own
+            // transaction, also when there were no children to remove: the route's check above
+            // was made before the wait for the source turn.
+            let secrets = state.db().disconnect_source_as(actor.id, library).await?;
+            Ok::<_, ApiError>((removed, secrets))
         }
-        let removed = if external {
-            tree::delete_source_children(&state, &actor, library).await?
-        } else {
-            0
+        .await;
+        let (removed, secrets) = match ended {
+            Ok(ended) => ended,
+            Err(error) => {
+                // Still connected: a listing stopped for this disconnect was not made due
+                // again, so it is made due here.
+                if external && let Err(e) = state.db().requeue_source(library, None).await {
+                    eprintln!("sharecraft-server: database failure: {e}");
+                }
+                return Err(error);
+            }
         };
-        // The library-level authorisation is judged again in the disconnect's own transaction,
-        // also when there were no children to remove: the route's check above was made before
-        // the wait for the source turn.
-        let secrets = state.db().disconnect_source_as(actor.id, library).await?;
         for id in secrets {
             forget_secret(&state, id).await;
         }
         drop(turn);
+        drop(stopping);
         let detail = if external {
             json!({ "kind": config.kind.as_str(), "removed": removed })
         } else {

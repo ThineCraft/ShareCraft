@@ -742,6 +742,9 @@ pub struct Sources {
     /// Share listings in a row that changed nothing, for the adaptive poll (see
     /// [`next_share_check`]). Kept in memory only, so a restart starts every count over.
     quiet: Mutex<HashMap<NodeId, u32>>,
+    /// Libraries being disconnected: no sync of them starts, a listing under way gives up at
+    /// its next folder, and a sync that ends meanwhile does not make them due again.
+    stopping: Mutex<HashSet<NodeId>>,
     /// Taken by each running sync.
     turns: Arc<Semaphore>,
     /// A test seam held immediately before a worker starts a chosen source.
@@ -763,6 +766,7 @@ impl Default for Sources {
             running: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             quiet: Mutex::new(HashMap::new()),
+            stopping: Mutex::new(HashSet::new()),
             turns: Arc::new(Semaphore::new(MAX_SYNCS)),
             start_gate: Arc::new(RwLock::new(())),
             start_held: Notify::new(),
@@ -821,6 +825,22 @@ impl Sources {
     /// Starts the count of quiet listings of `library` over: its listing failed.
     fn forget_quiet(&self, library: NodeId) {
         lock(&self.quiet).remove(&library);
+    }
+
+    /// Stops the syncs of `library` until the answer is dropped (a disconnect): none starts, a
+    /// listing under way gives up at its next folder, and one that ends meanwhile does not make
+    /// the library due again.
+    pub(crate) fn stop(&self, library: NodeId) -> Stopping<'_> {
+        lock(&self.stopping).insert(library);
+        Stopping {
+            sources: self,
+            library,
+        }
+    }
+
+    /// Whether `library` is being disconnected (see [`Sources::stop`]).
+    pub(crate) fn is_stopping(&self, library: NodeId) -> bool {
+        lock(&self.stopping).contains(&library)
     }
 
     /// Holds worker source starts until the returned guard is dropped.
@@ -892,6 +912,18 @@ impl Sources {
     }
 }
 
+/// The syncs of a library stopped by [`Sources::stop`], until this is dropped.
+pub(crate) struct Stopping<'a> {
+    sources: &'a Sources,
+    library: NodeId,
+}
+
+impl Drop for Stopping<'_> {
+    fn drop(&mut self) {
+        lock(&self.sources.stopping).remove(&self.library);
+    }
+}
+
 /// Syncs every library that is woken (see [`Sources::wake`]) or due (see
 /// [`records::Db::due_sources`]) as of `now`, at most [`MAX_SYNCS`] at once, and waits for
 /// them. Answers how many syncs it started. A library already being synced is left to that
@@ -935,10 +967,9 @@ async fn start_due(state: &AppState, now: OffsetDateTime, running: &mut JoinSet<
         Err(e) => eprintln!("sharecraft-server: database failure: {e}"),
     }
     let mut started = 0;
-    for (library, _) in chosen
-        .into_iter()
-        .filter(|(library, woken)| sources.start(*library, *woken))
-    {
+    for (library, _) in chosen.into_iter().filter(|(library, woken)| {
+        !sources.is_stopping(*library) && sources.start(*library, *woken)
+    }) {
         started += 1;
         let mut guard = RunningGuard::new(state.clone(), library);
         running.spawn({
@@ -1018,6 +1049,10 @@ async fn start_worker_sync(state: &AppState, library: NodeId, now: OffsetDateTim
             return WorkerStart::Ineligible;
         }
     };
+    // Being disconnected: the turn is given up at once for the disconnect to take.
+    if state.sources().is_stopping(library) {
+        return WorkerStart::Ineligible;
+    }
     let generation = match db.source_generation(library).await {
         Ok(Some(generation)) => generation,
         Ok(None) => return WorkerStart::Ineligible,
@@ -1404,6 +1439,12 @@ async fn finish(
             Ok(())
         }
         // Changed meanwhile: due again at once, still marked if the library is half applied.
+        // Being disconnected: not made due again; the disconnect removes the connection, or
+        // makes it due itself if it fails.
+        Ok(false) if sources.is_stopping(library) => {
+            sources.forget_quiet(library);
+            Ok(())
+        }
         Ok(false) => {
             sources.forget_quiet(library);
             let dirty = (status.etag.as_deref() == Some(DIRTY_ETAG)).then_some(DIRTY_ETAG);

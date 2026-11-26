@@ -585,7 +585,12 @@ pub enum ListError {
     TooManyFiles(usize),
     TooSlow,
     TooDeep,
+    /// The library is being disconnected; the walk gave up.
+    Stopped,
 }
+
+/// How often a listing waiting for a folder looks whether it was asked to stop.
+const STOP_POLL: Duration = Duration::from_millis(50);
 
 /// A connected file share as a storage source.
 pub(crate) struct ShareSource;
@@ -615,12 +620,15 @@ impl StorageSource for ShareSource {
             max_depth: 100,
         };
         let progress = state.shares().begin_listing(config.library);
+        let library = config.library;
+        let stopped = || state.sources().is_stopping(library);
         let listed = list_share_progress(
             state.shares().fs(),
             approved,
             &root,
             &limits,
             Some(progress.counter()),
+            Some(&stopped),
         )
         .await;
         drop(progress);
@@ -752,6 +760,10 @@ fn listing_failed(error: ListError, settings: &records::ShareSettings) -> SyncEr
             "Listing the folder took longer than {} seconds, so nothing was changed.",
             settings.list_seconds
         ),
+        ListError::Stopped => {
+            "The library is being disconnected, so its listing stopped and nothing was changed."
+                .to_owned()
+        }
         ListError::Unreachable | ListError::NotAFolder | ListError::TooDeep => {
             "The share could not be reached, so nothing was changed.".to_owned()
         }
@@ -788,16 +800,20 @@ pub async fn list_share(
     root: &SharePath,
     limits: &ListLimits,
 ) -> Result<ShareListing, ListError> {
-    list_share_progress(fs, approved_root, root, limits, None).await
+    list_share_progress(fs, approved_root, root, limits, None, None).await
 }
 
+/// [`list_share`], counting accepted files in `progress`, and giving up with
+/// [`ListError::Stopped`] before any further folder is read once `stopped` answers `true`.
 async fn list_share_progress(
     fs: Arc<dyn ShareFs>,
     approved_root: &SharePath,
     root: &SharePath,
     limits: &ListLimits,
     progress: Option<&AtomicUsize>,
+    stopped: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Result<ShareListing, ListError> {
+    let stop_asked = || stopped.is_some_and(|stopped| stopped());
     let started = Instant::now();
     let deadline = started.checked_add(limits.max_time).unwrap_or(started);
     let budget = FsBudget::new(limits.max_files, deadline);
@@ -829,6 +845,9 @@ async fn list_share_progress(
     let at_once = limits.at_once.max(1);
 
     while !queue.is_empty() {
+        if stop_asked() {
+            return Err(ListError::Stopped);
+        }
         if started.elapsed() > limits.max_time {
             return Err(ListError::TooSlow);
         }
@@ -854,13 +873,21 @@ async fn list_share_progress(
         }
 
         while !turns.is_empty() {
-            let remaining = limits.max_time.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return Err(ListError::TooSlow);
-            }
-            let joined = tokio::time::timeout(remaining, turns.join_next())
-                .await
-                .map_err(|_| ListError::TooSlow)?;
+            // Waited for in short steps, so a stop is noticed while a slow folder is read.
+            let joined = loop {
+                if stop_asked() {
+                    return Err(ListError::Stopped);
+                }
+                let remaining = limits.max_time.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(ListError::TooSlow);
+                }
+                if let Ok(joined) =
+                    tokio::time::timeout(remaining.min(STOP_POLL), turns.join_next()).await
+                {
+                    break joined;
+                }
+            };
             let Some(joined) = joined else {
                 break;
             };

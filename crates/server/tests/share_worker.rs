@@ -517,3 +517,60 @@ async fn a_github_library_and_a_share_library_are_both_synced_by_one_tick() {
     assert_eq!(shared.files, 1);
     assert_eq!(shared.next_check_at, Some(now + secs(60)));
 }
+
+#[tokio::test]
+async fn a_disconnect_stops_a_long_listing_and_no_new_listing_starts() {
+    let env = Env::new().await;
+    env.fake.put("a.txt", b"a");
+    assert!(env.listed_at(t0()).await);
+    // A walk of over 10 seconds: 100 folders, four at a time, half a second each.
+    for n in 0..100 {
+        env.fake.put(&format!("folder-{n:03}/file.txt"), b"x");
+    }
+    env.fake.slow_list(Duration::from_millis(500));
+    let lists = env.fake.lists();
+    let state = env.state.clone();
+    let listing =
+        tokio::spawn(async move { server::source_tick_once(&state, t0() + secs(60)).await });
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while env.fake.lists() < lists + 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the listing never began"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(env.status().await.state, SourceState::Syncing);
+
+    let started = std::time::Instant::now();
+    let (status, answer) = env
+        .call(
+            Method::DELETE,
+            &format!("/api/libraries/{}/source", env.library.0),
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert!(
+        started.elapsed() < TIMEOUT,
+        "the disconnect waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(listing.await.unwrap(), 1);
+    assert!(
+        env.server
+            .records_db()
+            .source_of(env.library)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The walk gave up: far fewer folders were read than a full listing reads, and no new
+    // listing starts.
+    let after = env.fake.lists();
+    assert!(after < lists + 50, "{} folders read", after - lists);
+    assert_eq!(env.tick(t0() + secs(120)).await, 0);
+    assert_eq!(env.tick(t0() + secs(86_400)).await, 0);
+    assert_eq!(env.fake.lists(), after);
+}
