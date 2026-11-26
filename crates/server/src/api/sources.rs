@@ -654,7 +654,8 @@ pub(crate) async fn connect_share(
     let mut approved = approved_root(&path, &settings.roots)
         .cloned()
         .ok_or(ApiError::ShareNotApproved)?;
-    if overlaps_data_folder(&state, &path).await {
+    let data_deadline = tokio::time::Instant::now() + Duration::from_secs(settings.list_seconds);
+    if overlaps_data_folder(&state, &path, data_deadline).await? {
         return Err(ApiError::ShareNotApproved);
     }
     if !state

@@ -1405,3 +1405,101 @@ async fn a_failed_identity_lookup_falls_back_to_path_checks_without_leaking_its_
     );
     assert!(!text.contains(IDENTITY_FAILURE), "{answer}");
 }
+
+#[tokio::test]
+async fn data_folder_lookups_against_a_hanging_share_are_bounded() {
+    const CONNECTS: usize = server::share::SHARE_LOOKUPS + 4;
+    let env = Env::new().await;
+    env.fake.mkdir("hung");
+    // The first lookup of every connect (whether the folder overlaps the data folder)
+    // resolves the folder itself, and that hangs.
+    env.fake.hang_canonical("hung");
+    struct Release(FakeShare);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release_canonical();
+        }
+    }
+    let release = Release(env.fake.clone());
+
+    let route = format!("/api/sites/{}/libraries/share", env.site.0);
+    let connecting: Vec<_> = (0..CONNECTS)
+        .map(|n| {
+            spawn_call(
+                &env,
+                &env.admin,
+                Method::POST,
+                &route,
+                Some(json!({
+                    "name": format!("Hung {n}"),
+                    "path": native(r"C:\approved\hung"),
+                })),
+            )
+        })
+        .collect();
+    wait_until("the lookup bound is reached", || async {
+        env.fake.canonical_hanging() >= server::share::SHARE_LOOKUPS
+    })
+    .await;
+    // Every connect has had ample time to start its own lookup of the hanging share.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        env.fake.canonical_hanging_peak(),
+        server::share::SHARE_LOOKUPS
+    );
+
+    drop(release);
+    for connecting in connecting {
+        let (status, answer) = connecting.await.unwrap();
+        assert!(
+            status == StatusCode::CREATED
+                || status == StatusCode::CONFLICT
+                || status == StatusCode::SERVICE_UNAVAILABLE,
+            "{status} {answer}"
+        );
+    }
+    assert_eq!(
+        env.fake.canonical_hanging_peak(),
+        server::share::SHARE_LOOKUPS
+    );
+}
+
+#[tokio::test]
+async fn a_hanging_data_folder_lookup_times_out_as_offline() {
+    let env = Env::new().await;
+    env.server
+        .records_db()
+        .set_setting(env.admin.id, SHARE_LIST_SECONDS, json!(30))
+        .await
+        .unwrap();
+    env.fake.mkdir("hung");
+    env.fake.hang_canonical("hung");
+    struct Release(FakeShare);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release_canonical();
+        }
+    }
+    let _release = Release(env.fake.clone());
+
+    let started = std::time::Instant::now();
+    let (status, answer) = spawn_call(
+        &env,
+        &env.admin,
+        Method::POST,
+        &format!("/api/sites/{}/libraries/share", env.site.0),
+        Some(json!({"name": "Hung", "path": native(r"C:\approved\hung")})),
+    )
+    .await
+    .unwrap();
+
+    // Answered by the 30-second deadline, not when the share server gives up.
+    assert!(
+        started.elapsed() < Duration::from_secs(30 + 15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"], "share_unreachable", "{answer}");
+    assert_eq!(answer["reason"], "offline", "{answer}");
+}
