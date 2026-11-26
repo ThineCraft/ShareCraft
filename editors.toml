@@ -5,7 +5,7 @@
 upstream = "https://github.com/storytold/gridcraft"
 base     = "e9addf52fe68847e6c1310fcfa5d42b7aa8b9650"
 fork     = "https://github.com/ThineCraft/GridCraft"
-branch   = "g5-compaction"
+branch   = "sharecraft"
 commit   = "2f4ea5e0cbada0720e6867cd6aaefae035d9adbc"
 app      = "apps/gridcraft-web"
 checkout = "../GridCraft"
