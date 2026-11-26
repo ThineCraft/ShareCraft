@@ -535,6 +535,43 @@ async fn an_object_changed_in_the_bucket_meanwhile_is_kept_and_a_named_copy_hold
 }
 
 #[tokio::test]
+async fn a_conflict_copy_is_made_when_its_author_has_lost_access_and_is_not_retried_for_ever() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"original");
+    let library = env.library("Removed", "read_write").await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "a.txt").await;
+    env.replace(docs, "a.txt", b"my edit").await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"outside edit");
+    // The author is taken off the site before the change is written.
+    env.db()
+        .set_node_access(env.admin.id, env.site, Principal::User(env.owner.id), None)
+        .await
+        .unwrap();
+
+    let now = OffsetDateTime::now_utc();
+    env.write(now).await;
+    assert_eq!(env.object("docs/a.txt").unwrap().bytes, b"outside edit");
+    let copy = copy_path("docs/", "a.txt", now);
+    assert_eq!(
+        env.object(&copy).map(|stored| stored.bytes),
+        Some(b"my edit".to_vec()),
+        "the change is kept in a copy named for its author"
+    );
+    assert!(
+        env.pending(file).await.is_none(),
+        "nothing is left to retry"
+    );
+    let copy_node = env.child(docs, copy.trim_start_matches("docs/")).await;
+    assert!(env.pending(copy_node).await.is_none());
+    let events = env.events_of("source.conflict_copy").await;
+    assert_eq!(
+        events,
+        vec![json!({ "node": file.0.to_string(), "copy": copy_node.0.to_string() })]
+    );
+}
+
+#[tokio::test]
 async fn a_change_between_head_and_put_is_kept_and_becomes_a_named_copy() {
     let env = Env::new().await;
     env.fake.put(BUCKET, &key("docs/a.txt"), b"original");

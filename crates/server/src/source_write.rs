@@ -1382,8 +1382,14 @@ async fn numbered(
 /// author and `now` ([`sibling_name`], numbered `(2)` to `(20)` if taken) with the first name
 /// free in the store ([`name_free`]) and in the folder. The copy's node is made and its content
 /// staged as a new file's (to be written next); then the file's own change is withdrawn and the
-/// file takes the store's state. Recorded as `source.conflict_copy {node, copy}`. When no copy
-/// can be made the row fails and keeps its content.
+/// file takes the store's state. Recorded as `source.conflict_copy {node, copy}`.
+///
+/// The copy is made by its author while they may add files beside the file. An author who has
+/// since lost that (taken off the site or library) or whose account is gone would otherwise
+/// keep the change failing for ever, unseen by them: the copy is then made by the person who
+/// connected the library, as a listing makes the files it finds ([`copy_makers`]), and keeps
+/// the author's name where it is known. Only when neither can make it does the row fail, keeping
+/// its content.
 async fn beside(
     state: &AppState,
     target: &S3Target,
@@ -1393,7 +1399,8 @@ async fn beside(
     now: OffsetDateTime,
 ) -> Attempt {
     let db = state.db();
-    let Some(author) = author else {
+    let makers = copy_makers(state, row.library, author).await;
+    let Some(named) = author.or(makers.first()) else {
         fail(state, row, now, COPY_FAILED).await;
         return Attempt::Acted;
     };
@@ -1410,7 +1417,7 @@ async fn beside(
         return Attempt::Acted;
     };
     let (folder, name) = split_path(&row.path);
-    let first = sibling_name(name, &author.name, now);
+    let first = sibling_name(name, &named.name, now);
     let mut names = vec![first.clone()];
     names.extend((2..=LAST_NUMBER).map(|n| numbered_name(&first, n)));
     for candidate in names {
@@ -1426,15 +1433,15 @@ async fn beside(
         let id = DocId(Uuid::new_v4());
         let editor = Editor::for_file_name(&candidate);
         let size = Some(row.blob.size);
-        match tree::create_document(state, author, parent, id, &candidate, editor, size).await {
-            Ok(_) => {}
+        let maker = match make_copy(state, &makers, parent, id, &candidate, editor, size).await {
+            Ok(maker) => maker,
             Err(AccessError::NameTaken) => continue,
             Err(e) => {
                 eprintln!("sharecraft-server: the node of a copy could not be made: {e}");
                 fail(state, row, now, COPY_FAILED).await;
                 return Attempt::Acted;
             }
-        }
+        };
         let copy = NodeId(id.0);
         let request = StageRequest {
             library: row.library,
@@ -1448,7 +1455,7 @@ async fn beside(
         };
         if let Err(e) = stage(state, &request).await {
             eprintln!("sharecraft-server: the content of a copy could not be staged: {e:?}");
-            if let Err(removed) = tree::apply(state, author, TreeOp::Delete { id: copy }).await {
+            if let Err(removed) = tree::apply(state, maker, TreeOp::Delete { id: copy }).await {
                 eprintln!(
                     "sharecraft-server: a copy with no content could not be removed: {removed}"
                 );
@@ -1476,6 +1483,54 @@ async fn beside(
     }
     fail(state, row, now, &sentence(WriteError::Failed)).await;
     Attempt::Acted
+}
+
+/// Who may make a conflict copy in `library`, in turn: the change's `author`, then the person
+/// who connected the library (whom a listing acts as), when their account is still open. Empty
+/// when neither is known.
+async fn copy_makers(state: &AppState, library: NodeId, author: Option<&User>) -> Vec<User> {
+    let mut makers: Vec<User> = author.cloned().into_iter().collect();
+    let db = state.db();
+    let connected_by = match db.source_of(library).await {
+        Ok(source) => source.map(|(config, _)| config.connected_by),
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot read who connected a library: {e}");
+            None
+        }
+    };
+    if let Some(id) = connected_by
+        && !makers.iter().any(|maker| maker.id == id)
+    {
+        match db.user(id).await {
+            Ok(Some(user)) if !user.disabled => makers.push(user),
+            Ok(_) => {}
+            Err(e) => eprintln!("sharecraft-server: cannot read who connected a library: {e}"),
+        }
+    }
+    makers
+}
+
+/// Makes the node of a conflict copy as the first of `makers` allowed to add it to `parent`
+/// (one refused for access, `Forbidden` or `NotFound`, gives way to the next); the one who made
+/// it. Any other refusal is final.
+async fn make_copy<'a>(
+    state: &AppState,
+    makers: &'a [User],
+    parent: NodeId,
+    id: DocId,
+    name: &str,
+    editor: Editor,
+    size: Option<u64>,
+) -> Result<&'a User, AccessError> {
+    let mut refused = AccessError::Forbidden;
+    for maker in makers {
+        match tree::create_document(state, maker, parent, id, name, editor, size).await {
+            Ok(_) => return Ok(maker),
+            Err(e @ (AccessError::Forbidden | AccessError::NotFound)) => refused = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(refused)
 }
 
 /// The file of `row` is what the store holds now: its tracking row takes the store's tag.

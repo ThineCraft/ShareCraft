@@ -2436,7 +2436,7 @@ node --test web/</code></pre>
 <tr><td>Data safety</td><td>The source and cleanup deletes in a move carry no <code>If-Match</code>, so there is a small window to delete newer outside content.</td></tr>
 <tr><td>Data safety</td><td>Restore after a save landed during a delete has a branch that is practically unreachable: the save retries until restored, and is lost if the entry is purged first. The log text there is wrong.</td></tr>
 <tr><td>Data safety</td><td>A lost answer to a copy leaves a duplicate (no loss). A tree refusal after an unhold can leave duplicates.</td></tr>
-<tr><td>Can loop or stall</td><td><strong>A conflict copy whose node cannot be made</strong> (the author is unreadable or has no access) retries for ever and is never written.</td></tr>
+<tr><td>Can loop or stall</td><td><strong>A conflict copy whose node cannot be made</strong> (the author is unreadable or has no access) retried for ever and was never written. <em>Fixed 2026-11-26:</em> the copy is then made by the person who connected the library (as a listing acts) and keeps the author&rsquo;s name; only when neither can make it does the change stay failed, for an owner to retry or discard.</td></tr>
 <tr><td>Can loop or stall</td><td><strong>Restore when the parent folder was purged:</strong> the entry cannot be restored (an ordinary bin restores to the library top).</td></tr>
 <tr><td>Can loop or stall</td><td>The stale-upload sweep has no back-off, logs per row per tick, and does not skip blocked libraries.</td></tr>
 <tr><td>Can loop or stall</td><td>A numbered rename before the sha-keyed repath can split a row from the tree if a newer save lands between them.</td></tr>
