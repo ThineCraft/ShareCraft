@@ -1559,6 +1559,103 @@ fn sha_hex_of(sha256: &[u8; 32]) -> String {
     sha256.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// A join with nothing to resume, as a newly opened browser sends.
+fn plain_join() -> LiveClientMsg {
+    LiveClientMsg::LiveJoin {
+        client: collab_core::ids::ClientId(uuid::Uuid::new_v4()),
+        protocol: protocol::live::LIVE_PROTOCOL,
+        format: FORMAT.to_owned(),
+        resume: None,
+        seen: None,
+        can_checkpoint: true,
+        build: protocol::live::LiveBuild::Browser,
+        returning_through: None,
+    }
+}
+
+/// A new session whose base is the earlier session's last position tells everyone to compact
+/// it: no entry of the earlier session follows it.
+#[tokio::test]
+async fn a_base_ending_an_earlier_session_is_compacted() {
+    use protocol::live::{LiveBuild, TicketPurpose};
+    let server = spawn_server_config(|config| {
+        live_config(config);
+        config.live_checkpoint_quiet = Duration::from_millis(50);
+        config.room_grace = Duration::from_millis(100);
+    })
+    .await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut ann_socket = join_capable_socket(&server, doc, &ann, LiveBuild::Browser).await;
+    let mut bob_socket = join_capable_socket(&server, doc, &bob, LiveBuild::Browser).await;
+    let holder = |asked: &Asked| if asked.first { &ann } else { &bob };
+    send_change(&mut ann_socket, 1, 0, "one").await;
+    send_change(&mut ann_socket, 2, 1, "two").await;
+    let write = loop {
+        let asked = ticket_to_either(&mut ann_socket, &mut bob_socket, TicketPurpose::Write).await;
+        if asked.at == Seq(2) {
+            break asked;
+        }
+    };
+    let file = b"live workbook at two".to_vec();
+    let checkpoint = saved_revision(
+        upload_checkpoint(&server, holder(&write), doc, &write, b"ids at two", &file).await,
+    )
+    .await;
+    let verify = ticket_to_either(&mut ann_socket, &mut bob_socket, TicketPurpose::Verify).await;
+    verify_checkpoint(&server, holder(&verify), doc, &verify, b"ids at two", &file).await;
+
+    let catchup_of = |message: LiveServerMsg| match message {
+        LiveServerMsg::Catchup {
+            base,
+            revision,
+            from,
+            head,
+            compact,
+        } => Some((base, revision, from, head, compact)),
+        _ => None,
+    };
+    // Within the session that made it, the base is not compacted.
+    let mut early = common::open_socket(server.addr, doc, &bob).await;
+    send_live(&mut early, &plain_join()).await;
+    let catchup = next_live(&mut early, catchup_of).await;
+    assert_eq!(
+        catchup,
+        (Seq(2), Some(checkpoint.clone()), Seq(2), Seq(2), false)
+    );
+
+    // Everyone leaves and the session ends.
+    drop(ann_socket);
+    drop(bob_socket);
+    drop(early);
+    let ended = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server
+        .db
+        .db
+        .load_live(doc)
+        .await
+        .unwrap()
+        .open_session
+        .is_some()
+    {
+        assert!(tokio::time::Instant::now() < ended, "the session ends");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The next session starts on that base, the earlier session's last position.
+    let mut socket = common::open_socket(server.addr, doc, &ann).await;
+    send_live(&mut socket, &plain_join()).await;
+    let catchup = next_live(&mut socket, catchup_of).await;
+    assert_eq!(
+        catchup,
+        (Seq(2), Some(checkpoint.clone()), Seq(2), Seq(2), true)
+    );
+    // A second person joining the same session on the same base is told the same.
+    let mut late = common::open_socket(server.addr, doc, &bob).await;
+    send_live(&mut late, &plain_join()).await;
+    let catchup = next_live(&mut late, catchup_of).await;
+    assert_eq!(catchup, (Seq(2), Some(checkpoint), Seq(2), Seq(2), true));
+}
+
 /// A verified checkpoint outlives the room and the server: after a restart a newcomer is
 /// caught up from it (not from the start of the log) and the next checkpoint is made on it.
 #[tokio::test]
@@ -1628,11 +1725,17 @@ async fn verified_checkpoint_survives_room_and_server_restart() {
             revision,
             from,
             head,
-        } => Some((base, revision, from, head)),
+            compact,
+        } => Some((base, revision, from, head, compact)),
         _ => None,
     })
     .await;
-    assert_eq!(catchup, (Seq(2), Some(checkpoint.clone()), Seq(2), Seq(3)));
+    // The earlier session's entry 3 follows the base and may name its deleted ids, so the
+    // base is not compacted in this session.
+    assert_eq!(
+        catchup,
+        (Seq(2), Some(checkpoint.clone()), Seq(2), Seq(3), false)
+    );
     let loaded = db.db.load_live(doc).await.unwrap();
     assert_eq!(loaded.verified_through, Seq(2));
     assert_eq!(

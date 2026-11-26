@@ -274,15 +274,29 @@ impl OrderedIds {
 
     /// Live and deleted runs held now.
     ///
-    /// Deleted runs are never merged or removed while the table lives, so this only grows in a
-    /// session, and an axis near [`Self::MAX_RUNS`] refuses every structural change. The way
-    /// out: deleted runs below the agreed checkpoint position may be compacted once every
-    /// participant has passed that position, because no change still to come can name them.
-    /// G5 Task 8 (the fork's identity tables) owns that compaction. Until then an axis starts
-    /// afresh only when a session starts from a plain file revision, with fresh identities; a
-    /// session that starts from a checkpoint loads the same tables, deleted runs included.
-    fn total_runs(&self) -> usize {
+    /// Deleted runs are never merged or removed while a session lasts, so this only grows in a
+    /// session, and an axis near [`Self::MAX_RUNS`] refuses every structural change. Between
+    /// sessions [`Self::compact`] drops them: every editor of a session that starts from an
+    /// earlier session's checkpoint compacts that checkpoint's tables as it loads them.
+    pub fn total_runs(&self) -> usize {
         self.live.len().saturating_add(self.deleted.len())
+    }
+
+    /// Forgets every deleted id and returns how many deleted runs were dropped. Afterwards a
+    /// deleted id is [`Lookup::Unknown`] instead of [`Lookup::Deleted`]; the live ids, their
+    /// order and their positions are unchanged.
+    ///
+    /// Safe only where no change still to come was made against the deleted ids: when a new
+    /// session starts from a checkpoint of an earlier one, before any of its entries. The
+    /// result depends only on the table, so every editor that compacts the same table agrees,
+    /// and compacting twice is the same as once.
+    pub fn compact(&mut self) -> usize {
+        let dropped = self.deleted.len();
+        if dropped > 0 {
+            self.deleted.clear();
+            self.reindex();
+        }
+        dropped
     }
 
     /// Refuses a change that could grow the table by `growth` runs past [`Self::MAX_RUNS`] or
@@ -724,6 +738,36 @@ mod tests {
         assert_eq!(ids.find(LiveId(0, 1_048_575)), Lookup::At(1_048_575));
         assert_eq!(ids.find(LiveId(0, 1_048_576)), Lookup::Unknown);
         assert_eq!(OrderedIds::base(0).runs(), 0);
+    }
+
+    #[test]
+    fn compacting_drops_deleted_runs_and_keeps_live_ones() {
+        let mut ids = OrderedIds::base(20);
+        ids.insert(5, LiveId(2, 0), 3).unwrap();
+        ids.delete(1, 2).unwrap();
+        ids.delete(10, 4).unwrap();
+        let live: Vec<_> = (0..ids.len()).map(|pos| ids.id_at(pos)).collect();
+        let deleted_runs = ids.total_runs() - ids.runs();
+        assert!(deleted_runs >= 2);
+
+        assert_eq!(ids.compact(), deleted_runs);
+        assert_eq!(ids.total_runs(), ids.runs());
+        assert_eq!(
+            (0..ids.len()).map(|pos| ids.id_at(pos)).collect::<Vec<_>>(),
+            live
+        );
+        assert_eq!(ids.find(LiveId(0, 1)), Lookup::Unknown);
+        assert_eq!(ids.find(LiveId(2, 1)), Lookup::At(4));
+        ids.validate().unwrap();
+        // Compacting again drops nothing, so loading a compacted table twice agrees.
+        let once = ids.clone();
+        assert_eq!(ids.compact(), 0);
+        assert_eq!(ids, once);
+        // The table round-trips and takes changes as before.
+        let back: OrderedIds = serde_json::from_value(serde_json::to_value(&ids).unwrap()).unwrap();
+        assert_eq!(back, ids);
+        ids.delete(0, 1).unwrap();
+        assert_eq!(ids.total_runs() - ids.runs(), 1);
     }
 
     #[test]

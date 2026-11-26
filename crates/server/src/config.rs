@@ -177,6 +177,33 @@ pub enum ConfigError {
     /// A live-editor setting names an editor that cannot co-author.
     #[error("SHARECRAFT_LIVE_EDITORS names {0:?}; only gridcraft can co-author")]
     BadLiveEditors(String),
+    /// Live editing is asked for in production mode while work it needs there is still open.
+    #[error(
+        "SHARECRAFT_LIVE_EDITORS is set, but editing together is not ready for production mode \
+         yet: {0}. Leave SHARECRAFT_LIVE_EDITORS unset in production mode"
+    )]
+    LiveNotReadyForProduction(&'static str),
+}
+
+/// Work editing together still needs before production mode may switch it on, in plain words.
+/// Remove an entry when its work lands; with none left, production mode accepts
+/// `SHARECRAFT_LIVE_EDITORS`.
+/// Empty since deleted rows and columns are compacted between sessions (G5 follow-up I2); add
+/// an entry here to hold production back again while a known gap is open.
+const LIVE_PRODUCTION_BLOCKERS: &[&str] = &[];
+
+/// Refuses live editors in production mode while [`LIVE_PRODUCTION_BLOCKERS`] names open work.
+fn refuse_live_in_production(
+    production: bool,
+    live_editors: &[Editor],
+    blockers: &[&'static str],
+) -> Result<(), ConfigError> {
+    match blockers.first() {
+        Some(blocker) if production && !live_editors.is_empty() => {
+            Err(ConfigError::LiveNotReadyForProduction(blocker))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The raw production-mode settings, as read from the environment.
@@ -248,6 +275,11 @@ impl Config {
             database.as_deref(),
             editors.as_deref(),
             max_file_bytes.as_deref(),
+        )?;
+        refuse_live_in_production(
+            config.deployment.is_production(),
+            &live_editors,
+            LIVE_PRODUCTION_BLOCKERS,
         )?;
         config.github_api = github_api;
         config.live_editors = live_editors;
@@ -465,6 +497,25 @@ mod tests {
         for value in ["wordcraft", "pdfcraft", "solidcraft", "unknown"] {
             assert!(live_editors_from(Some(value)).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn production_refuses_live_editors_while_work_is_open() {
+        let live = [Editor::GridCraft];
+        let open: &[&str] = &["a known gap"];
+        let refused = refuse_live_in_production(true, &live, open);
+        assert!(
+            matches!(
+                refused,
+                Err(ConfigError::LiveNotReadyForProduction(blocker)) if blocker == open[0]
+            ),
+            "{refused:?}"
+        );
+        // Development mode, and production without live editors, start as before.
+        assert!(refuse_live_in_production(false, &live, open).is_ok());
+        assert!(refuse_live_in_production(true, &[], open).is_ok());
+        // With no work open, as now, production mode accepts live editors.
+        assert!(refuse_live_in_production(true, &live, LIVE_PRODUCTION_BLOCKERS).is_ok());
     }
 
     #[test]

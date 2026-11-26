@@ -645,8 +645,11 @@ async fn insert_live_checkpoint(
     let inserted = sqlx::query(
         "insert into live_checkpoints \
                  (document_id, revision, through, sha256, session_id, session_data, \
-                  major_reason, major_person, created_at, writer_participant, writer_client) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                  major_reason, major_person, created_at, writer_participant, writer_client, \
+                  entry_at, entry_seed) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                     (select at from live_entries where document_id = $1 and seq = $3), \
+                     (select seed from live_entries where document_id = $1 and seq = $3)) \
              on conflict do nothing",
     )
     .bind(doc.0)
@@ -942,6 +945,29 @@ impl Db {
                 .bind(signed(seq.0)?)
                 .fetch_optional(self.pool())
                 .await?;
+        row.map(|row| Ok((row.try_get("at")?, seed_of(row.try_get("seed")?)?)))
+            .transpose()
+    }
+
+    /// The stamp a checkpoint of `doc` at `through` loads under: the copy the checkpoint kept
+    /// when it was recorded, or else the stamp of the entry still at that position. `None`
+    /// when neither is kept. The checkpoint's copy outlives the 30-day sweep of the entry.
+    pub async fn live_base_stamp(
+        &self,
+        doc: DocId,
+        through: Seq,
+    ) -> Result<Option<(OffsetDateTime, u32)>, DbError> {
+        let row = sqlx::query(
+            "select entry_at as at, entry_seed as seed from live_checkpoints \
+             where document_id = $1 and through = $2 and entry_at is not null \
+             union all \
+             select at, seed from live_entries where document_id = $1 and seq = $2 \
+             limit 1",
+        )
+        .bind(doc.0)
+        .bind(signed(through.0)?)
+        .fetch_optional(self.pool())
+        .await?;
         row.map(|row| Ok((row.try_get("at")?, seed_of(row.try_get("seed")?)?)))
             .transpose()
     }
@@ -1661,8 +1687,11 @@ impl Db {
         sqlx::query(
             "insert into live_checkpoints \
                  (document_id, revision, through, sha256, verified_at, session_id, session_data, \
-                  major_reason, major_person, created_at, writer_participant, writer_client) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                  major_reason, major_person, created_at, writer_participant, writer_client, \
+                  entry_at, entry_seed) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                     (select at from live_entries where document_id = $1 and seq = $3), \
+                     (select seed from live_entries where document_id = $1 and seq = $3))",
         )
         .bind(doc.0)
         .bind(checkpoint.revision)

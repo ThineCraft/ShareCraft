@@ -989,17 +989,51 @@ async fn live_base_checkpoint_carries_the_stamp_of_its_position() {
     let server = spawn_server().await;
     let ann = server.user("Ann").await;
     let doc = new_doc();
-    server.create_file_document(doc, &ann).await;
+    let (_, second) = stamped_checkpoint(&server, &ann, doc).await;
+    assert_stamped_base(&server, &ann, doc, second).await;
+}
+
+#[tokio::test]
+async fn live_base_keeps_its_stamp_after_the_entry_is_swept() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    let (session, second) = stamped_checkpoint(&server, &ann, doc).await;
+    server
+        .db
+        .db
+        .end_live_session(session, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    // Past the retention period the entries through the verified position go; the third
+    // stays, so the checkpoint keeps its identity data and is still the base.
+    let later = OffsetDateTime::now_utc() + time::Duration::days(records::LIVE_KEEP_DAYS + 1);
+    server.db.db.sweep_live(later).await.unwrap();
+    assert_eq!(
+        server.db.db.live_entry_stamp(doc, Seq(2)).await.unwrap(),
+        None
+    );
+    assert_stamped_base(&server, &ann, doc, second).await;
+}
+
+/// A document of `ann`'s with three live entries, the second stamped `second` with seed
+/// 4,000,000,000, and a verified checkpoint at position 2. Returns the session and `second`.
+async fn stamped_checkpoint(
+    server: &TestServer,
+    ann: &TestUser,
+    doc: DocId,
+) -> (Uuid, OffsetDateTime) {
+    server.create_file_document(doc, ann).await;
     // The checkpoint names a stored revision of the document; its bytes do not matter here.
-    let mut seat = FileClient::connect_as(&server, doc, &ann).await;
+    let mut seat = FileClient::connect_as(server, doc, ann).await;
     let token = seat.token().unwrap();
-    let response = save(&server, &ann, doc, None, Some(&token), b"one".to_vec()).await;
+    let response = save(server, ann, doc, None, Some(&token), b"one".to_vec()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let json: Value = response.json().await.unwrap();
     let revision = json["revision"].as_str().unwrap().to_owned();
     let revision = revision.as_str();
     seat.close().await;
-    wait_revision_row(&server, doc, revision).await;
+    wait_revision_row(server, doc, revision).await;
     let session = Uuid::new_v4();
     server
         .db
@@ -1011,7 +1045,8 @@ async fn live_base_checkpoint_carries_the_stamp_of_its_position() {
     let first = OffsetDateTime::from_unix_timestamp(1_795_219_200).unwrap();
     let second = OffsetDateTime::from_unix_timestamp(1_795_219_260).unwrap()
         + time::Duration::milliseconds(167);
-    for (seq, at, seed) in [(1, first, 7), (2, second, 4_000_000_000)] {
+    // The third entry is past the verified position, so a sweep keeps it.
+    for (seq, at, seed) in [(1, first, 7), (2, second, 4_000_000_000), (3, second, 9)] {
         server
             .db
             .db
@@ -1061,8 +1096,18 @@ async fn live_base_checkpoint_carries_the_stamp_of_its_position() {
         .await
         .unwrap();
 
+    (session, second)
+}
+
+/// Asserts that the live base at position 2 carries `second` and seed 4,000,000,000.
+async fn assert_stamped_base(
+    server: &TestServer,
+    ann: &TestUser,
+    doc: DocId,
+    second: OffsetDateTime,
+) {
     let response = server
-        .http(Some(&ann))
+        .http(Some(ann))
         .get(server.url(&format!("/api/docs/{}/live-base", doc.0)))
         .query(&[("at", "2")])
         .send()

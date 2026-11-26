@@ -377,7 +377,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(manifest.live_format(), Some("gridcraft/1"));
-        manifest.live.as_mut().unwrap().protocol = 2;
+        manifest.live.as_mut().unwrap().protocol = protocol::live::LIVE_PROTOCOL + 1;
         assert_eq!(manifest.live_format(), None);
         manifest.live.as_mut().unwrap().protocol = protocol::live::LIVE_PROTOCOL;
         manifest.live.as_mut().unwrap().format = "gridcraft/2".to_owned();

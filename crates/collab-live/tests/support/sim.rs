@@ -336,6 +336,7 @@ impl Sim {
             revision: None,
             from,
             head,
+            compact: false,
         })];
         for entry in self.log.iter().skip(from.0 as usize) {
             frames.push(frame(&LiveServerMsg::Entry {

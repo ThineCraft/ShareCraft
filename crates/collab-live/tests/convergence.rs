@@ -156,7 +156,9 @@ impl World {
         device.to_server.extend(step.send);
         for event in step.events {
             match event {
-                Event::LoadBase { revision, at: base } => {
+                Event::LoadBase {
+                    revision, at: base, ..
+                } => {
                     prop_assert_eq!(revision, None);
                     prop_assert_eq!(base, Seq(0));
                     // The host loads the base later (`base_ready`), so entries may be held.

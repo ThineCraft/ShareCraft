@@ -213,8 +213,13 @@ impl std::fmt::Debug for Step {
 #[derive(Clone, PartialEq, Eq)]
 pub enum Event {
     /// Reset the editor to the stored revision at `at` (none: the empty document), then call
-    /// [`LiveClient::base_ready`].
-    LoadBase { revision: Option<String>, at: Seq },
+    /// [`LiveClient::base_ready`]. With `compact`, the editor forgets the deleted ids of a
+    /// checkpoint base as it loads it (`OrderedIds::compact`); a plain file base ignores it.
+    LoadBase {
+        revision: Option<String>,
+        at: Seq,
+        compact: bool,
+    },
     /// The entry at `seq` was applied to the agreed state.
     Applied { seq: Seq, own: bool, effect: Effect },
     /// The server refused a change; it is no longer shown. The reason is
@@ -292,10 +297,15 @@ pub enum Event {
 impl std::fmt::Debug for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Event::LoadBase { revision, at } => f
+            Event::LoadBase {
+                revision,
+                at,
+                compact,
+            } => f
                 .debug_struct("LoadBase")
                 .field("revision", revision)
                 .field("at", at)
+                .field("compact", compact)
                 .finish(),
             Event::Applied { seq, own, effect } => f
                 .debug_struct("Applied")
@@ -571,6 +581,9 @@ pub struct LiveClient<E: LiveEditor> {
     entry_times: VecDeque<u64>,
     /// Whether the editor holds a state of this session (a base and entries on it).
     has_state: bool,
+    /// The session the editor's state was loaded in. A state from another session has not
+    /// forgotten what a compacted base forgets, so it is loaded again rather than caught up.
+    state_session: Option<LiveSessionId>,
     /// A copy of the agreed state; `None` means what is shown is exactly the agreed state,
     /// with nothing folded and nothing waiting shown.
     agreed: Option<E::Snapshot>,
@@ -632,6 +645,7 @@ impl<E: LiveEditor> LiveClient<E> {
             last_heartbeat_ms: 0,
             entry_times: VecDeque::new(),
             has_state: false,
+            state_session: None,
             agreed: None,
             agreed_seq: Seq(0),
             head: Seq(0),
@@ -760,6 +774,7 @@ impl<E: LiveEditor> LiveClient<E> {
                 revision,
                 from,
                 head,
+                compact,
             } => {
                 if !self.joined {
                     return Err(ClientError::Desync(
@@ -770,14 +785,21 @@ impl<E: LiveEditor> LiveClient<E> {
                 // Another revision named at exactly the client's position replaced the file
                 // from outside (S4): what the client holds is no longer the agreed state.
                 let replaced = from == base && revision != self.base_revision;
-                if self.has_state && from == self.agreed_seq && !replaced {
+                // Everyone else in this session forgets the base's deleted ids; a state from
+                // another session still holds them, so it loads the base again too.
+                let stale = compact && self.state_session != self.session;
+                if self.has_state && from == self.agreed_seq && !replaced && !stale {
                     self.phase = Phase::CatchingUp;
                 } else {
                     self.phase = Phase::LoadingBase;
                     self.held.clear();
                     self.base_at = base;
                     self.base_revision.clone_from(&revision);
-                    step.events.push(Event::LoadBase { revision, at: base });
+                    step.events.push(Event::LoadBase {
+                        revision,
+                        at: base,
+                        compact,
+                    });
                 }
                 self.check_live(now_ms, &mut step);
             }
@@ -1000,6 +1022,7 @@ impl<E: LiveEditor> LiveClient<E> {
         self.folded.clear();
         self.agreed_seq = self.base_at;
         self.has_state = true;
+        self.state_session = self.session;
         self.skipped.clear();
         if self.stalled_at.is_some_and(|at| at <= self.base_at) {
             // The stored revision already covers the entry the note names.
