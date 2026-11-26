@@ -188,10 +188,9 @@ pub enum ConfigError {
 /// Work editing together still needs before production mode may switch it on, in plain words.
 /// Remove an entry when its work lands; with none left, production mode accepts
 /// `SHARECRAFT_LIVE_EDITORS`.
-const LIVE_PRODUCTION_BLOCKERS: &[&str] = &[
-    "deleted rows and columns are never compacted, so a long session can reach the limit and \
-     then refuse every row and column change (G5 follow-up I2)",
-];
+/// Empty since deleted rows and columns are compacted between sessions (G5 follow-up I2); add
+/// an entry here to hold production back again while a known gap is open.
+const LIVE_PRODUCTION_BLOCKERS: &[&str] = &[];
 
 /// Refuses live editors in production mode while [`LIVE_PRODUCTION_BLOCKERS`] names open work.
 fn refuse_live_in_production(
@@ -503,20 +502,20 @@ mod tests {
     #[test]
     fn production_refuses_live_editors_while_work_is_open() {
         let live = [Editor::GridCraft];
-        let refused = refuse_live_in_production(true, &live, LIVE_PRODUCTION_BLOCKERS);
+        let open: &[&str] = &["a known gap"];
+        let refused = refuse_live_in_production(true, &live, open);
         assert!(
             matches!(
                 refused,
-                Err(ConfigError::LiveNotReadyForProduction(blocker))
-                    if blocker == LIVE_PRODUCTION_BLOCKERS[0]
+                Err(ConfigError::LiveNotReadyForProduction(blocker)) if blocker == open[0]
             ),
             "{refused:?}"
         );
         // Development mode, and production without live editors, start as before.
-        assert!(refuse_live_in_production(false, &live, LIVE_PRODUCTION_BLOCKERS).is_ok());
-        assert!(refuse_live_in_production(true, &[], LIVE_PRODUCTION_BLOCKERS).is_ok());
-        // Once no work is open, production mode accepts live editors.
-        assert!(refuse_live_in_production(true, &live, &[]).is_ok());
+        assert!(refuse_live_in_production(false, &live, open).is_ok());
+        assert!(refuse_live_in_production(true, &[], open).is_ok());
+        // With no work open, as now, production mode accepts live editors.
+        assert!(refuse_live_in_production(true, &live, LIVE_PRODUCTION_BLOCKERS).is_ok());
     }
 
     #[test]

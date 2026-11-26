@@ -24,7 +24,7 @@ code{font-size:.92em}
 <body>
 <main>
 <h1>Row and column compaction</h1>
-<p class="sub">Options for the owner, 26 November 2026. The last G5 follow-up that stops editing together from being switched on in production. Nothing below is built yet.</p>
+<p class="sub">Options for the owner, 26 November 2026. The last G5 follow-up that stops editing together from being switched on in production. The owner chose A the same day; how it was built is at the end.</p>
 
 <h2>The problem</h2>
 <p>When people edit a spreadsheet together, every row and column has an identity, so that “Bob edits row 12” still means the right row after Ann inserts a row above it. Identities are kept in runs, and a deleted row keeps its run forever (as a tombstone), so a later change that names it can say “someone deleted that row” instead of landing in the wrong place.</p>
@@ -57,6 +57,19 @@ code{font-size:.92em}
 <h2>Recommendation</h2>
 <p>A first. It removes the permanent build-up that real use would hit, for about a third of the work. B can follow later if one session ever needs it. With A in, the production guard’s list is empty, so production mode can switch editing together on.</p>
 <p>The remaining minors from the G5 ledger (a heartbeat during a reload, test gaps for the joiner wait list, presence flooding by a hostile server, and similar) don’t block production. I suggest fixing them after compaction, as one batch.</p>
+
+<h2>As built (option A)</h2>
+<div class="scroll"><table>
+<thead><tr><th>Part</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td>Server</td><td>The catch-up message carries <code>compact</code>: true when the verified base is the last position before the open session began. It depends only on the base and the session, so everyone loading that base in that session is told the same. A base followed by an earlier session’s unsaved entries is not compacted (those entries may name its deleted rows); the session after compacts instead.</td></tr>
+<tr><td>Live protocol</td><td>Version 2. A version-1 editor (an old browser tab after an upgrade) is refused, because it would keep ids that everyone else forgets.</td></tr>
+<tr><td>collab-live</td><td><code>OrderedIds::compact</code> forgets every deleted id. A client whose state came from another session loads a compacted base again instead of carrying on with its old tables.</td></tr>
+<tr><td>GridCraft fork</td><td>A checkpoint base loaded with <code>compact</code> drops every sheet’s deleted row and column runs and their deletion owners; sheet identities are kept.</td></tr>
+<tr><td>Production guard</td><td>Its list of open work is empty, so production mode accepts <code>SHARECRAFT_LIVE_EDITORS</code>. The guard stays for any later gap.</td></tr>
+<tr><td>What changes for people</td><td>A returning person’s change that names a row or column deleted before the compaction does nothing (“not available”) instead of landing as a <code>#REF!</code> or near where the row was. One very long session can still fill an axis; the next session starts clean.</td></tr>
+</tbody>
+</table></div>
 </main>
 </body>
 </html>

@@ -13,7 +13,10 @@ use uuid::Uuid;
 use crate::RemovedReason;
 
 /// The live protocol's version. A client and server that disagree end with `Incompatible`.
-pub const LIVE_PROTOCOL: u32 = 1;
+///
+/// 2: `Catchup` carries `compact`, and editors drop deleted row and column ids when they load
+/// such a base, so a version-1 editor would disagree with them about which ids exist.
+pub const LIVE_PROTOCOL: u32 = 2;
 /// The most bytes a change's content may hold.
 pub const MAX_PAYLOAD_BYTES: usize = 262_144;
 /// The longest format name, in characters.
@@ -320,6 +323,13 @@ pub enum LiveServerMsg {
         from: Seq,
         /// The last position in the log.
         head: Seq,
+        /// Whether editors forget the deleted ids of the checkpoint at `base` as they load it:
+        /// true when `base` is the last position before this session began, so the checkpoint
+        /// belongs to an earlier session and no entry still to come was made against those
+        /// ids. It depends only on the base and the session, so everyone who loads that base in
+        /// this session is told the same. Ignored for a base without identity data.
+        #[serde(default)]
+        compact: bool,
     },
     /// An entry in the log.
     Entry {
@@ -465,12 +475,14 @@ impl std::fmt::Debug for LiveServerMsg {
                 revision,
                 from,
                 head,
+                compact,
             } => f
                 .debug_struct("Catchup")
                 .field("base", base)
                 .field("revision", revision)
                 .field("from", from)
                 .field("head", head)
+                .field("compact", compact)
                 .finish(),
             LiveServerMsg::Entry { entry } => {
                 f.debug_struct("Entry").field("entry", entry).finish()
@@ -859,6 +871,7 @@ mod tests {
                 revision: None,
                 from: Seq(0),
                 head: Seq(2),
+                compact: false,
             },
             LiveServerMsg::Entry {
                 entry: change("{}"),
@@ -945,7 +958,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&join).unwrap(),
             "{\"type\":\"live_join\",\"client\":\"00000000-0000-0000-0000-000000000001\",\
-             \"protocol\":1,\"format\":\"gridcraft/1\",\"resume\":null,\"seen\":12,\
+             \"protocol\":2,\"format\":\"gridcraft/1\",\"resume\":null,\"seen\":12,\
              \"can_checkpoint\":true,\"build\":\"desktop\",\"returning_through\":null}"
         );
 
@@ -1047,7 +1060,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&returning).unwrap(),
             "{\"type\":\"live_join\",\"client\":\"00000000-0000-0000-0000-000000000001\",\
-             \"protocol\":1,\"format\":\"gridcraft/1\",\"resume\":{\"session\":\
+             \"protocol\":2,\"format\":\"gridcraft/1\",\"resume\":{\"session\":\
              \"00000000-0000-0000-0000-000000000002\",\"participant\":3},\"seen\":12,\
              \"can_checkpoint\":false,\"build\":\"browser\",\"returning_through\":17}"
         );
@@ -1367,6 +1380,7 @@ mod tests {
                 revision: None,
                 from: Seq(0),
                 head: Seq(2),
+                compact: false,
             },
             LiveServerMsg::Entry {
                 entry: change(SENTINEL_PAYLOAD),
@@ -1467,7 +1481,7 @@ mod tests {
     #[test]
     fn an_older_join_without_the_new_fields_is_read_with_defaults() {
         let old = "{\"type\":\"live_join\",\"client\":\"00000000-0000-0000-0000-000000000001\",\
-                   \"protocol\":1,\"format\":\"gridcraft/1\",\"resume\":null,\"seen\":null}";
+                   \"protocol\":2,\"format\":\"gridcraft/1\",\"resume\":null,\"seen\":null}";
         let join: LiveClientMsg = serde_json::from_str(old).unwrap();
         assert_eq!(
             join,

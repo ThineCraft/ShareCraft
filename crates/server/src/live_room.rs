@@ -3195,7 +3195,7 @@ impl<S: LiveStore> LiveRoom<S> {
             || expected.is_some_and(|format| format != request.format)
         {
             let message = LiveServerMsg::Incompatible {
-                protocol: LIVE_PROTOCOL,
+                protocol: protocol::live::LIVE_PROTOCOL,
                 format: expected.unwrap_or(&request.format).to_owned(),
             };
             send_direct(&request.tx, Outbound::One(encode(&message)));
@@ -3494,6 +3494,7 @@ impl<S: LiveStore> LiveRoom<S> {
             revision: self.base_revision.clone(),
             from,
             head: self.head,
+            compact: self.compact_base(),
         }));
         frames.extend(
             self.entries
@@ -4403,6 +4404,20 @@ impl<S: LiveStore> LiveRoom<S> {
         self.send_resync(client);
     }
 
+    /// Whether editors forget the deleted ids of the verified base as they load it: when the
+    /// base is the last position before the open session began. That checkpoint was made in an
+    /// earlier session, and every entry after it is applied by editors that loaded it
+    /// compacted, so an entry naming a forgotten id (a returning person's old change) finds it
+    /// unknown in every editor alike and has no effect. A base with entries of an earlier session
+    /// after it is not compacted, since those entries may name its deleted ids; the next
+    /// session compacts instead. The answer depends only on the base and the session, so every
+    /// editor that loads this base in this session is told the same.
+    fn compact_base(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            self.verified_through.0.checked_add(1) == Some(session.first_seq.0)
+        })
+    }
+
     /// Sends `client` the log again from the verified base.
     fn send_resync(&mut self, client: ClientId) {
         // The client loads the log again from the base: it is catching up until it reports
@@ -4422,6 +4437,7 @@ impl<S: LiveStore> LiveRoom<S> {
             revision: self.base_revision.clone(),
             from: self.verified_through,
             head: self.head,
+            compact: self.compact_base(),
         })];
         frames.extend(
             self.entries
@@ -5258,7 +5274,7 @@ mod tests {
             session: SessionId(id(user.0.as_u128().wrapping_add(1000))),
             name: format!("User {}", user.0.as_u128()),
             role: builtin_access(role),
-            protocol: 1,
+            protocol: protocol::live::LIVE_PROTOCOL,
             format: format.to_owned(),
             resume,
             seen,
@@ -5367,7 +5383,8 @@ mod tests {
                     base: Seq(0),
                     from: Seq(0),
                     head: Seq(0),
-                    revision: None
+                    revision: None,
+                    ..
                 }
             ]
         ));
@@ -6072,7 +6089,11 @@ mod tests {
     async fn incompatible_join_is_told_and_not_admitted() {
         let (mut room, _) = room().await;
         let mut ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
-        for (conn, protocol, format) in [(2, 2, FORMAT), (3, 1, "gridcraft/2")] {
+        // An editor of the previous protocol, and one with an unknown format.
+        for (conn, protocol, format) in [
+            (2, 1, FORMAT),
+            (3, protocol::live::LIVE_PROTOCOL, "gridcraft/2"),
+        ] {
             let (tx, mut rx) = mpsc::channel(8);
             let (accepted, answer) = oneshot::channel();
             room.handle(LiveCommand::Join {
@@ -6209,6 +6230,7 @@ mod tests {
                     revision: Some(revision),
                     from: Seq(1),
                     head: Seq(2),
+                    ..
                 },
                 LiveServerMsg::Entry { entry },
             ] if revision == "verified-revision" && entry.seq == Seq(2)
@@ -6773,7 +6795,7 @@ mod tests {
         assert!(
             matches!(
                 resent.as_slice(),
-                [LiveServerMsg::Catchup { base: Seq(1), revision: Some(base), from: Seq(1), head: Seq(1) }]
+                [LiveServerMsg::Catchup { base: Seq(1), revision: Some(base), from: Seq(1), head: Seq(1), .. }]
                     if *base == revision
             ),
             "{resent:?}"
@@ -7169,7 +7191,7 @@ mod tests {
                 session: SessionId(id(1019)),
                 name: "Late".into(),
                 role: builtin_access("editor"),
-                protocol: 1,
+                protocol: protocol::live::LIVE_PROTOCOL,
                 format: FORMAT.to_owned(),
                 resume: None,
                 seen: None,
@@ -7750,7 +7772,8 @@ mod tests {
                 base: Seq(0),
                 revision: None,
                 from: Seq(0),
-                head: Seq(2)
+                head: Seq(2),
+                ..
             }
         ));
         assert_eq!(entries(cat.initial.clone()).len(), 2);
@@ -8103,6 +8126,7 @@ mod tests {
                     revision: Some(base_revision),
                     from: Seq(2),
                     head: Seq(3),
+                    ..
                 },
                 LiveServerMsg::Entry { entry },
             ] => {
@@ -8180,6 +8204,7 @@ mod tests {
                     revision: Some(revision),
                     from: Seq(1),
                     head: Seq(2),
+                    ..
                 },
                 LiveServerMsg::Entry { entry },
             ] if revision == "verified-revision" && entry.seq == Seq(2)
@@ -8606,7 +8631,7 @@ mod tests {
                 session: SessionId(id(1099)),
                 name: "Impostor".into(),
                 role: builtin_access("editor"),
-                protocol: 1,
+                protocol: protocol::live::LIVE_PROTOCOL,
                 format: FORMAT.into(),
                 resume,
                 seen: Some(Seq(0)),
@@ -8731,7 +8756,7 @@ mod tests {
             session: SessionId(id(user.0.as_u128().wrapping_add(1000))),
             name: format!("User {}", user.0.as_u128()),
             role: builtin_access("editor"),
-            protocol: 1,
+            protocol: protocol::live::LIVE_PROTOCOL,
             format: FORMAT.to_owned(),
             resume,
             seen,
@@ -9647,7 +9672,7 @@ mod tests {
                 session: SessionId(id(1011)),
                 name: "Ann".into(),
                 role: builtin_access("editor"),
-                protocol: 1,
+                protocol: protocol::live::LIVE_PROTOCOL,
                 format: FORMAT.to_owned(),
                 resume: None,
                 seen: None,

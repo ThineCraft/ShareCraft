@@ -999,6 +999,7 @@ fn own_earlier_entry_met_again_from_the_base_is_applied() {
     assert!(step.events.contains(&Event::LoadBase {
         revision: None,
         at: Seq(0),
+        compact: false,
     }));
     client
         .receive(
@@ -1081,7 +1082,7 @@ fn join_from_nothing_loads_the_base() {
     let mut client: LiveClient<StandIn> = LiveClient::new(config());
     let join: Value = serde_json::from_str(&client.connected(0)[0]).unwrap();
     assert_eq!(join["type"], "live_join");
-    assert_eq!(join["protocol"], 1);
+    assert_eq!(join["protocol"], protocol::live::LIVE_PROTOCOL);
     assert_eq!(join["format"], FORMAT);
     assert_eq!(client.phase(), Phase::Joining);
     client.receive(&mut doc, &joined(1), 0).unwrap();
@@ -1091,6 +1092,7 @@ fn join_from_nothing_loads_the_base() {
         vec![Event::LoadBase {
             revision: None,
             at: Seq(0),
+            compact: false,
         }]
     );
     assert_eq!(client.phase(), Phase::LoadingBase);
@@ -1476,6 +1478,7 @@ fn non_checkpoint_archive_return_is_emitted_before_base_load() {
         vec![Event::LoadBase {
             revision: None,
             at: Seq(0),
+            compact: false,
         }]
     );
 }
@@ -2013,6 +2016,7 @@ fn restart_after_crash_stops_before_the_entry() {
     assert!(step.events.contains(&Event::LoadBase {
         revision: None,
         at: Seq(0),
+        compact: false,
     }));
     for frame in first_two() {
         client.receive(&mut doc, &frame, 0).unwrap();
@@ -2125,6 +2129,7 @@ fn cancel_after_a_crash_in_place_loads_the_base_again() {
     assert!(step.events.contains(&Event::LoadBase {
         revision: None,
         at: Seq(0),
+        compact: false,
     }));
     doc.doc = StandIn::new("b");
     client.base_ready(&mut doc, 40).unwrap();
@@ -2172,6 +2177,7 @@ fn cancel_makes_others_resync() {
     assert!(step.events.contains(&Event::LoadBase {
         revision: None,
         at: Seq(0),
+        compact: false,
     }));
     doc = StandIn::new("a");
     client.base_ready(&mut doc, 20).unwrap();
@@ -2433,6 +2439,7 @@ fn replaced_base_at_the_same_position_is_loaded() {
     assert!(step.events.contains(&Event::LoadBase {
         revision: Some("outside".to_owned()),
         at: Seq(1),
+        compact: false,
     }));
     client.base_ready(&mut doc, 30).unwrap();
     assert_eq!(client.phase(), Phase::Live);
@@ -2444,6 +2451,58 @@ fn replaced_base_at_the_same_position_is_loaded() {
     let step = client
         .receive(&mut doc, &catchup_on(1, "outside", 1, 1), 60)
         .unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::LoadBase { .. }))
+    );
+}
+
+/// A compacted base is loaded by a client whose state came from another session, even at its
+/// own position, because its tables still hold the ids everyone else forgets. In the session
+/// it loaded the base in, the same catch-up lets it carry on.
+#[test]
+fn compacted_base_is_loaded_by_a_state_from_another_session() {
+    let compact_catchup = |base: u64| {
+        json!({ "type": "catchup", "base": base, "revision": null, "from": base, "head": base, "compact": true })
+            .to_string()
+    };
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 2, other(2), 1, 0, &insert(LiveId(2, 0), "x")),
+            10,
+        )
+        .unwrap();
+    assert_eq!(client.agreed_seq(), Seq(1));
+
+    // The session ended; the client comes back to a new one whose base is its own position.
+    client.disconnected(20);
+    client.connected(30);
+    let mut next: Value = serde_json::from_str(&joined(3)).unwrap();
+    next["session"] = json!("00000000-0000-0000-0000-0000000000bb");
+    client.receive(&mut doc, &next.to_string(), 40).unwrap();
+    let step = client.receive(&mut doc, &compact_catchup(1), 40).unwrap();
+    assert_eq!(client.phase(), Phase::LoadingBase);
+    assert!(step.events.contains(&Event::LoadBase {
+        revision: None,
+        at: Seq(1),
+        compact: true,
+    }));
+    client.base_ready(&mut doc, 50).unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+
+    // Reconnecting within that session keeps the state it loaded there.
+    client.disconnected(60);
+    client.connected(70);
+    let mut kept: Value = serde_json::from_str(&joined_kept(3)).unwrap();
+    kept["session"] = json!("00000000-0000-0000-0000-0000000000bb");
+    client.receive(&mut doc, &kept.to_string(), 80).unwrap();
+    let step = client.receive(&mut doc, &compact_catchup(1), 80).unwrap();
     assert_eq!(client.phase(), Phase::Live);
     assert!(
         !step
