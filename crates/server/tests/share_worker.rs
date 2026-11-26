@@ -574,3 +574,162 @@ async fn a_disconnect_stops_a_long_listing_and_no_new_listing_starts() {
     assert_eq!(env.tick(t0() + secs(86_400)).await, 0);
     assert_eq!(env.fake.lists(), after);
 }
+
+/// Releases the fake's hung lookups however a test ends, so no blocked call outlives it.
+struct Release(FakeShare);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.release_canonical();
+    }
+}
+
+/// Lists at `t0`, then hangs every lookup of the share's root and starts a tick at
+/// `t0 + 60 s` whose listing waits on it; answers the tick once the listing waits.
+async fn listing_held_at_the_root(env: &Env) -> (Release, tokio::task::JoinHandle<usize>) {
+    env.fake.put("a.txt", b"a");
+    assert!(env.listed_at(t0()).await);
+    env.fake.hang_canonical(ROOT);
+    let release = Release(env.fake.clone());
+    let state = env.state.clone();
+    let tick = tokio::spawn(async move { server::source_tick_once(&state, t0() + secs(60)).await });
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while env.fake.canonical_hanging() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the listing never reached the share"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(env.status().await.state, SourceState::Syncing);
+    (release, tick)
+}
+
+#[tokio::test]
+async fn a_disconnect_answers_while_the_listing_waits_for_a_hung_share() {
+    let env = Env::new().await;
+    let (release, tick) = listing_held_at_the_root(&env).await;
+    let started = std::time::Instant::now();
+
+    let (status, answer) = env
+        .call(
+            Method::DELETE,
+            &format!("/api/libraries/{}/source", env.library.0),
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert!(
+        started.elapsed() < TIMEOUT,
+        "the disconnect waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(tick.await.unwrap(), 1);
+    drop(release);
+    assert!(
+        env.server
+            .records_db()
+            .source_of(env.library)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let attempts = env.attempts();
+    assert_eq!(env.tick(t0() + secs(120)).await, 0);
+    assert_eq!(env.attempts(), attempts);
+}
+
+#[tokio::test]
+async fn a_listing_stopped_for_a_disconnect_records_nothing_and_is_not_made_due_again() {
+    let env = Env::new().await;
+    let before = {
+        let (release, tick) = listing_held_at_the_root(&env).await;
+        let before = env.status().await;
+        // As a disconnect does first: stop the library's syncs. Its generation has not moved
+        // yet, so only the stop keeps the listing from recording a failure.
+        let stopping = env.state.sources().stop(env.library);
+        assert_eq!(tick.await.unwrap(), 1);
+
+        let after = env.status().await;
+        assert_eq!(after.state, SourceState::Syncing, "{after:?}");
+        assert_eq!(after.last_error, None);
+        assert_eq!(after.retry_at, None);
+        assert_eq!(after.last_checked_at, before.last_checked_at);
+        let failed = env
+            .server
+            .records_db()
+            .events_of_kind("source.failed")
+            .await
+            .unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+        // Nothing starts while the library is stopped (within the stale time, after which the
+        // existing recovery makes a `syncing` connection with a free lock due again).
+        assert_eq!(env.tick(t0() + secs(600)).await, 0);
+        drop(stopping);
+        drop(release);
+        before
+    };
+    // Not made due again: still the state the stopped listing left.
+    let after = env.status().await;
+    assert_eq!(after.state, SourceState::Syncing);
+    assert_eq!(after.last_checked_at, before.last_checked_at);
+}
+
+#[tokio::test]
+async fn a_disconnect_that_fails_after_stopping_the_listing_makes_the_library_due() {
+    let env = Env::new().await;
+    let (release, tick) = listing_held_at_the_root(&env).await;
+    let pool = env.server.records_db().test_pool().clone();
+    sqlx::query(
+        "create function refuse_disconnect() returns trigger language plpgsql as $$ \
+         begin raise exception 'injected disconnect failure'; end $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "create trigger refuse_disconnect before delete on library_sources \
+         for each row execute function refuse_disconnect()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, answer) = env
+        .call(
+            Method::DELETE,
+            &format!("/api/libraries/{}/source", env.library.0),
+            None,
+        )
+        .await;
+
+    assert_ne!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert_eq!(tick.await.unwrap(), 1);
+    drop(release);
+    sqlx::query("drop trigger refuse_disconnect on library_sources")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let requeued = env.status().await;
+    assert_eq!(requeued.state, SourceState::Connecting, "{requeued:?}");
+    assert_eq!(requeued.last_checked_at, None);
+    assert_eq!(requeued.next_check_at, None);
+    // Due at once: listed by the next tick.
+    assert!(env.listed_at(t0() + secs(61)).await);
+    assert_eq!(env.status().await.state, SourceState::Ok);
+}
+
+#[tokio::test]
+async fn overlapping_stops_of_one_library_hold_until_the_last_ends() {
+    let env = Env::new().await;
+    env.fake.put("a.txt", b"a");
+    assert!(env.listed_at(t0()).await);
+    let first = env.state.sources().stop(env.library);
+    let second = env.state.sources().stop(env.library);
+
+    drop(first);
+    assert!(!env.listed_at(t0() + secs(60)).await);
+    drop(second);
+    assert!(env.listed_at(t0() + secs(60)).await);
+}

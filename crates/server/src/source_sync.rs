@@ -744,7 +744,7 @@ pub struct Sources {
     quiet: Mutex<HashMap<NodeId, u32>>,
     /// Libraries being disconnected: no sync of them starts, a listing under way gives up at
     /// its next folder, and a sync that ends meanwhile does not make them due again.
-    stopping: Mutex<HashSet<NodeId>>,
+    stopping: Mutex<HashMap<NodeId, usize>>,
     /// Taken by each running sync.
     turns: Arc<Semaphore>,
     /// A test seam held immediately before a worker starts a chosen source.
@@ -766,7 +766,7 @@ impl Default for Sources {
             running: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             quiet: Mutex::new(HashMap::new()),
-            stopping: Mutex::new(HashSet::new()),
+            stopping: Mutex::new(HashMap::new()),
             turns: Arc::new(Semaphore::new(MAX_SYNCS)),
             start_gate: Arc::new(RwLock::new(())),
             start_held: Notify::new(),
@@ -829,9 +829,12 @@ impl Sources {
 
     /// Stops the syncs of `library` until the answer is dropped (a disconnect): none starts, a
     /// listing under way gives up at its next folder, and one that ends meanwhile does not make
-    /// the library due again.
-    pub(crate) fn stop(&self, library: NodeId) -> Stopping<'_> {
-        lock(&self.stopping).insert(library);
+    /// the library due again; a listing that gives up records nothing. Stops of one library
+    /// are counted, so the syncs stay stopped until every holder has dropped its answer.
+    pub fn stop(&self, library: NodeId) -> Stopping<'_> {
+        let mut stopping = lock(&self.stopping);
+        let holders = stopping.entry(library).or_insert(0);
+        *holders = holders.saturating_add(1);
         Stopping {
             sources: self,
             library,
@@ -840,7 +843,7 @@ impl Sources {
 
     /// Whether `library` is being disconnected (see [`Sources::stop`]).
     pub(crate) fn is_stopping(&self, library: NodeId) -> bool {
-        lock(&self.stopping).contains(&library)
+        lock(&self.stopping).contains_key(&library)
     }
 
     /// Holds worker source starts until the returned guard is dropped.
@@ -913,14 +916,20 @@ impl Sources {
 }
 
 /// The syncs of a library stopped by [`Sources::stop`], until this is dropped.
-pub(crate) struct Stopping<'a> {
+pub struct Stopping<'a> {
     sources: &'a Sources,
     library: NodeId,
 }
 
 impl Drop for Stopping<'_> {
     fn drop(&mut self) {
-        lock(&self.sources.stopping).remove(&self.library);
+        let mut stopping = lock(&self.sources.stopping);
+        if let HashEntry::Occupied(mut holders) = stopping.entry(self.library) {
+            *holders.get_mut() = holders.get().saturating_sub(1);
+            if *holders.get() == 0 {
+                holders.remove();
+            }
+        }
     }
 }
 
@@ -1292,6 +1301,15 @@ async fn finish(
     generation: i64,
 ) -> Result<Option<SyncReport>, SyncError> {
     let library = config.library;
+    // Being disconnected (see [`Sources::stop`]): a sync that gave up, or failed meanwhile,
+    // records no failure, event or back-off; the disconnect removes the connection, or makes
+    // it due again itself if it fails.
+    if state.sources().is_stopping(library)
+        && let Err(Failure { error, .. }) = outcome
+    {
+        state.sources().forget_quiet(library);
+        return Err(error);
+    }
     let mut status = SourceStatus {
         last_checked_at: Some(now),
         ..before

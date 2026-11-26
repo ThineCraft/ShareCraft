@@ -822,16 +822,20 @@ async fn list_share_progress(
     let stat_fs = Arc::clone(&fs);
     let stat_approved = approved_path.clone();
     let stat_path = root_path.clone();
-    let stat_permit = acquire_permit(started, limits.max_time).await?;
-    let stat = wait_for(
-        started,
-        limits.max_time,
-        tokio::task::spawn_blocking(move || {
-            let _permit = stat_permit;
-            stat_fs.stat(&stat_approved, &stat_path)
-        }),
+    let stat_permit =
+        unless_stopped(acquire_permit(started, limits.max_time), &stop_asked).await??;
+    let stat = unless_stopped(
+        wait_for(
+            started,
+            limits.max_time,
+            tokio::task::spawn_blocking(move || {
+                let _permit = stat_permit;
+                stat_fs.stat(&stat_approved, &stat_path)
+            }),
+        ),
+        &stop_asked,
     )
-    .await?;
+    .await??;
     let stat = stat.map_err(|error| kind_of_failure(&error))?;
     if stat.kind != FsKind::Dir {
         return Err(ListError::NotAFolder);
@@ -856,7 +860,8 @@ async fn list_share_progress(
             let Some((path, relative, depth, root)) = queue.pop_front() else {
                 break;
             };
-            let permit = acquire_permit(started, limits.max_time).await?;
+            let permit =
+                unless_stopped(acquire_permit(started, limits.max_time), &stop_asked).await??;
             let turn_fs = Arc::clone(&fs);
             let turn_approved = approved_path.clone();
             let turn_budget = budget.clone();
@@ -1004,6 +1009,24 @@ async fn list_share_progress(
         temps,
         took: started.elapsed(),
     })
+}
+
+/// Waits for `future`, looking every [`STOP_POLL`] whether the listing was asked to stop; then
+/// [`ListError::Stopped`] (the future is dropped; a blocking call it started finishes on its
+/// own thread).
+async fn unless_stopped<F: std::future::Future>(
+    future: F,
+    stop_asked: &impl Fn() -> bool,
+) -> Result<F::Output, ListError> {
+    tokio::pin!(future);
+    loop {
+        if stop_asked() {
+            return Err(ListError::Stopped);
+        }
+        if let Ok(output) = tokio::time::timeout(STOP_POLL, &mut future).await {
+            return Ok(output);
+        }
+    }
 }
 
 async fn acquire_permit(
