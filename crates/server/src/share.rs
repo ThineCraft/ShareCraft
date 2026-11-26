@@ -242,6 +242,7 @@ pub struct Shares {
     cache_max_bytes_for_tests: Mutex<Option<u64>>,
     listing_progress: Mutex<HashMap<NodeId, Arc<AtomicUsize>>>,
     lookups: Arc<tokio::sync::Semaphore>,
+    listing_took_for_tests: Mutex<Option<Duration>>,
 }
 
 /// How many canonical-path lookups a connect may have in flight across the whole server. A
@@ -269,6 +270,7 @@ impl Shares {
             cache_max_bytes_for_tests: Mutex::new(None),
             listing_progress: Mutex::new(HashMap::new()),
             lookups: Arc::new(tokio::sync::Semaphore::new(SHARE_LOOKUPS)),
+            listing_took_for_tests: Mutex::new(None),
         }
     }
 
@@ -412,6 +414,24 @@ impl Shares {
             .cache_max_bytes_for_tests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bytes);
+    }
+
+    /// Makes every later share listing report that it took `took`, whatever it really took, so
+    /// tests can drive the spacing after a slow listing without waiting that long.
+    #[doc(hidden)]
+    pub fn set_listing_took_for_tests(&self, took: Duration) {
+        *self
+            .listing_took_for_tests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(took);
+    }
+
+    /// How long a listing that really took `took` is taken to have lasted.
+    fn listing_took(&self, took: Duration) -> Duration {
+        self.listing_took_for_tests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or(took)
     }
 
     /// Number of node-flight entries. Used to prove cancellation cleanup in integration tests.
@@ -603,7 +623,7 @@ impl StorageSource for ShareSource {
             etag: None,
             credit: None,
             hidden: listed.hidden,
-            took: listed.took,
+            took: state.shares().listing_took(listed.took),
             seen: (),
         })))
     }

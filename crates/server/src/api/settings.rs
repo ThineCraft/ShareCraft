@@ -172,7 +172,8 @@ pub(crate) async fn change_shares(
         .into_iter()
         .filter_map(|(key, value)| value.map(|v| (key, v)))
         .collect();
-    let mut roots_turn = if changes.iter().any(|(key, _)| *key == SHARE_ROOTS) {
+    let roots_changed = changes.iter().any(|(key, _)| *key == SHARE_ROOTS);
+    let mut roots_turn = if roots_changed {
         Some(
             state
                 .db()
@@ -189,6 +190,19 @@ pub(crate) async fn change_shares(
         .set_settings(signed.session.user.id, changes)
         .await?;
     drop(roots_turn.take());
+    if roots_changed {
+        // A share stopped because its folder was not approved is not retried on its own; the
+        // roots changed, so each is made due and woken. Nothing about it fails this request.
+        match state.db().requeue_stopped_shares().await {
+            Ok(libraries) => {
+                for library in libraries {
+                    state.sources().forget_failures(library);
+                    state.sources().wake(library);
+                }
+            }
+            Err(e) => eprintln!("sharecraft-server: cannot wake stopped shares: {e}"),
+        }
+    }
     Ok(Json(shares_out(&state).await?))
 }
 
