@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Row and column compaction: options</title>
+<style>
+:root{--bg:#fff;--fg:#1d1d1f;--muted:#5f6368;--line:#d9dce1;--band:#f3f5f8;--head:#e8ecf2;--accent:#0b57d0}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e8eaed;--muted:#a0a6ad;--line:#33373d;--band:#1f2228;--head:#262a31;--accent:#8ab4f8}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.6rem;margin:0 0 4px}h2{font-size:1.2rem;margin:32px 0 8px}
+p.sub{color:var(--muted);margin:0 0 16px}
+.scroll{position:relative;overflow-x:auto;margin:0 0 16px}
+table{border-collapse:collapse;width:100%;min-width:520px}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{background:var(--head)}
+tbody tr:nth-child(even){background:var(--band)}
+ul,ol{padding-left:1.3em}
+li:nth-child(even){background:var(--band)}
+code{font-size:.92em}
+</style>
+</head>
+<body>
+<main>
+<h1>Row and column compaction</h1>
+<p class="sub">Options for the owner, 26 November 2026. The last G5 follow-up that stops editing together from being switched on in production. Nothing below is built yet.</p>
+
+<h2>The problem</h2>
+<p>When people edit a spreadsheet together, every row and column has an identity, so that “Bob edits row 12” still means the right row after Ann inserts a row above it. Identities are kept in runs, and a deleted row keeps its run forever (as a tombstone), so a later change that names it can say “someone deleted that row” instead of landing in the wrong place.</p>
+<p>Tombstones are never removed, and each sheet axis allows at most 65,536 runs. A checkpoint carries the runs into the next session, tombstones included. Over months of editing an axis can reach the limit, and from then on every row and column insert, delete or move on that sheet is refused, in every session, for good. A hostile editor could reach it on purpose in one session.</p>
+<p>The code already says the way out (<code>collab-live/src/ids.rs</code>): tombstones below a position that every participant has passed can be dropped, because no change still to come can name them. The difficulty is that every editor must drop exactly the same ones at exactly the same point, or their tables differ and the next change can be accepted by one and refused by another.</p>
+
+<h2>What landed today (branch g5-prod-followups)</h2>
+<div class="scroll"><table>
+<thead><tr><th>Commit</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td>36a484b</td><td>I1: a checkpoint keeps the stamp of its position, so the 30-day sweep no longer leaves a document that cannot be opened together. Migration 0028 fills in existing checkpoints.</td></tr>
+<tr><td>e97d3ef</td><td>xtask writes the live protocol number from the protocol crate instead of a hard-coded 1.</td></tr>
+<tr><td>c33165e</td><td>Production mode refuses to start with <code>SHARECRAFT_LIVE_EDITORS</code> set while compaction is missing, and says why. melli does not set it, so melli is unaffected.</td></tr>
+</tbody>
+</table></div>
+
+<h2>Options</h2>
+<div class="scroll"><table>
+<thead><tr><th></th><th>A. Compact when a new session starts</th><th>B. Compact in the log, during a session</th></tr></thead>
+<tbody>
+<tr><td>How</td><td>When a session starts from a checkpoint of an earlier session, every editor drops that checkpoint’s tombstones as it loads it. Everyone in the new session starts from the same compacted table, and the session’s own checkpoints carry it on.</td><td>When every participant has passed a position, the server puts a “compact through here” record in the change log. Every editor drops the tombstones below it when it applies that record, at the same point in the order.</td></tr>
+<tr><td>Fixes growth across sessions (the real-life case)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Fixes one very long or hostile session</td><td>No: one session can still reach the limit, but only that session, and the next one starts clean.</td><td>Yes</td></tr>
+<tr><td>Changes</td><td>collab-live: a compaction function and its tests. GridCraft fork: compact on load when the base is from an earlier session. Server: tell the editor whether the base is from an earlier session. Re-pin and rebuild GridCraft.</td><td>As A, plus a new log record (live protocol 2), server logic to decide when everyone has passed a position, and handling for people who join or return around that point.</td></tr>
+<tr><td>Size</td><td>About 1 day, including the real-browser check.</td><td>About 3 days, including the real-browser check.</td></tr>
+<tr><td>Risk</td><td>Low. One thing to confirm: a person returning from the earlier session must not replay a change that names a dropped row (returning people’s unsent changes become an archived copy today, so this should hold).</td><td>Higher: a new kind of ordered record, protocol version bump, more join and return cases to test.</td></tr>
+</tbody>
+</table></div>
+
+<h2>Recommendation</h2>
+<p>A first. It removes the permanent build-up that real use would hit, for about a third of the work. B can follow later if one session ever needs it. With A in, the production guard’s list is empty, so production mode can switch editing together on.</p>
+<p>The remaining minors from the G5 ledger (a heartbeat during a reload, test gaps for the joiner wait list, presence flooding by a hostile server, and similar) don’t block production. I suggest fixing them after compaction, as one batch.</p>
+</main>
+</body>
+</html>
