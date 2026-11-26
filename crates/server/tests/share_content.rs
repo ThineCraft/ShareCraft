@@ -927,3 +927,55 @@ async fn materialise_is_none_for_an_ordinary_file_and_for_a_github_file() {
 
     assert!(materialise(&state, github_node).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn a_stuck_read_does_not_hold_up_later_requests_for_the_same_file() {
+    let env = Env::new(&[("stuck.txt", b"content", 1)]).await;
+    env.state
+        .shares()
+        .set_operation_timeout(Duration::from_millis(30));
+    // The operating-system read stays stuck (keeping the file's single flight) for 3 seconds.
+    env.fake
+        .slow_read("stuck.txt", Duration::from_millis(3_000));
+    let node = env.item("stuck.txt").await.node;
+    assert!(matches!(
+        materialise(&env.state, node).await,
+        Err(ExternalError::Offline)
+    ));
+    let started = Instant::now();
+
+    let again = materialise(&env.state, node).await;
+
+    assert!(matches!(again, Err(ExternalError::Offline)));
+    assert!(
+        started.elapsed() < Duration::from_millis(1_000),
+        "waited {:?} behind the stuck read",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_request_behind_a_slow_first_read_gives_up_at_the_read_wait() {
+    let env = Env::new(&[("slow.txt", b"content", 1)]).await;
+    env.state
+        .shares()
+        .set_operation_timeout(Duration::from_millis(10_000));
+    env.state.shares().set_read_wait(Duration::from_millis(200));
+    env.fake.slow_open("slow.txt", Duration::from_millis(3_000));
+    let node = env.item("slow.txt").await.node;
+    let state = env.state.clone();
+    let first = tokio::spawn(async move { materialise(&state, node).await });
+    wait_until(|| env.fake.open_started() == 1).await;
+    let started = Instant::now();
+
+    let second = materialise(&env.state, node).await;
+
+    assert!(matches!(second, Err(ExternalError::Busy)));
+    assert!(
+        started.elapsed() < Duration::from_millis(1_500),
+        "waited {:?} for the first read",
+        started.elapsed()
+    );
+    let first = first.await.unwrap().unwrap().unwrap();
+    assert_eq!(env.bytes(&first), b"content");
+}

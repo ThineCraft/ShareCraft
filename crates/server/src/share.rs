@@ -386,6 +386,16 @@ impl Shares {
         flight
     }
 
+    /// [`Shares::flight`], waited for no longer than a read turn is; `None` if it did not come
+    /// free in time (a read of the node, perhaps stuck in the operating system, holds it).
+    pub(crate) async fn flight_within(&self, node: NodeId) -> Option<Flight> {
+        let wait = *self
+            .read_wait
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tokio::time::timeout(wait, self.flight(node)).await.ok()
+    }
+
     pub(crate) async fn read_turn(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let wait = *self
             .read_wait
