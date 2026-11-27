@@ -71,9 +71,13 @@ mod wnet {
     use super::{LoginFailure, ShareConnector, WNetConnector, failure_of};
     use crate::secrets::Secret;
 
-    /// `text` as UTF-16 ending in a NUL.
+    /// `text` as UTF-16 ending in a NUL, allocated once at its final size so no partial copy
+    /// (of a password) is left behind by a reallocation.
     fn wide(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain(std::iter::once(0)).collect()
+        let mut wide = Vec::with_capacity(text.encode_utf16().count().saturating_add(1));
+        wide.extend(text.encode_utf16());
+        wide.push(0);
+        wide
     }
 
     /// Overwrites `buffer` with zeros in a way the optimiser keeps.
@@ -229,6 +233,12 @@ impl ShareLogins {
             LoginFailure::Other(0)
         })?;
         let Some(login) = login else {
+            // The login was removed (perhaps by another front end, or by a removal that raced
+            // a sign-in): nothing may go on using it.
+            if self.holds_server(&server) {
+                let _turn = self.turn.lock().await;
+                self.forget_server(&server);
+            }
             return Ok(());
         };
         if self.connected().get(&remote) == Some(&login.password_secret) {
@@ -236,8 +246,7 @@ impl ShareLogins {
         }
         let _turn = self.turn.lock().await;
         // Another read may have signed in while this one waited.
-        let old = self.connected().get(&remote).copied();
-        if old == Some(login.password_secret) {
+        if self.connected().get(&remote) == Some(&login.password_secret) {
             return Ok(());
         }
         let context = format!("share-login:{server}");
@@ -260,12 +269,16 @@ impl ShareLogins {
                 return Err(LoginFailure::Other(0));
             }
         };
-        let connector = self.connector();
-        if old.is_some() {
-            // Made with a login since replaced: Windows refuses a second login to one server.
-            self.connected().remove(&remote);
-            connector.disconnect(&remote);
+        // A connection to any share of the server made with a login since replaced (here or by
+        // another front end) is dropped first: Windows refuses a second login to one server.
+        let stale = self
+            .connected()
+            .iter()
+            .any(|(held, secret)| on_server(held, &server) && *secret != login.password_secret);
+        if stale {
+            self.forget_server(&server);
         }
+        let connector = self.connector();
         connect(
             connector,
             remote.clone(),
@@ -284,6 +297,13 @@ impl ShareLogins {
         let remote = remote.to_lowercase();
         self.connected().remove(&remote);
         self.connector().disconnect(&remote);
+    }
+
+    /// Whether a connection to a share of `server` is recorded.
+    fn holds_server(&self, server: &str) -> bool {
+        self.connected()
+            .keys()
+            .any(|remote| on_server(remote, server))
     }
 
     /// Drops every connection this process made to a share of `server`.
@@ -328,8 +348,18 @@ impl ShareLogins {
     }
 }
 
+/// What became of a sign-in on its blocking thread, as seen by the thread and by its waiter.
+#[derive(Default)]
+struct Outcome {
+    /// The waiter gave up: a sign-in that succeeds after this must be undone.
+    abandoned: bool,
+    /// The sign-in succeeded.
+    connected: bool,
+}
+
 /// Signs in on a blocking thread, waiting no longer than `wait`. A sign-in still running then
-/// finishes on its own thread; it counts as unreachable here.
+/// counts as unreachable here, and is undone (disconnected) if it succeeds later, so no
+/// connection is left that nobody recorded.
 ///
 /// # Errors
 /// Why signing in failed.
@@ -340,12 +370,39 @@ pub(crate) async fn connect(
     password: Secret,
     wait: std::time::Duration,
 ) -> Result<(), LoginFailure> {
-    let task =
-        tokio::task::spawn_blocking(move || connector.connect(&remote, &username, &password));
+    let outcome = Arc::new(Mutex::new(Outcome::default()));
+    let seen = Arc::clone(&outcome);
+    let undo = Arc::clone(&connector);
+    let target = remote.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let answer = connector.connect(&remote, &username, &password);
+        let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if answer.is_ok() {
+            if seen.abandoned {
+                connector.disconnect(&remote);
+            } else {
+                seen.connected = true;
+            }
+        }
+        answer
+    });
     match tokio::time::timeout(wait, task).await {
         Ok(Ok(answer)) => answer,
         Ok(Err(_)) => Err(LoginFailure::Other(0)),
-        Err(_) => Err(LoginFailure::Unreachable),
+        Err(_) => {
+            let connected = {
+                let mut seen = outcome
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                seen.abandoned = true;
+                seen.connected
+            };
+            // Finished just as the wait ran out: undone here instead.
+            if connected {
+                undo.disconnect(&target);
+            }
+            Err(LoginFailure::Unreachable)
+        }
     }
 }
 

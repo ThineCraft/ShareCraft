@@ -475,7 +475,10 @@ pub(crate) async fn set_share_login(
     let secret = match stored {
         Ok(secret) => secret,
         Err(e) => {
+            // The new login was not stored: the connection made with it is not recorded
+            // anywhere, so it is undone here or later sign-ins would meet it (error 1219).
             state.share_logins().forget_server(&server);
+            state.share_logins().connector().disconnect(&remote);
             return Err(e.into());
         }
     };

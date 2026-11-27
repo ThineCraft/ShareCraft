@@ -13,6 +13,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use collab_core::ids::NodeId;
 use common::fake_connector::FakeConnector;
@@ -22,11 +23,16 @@ use records::{NewSource, SHARE_ROOTS, SecretId, SharePath, SourceKind, SourceMod
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
-use server::share_login::LoginFailure;
+use server::share_login::{LoginFailure, ShareLogins};
 use server::source_sync::{SyncError, sync_once};
 use time::OffsetDateTime;
 
 const PASSWORD: &str = "Tr1cky-pass-word";
+/// The password after a change on the file server.
+const CHANGED_PASSWORD: &str = "the-new-pass-word";
+/// A new password the file server refuses.
+#[cfg_attr(not(windows), allow(dead_code))]
+const REFUSED_PASSWORD: &str = "new-pass-word";
 const ROOT: &str = r"\\nas\docs";
 const OTHER_ROOT: &str = r"\\nas\other";
 const ELSEWHERE_ROOT: &str = r"\\files\team";
@@ -212,13 +218,13 @@ async fn refused_login_is_not_stored() {
             .call(
                 Method::PUT,
                 "/api/settings/shares/logins/nas",
-                Some(json!({"username": "bob", "password": "new-pass-word"})),
+                Some(json!({"username": "bob", "password": REFUSED_PASSWORD})),
             )
             .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
         assert_eq!(error_of(&text), "login_refused");
         assert!(text.contains(r"\\nas"), "{text}");
-        assert!(!text.contains("bob") && !text.contains("new-pass-word"));
+        assert!(!text.contains("bob") && !text.contains(REFUSED_PASSWORD));
         // Nothing was stored: the old login stays as it was.
         let after = db.share_login("nas").await.unwrap().unwrap();
         assert_eq!(after, before);
@@ -318,10 +324,10 @@ async fn new_login_after_password_change_heals_without_restart() {
     // A login stored again (another front end, or the settings page) is used at the next
     // read, without a restart: the secret it uses is new.
     env.connector.always(None);
-    env.seed("nas", "ann", "the-new-pass-word").await;
+    env.seed("nas", "ann", CHANGED_PASSWORD).await;
     env.ensure(ROOT).await.unwrap();
     let last = env.connector.connects().pop().unwrap();
-    assert!(last.password.expose() == "the-new-pass-word");
+    assert!(last.password.expose() == CHANGED_PASSWORD);
 
     #[cfg(windows)]
     {
@@ -476,6 +482,126 @@ async fn secret_store_failure_is_a_plain_error_and_a_retry() {
         env.ensure(ROOT).await,
         Err(LoginFailure::SecretStoreUnavailable)
     );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn store_failure_after_good_sign_in_disconnects_the_remote() {
+    // The secret store cannot be reached, so the new login cannot be stored after the file
+    // server accepted it.
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("provider.token");
+    std::fs::write(&token, "provider-bearer-token\n").unwrap();
+    let settings = server::secret_provider::SecretProviderSettings::from_values(
+        Some("http://127.0.0.1:9"),
+        Some(token.to_str().unwrap()),
+    )
+    .unwrap()
+    .expect("settings");
+    let env = Env::with(move |config| config.secret_provider = Some(settings)).await;
+    let (status, text) = env
+        .call(
+            Method::PUT,
+            "/api/settings/shares/logins/nas",
+            Some(json!({"username": "ann", "password": PASSWORD})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert_eq!(error_of(&text), "secret_store_unavailable");
+    assert_eq!(env.connector.remotes(), vec![ROOT.to_owned()]);
+    assert!(env.connector.disconnects().contains(&ROOT.to_owned()));
+    assert!(env.connector.live().is_empty());
+    assert!(
+        env.server
+            .records_db()
+            .share_logins()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn timed_out_sign_in_is_undone_when_it_finishes() {
+    let env = Env::new().await;
+    env.seed("nas", "ann", PASSWORD).await;
+    env.state
+        .shares()
+        .set_operation_timeout(Duration::from_millis(100));
+    env.connector.delay(Duration::from_millis(400));
+    assert_eq!(env.ensure(ROOT).await, Err(LoginFailure::Unreachable));
+    // The sign-in finishes on its own thread after the wait ran out, and is undone then.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while env.connector.disconnects().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "never undone");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(env.connector.disconnects(), vec![ROOT.to_owned()]);
+    assert!(env.connector.live().is_empty());
+    // Nothing was remembered: the next read signs in again.
+    env.connector.delay(Duration::ZERO);
+    env.ensure(ROOT).await.unwrap();
+    assert_eq!(env.connector.connects().len(), 2);
+}
+
+#[tokio::test]
+async fn login_replaced_elsewhere_signs_out_of_every_remote_of_server() {
+    let env = Env::new().await;
+    env.seed("nas", "ann", PASSWORD).await;
+    // Front end A (the server's own state) reads two shares of one server.
+    env.ensure(ROOT).await.unwrap();
+    env.ensure(OTHER_ROOT).await.unwrap();
+    assert_eq!(
+        env.connector.live(),
+        vec![ROOT.to_owned(), OTHER_ROOT.to_owned()]
+    );
+
+    // Front end B, over the same database, replaces the login and reads with it.
+    let other_connector = FakeConnector::new();
+    let other = ShareLogins::default();
+    other.set_connector_for_tests(Arc::new(other_connector.clone()));
+    env.seed("nas", "bob", CHANGED_PASSWORD).await;
+    other
+        .ensure(&env.state, &SharePath::parse(ROOT).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(other_connector.connects()[0].username, "bob");
+
+    // A's next read of either share drops both old connections first: no conflict.
+    env.ensure(OTHER_ROOT).await.unwrap();
+    let mut gone = env.connector.disconnects();
+    gone.sort();
+    assert_eq!(gone, vec![ROOT.to_owned(), OTHER_ROOT.to_owned()]);
+    assert_eq!(env.connector.live(), vec![OTHER_ROOT.to_owned()]);
+    let last = env.connector.connects().pop().unwrap();
+    assert_eq!(last.username, "bob");
+    // A first read of the other share uses the new login too.
+    env.ensure(ROOT).await.unwrap();
+    assert_eq!(
+        env.connector.live(),
+        vec![ROOT.to_owned(), OTHER_ROOT.to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn removed_login_signs_out_at_the_next_read() {
+    let env = Env::new().await;
+    env.seed("nas", "ann", PASSWORD).await;
+    env.ensure(ROOT).await.unwrap();
+    env.ensure(OTHER_ROOT).await.unwrap();
+    // Removed without this front end signing out (another front end, or a removal that raced
+    // a sign-in).
+    env.server
+        .records_db()
+        .remove_share_login("nas")
+        .await
+        .unwrap();
+    env.ensure(ROOT).await.unwrap();
+    assert!(env.connector.live().is_empty());
+    let mut gone = env.connector.disconnects();
+    gone.sort();
+    assert_eq!(gone, vec![ROOT.to_owned(), OTHER_ROOT.to_owned()]);
+    assert_eq!(env.connector.connects().len(), 2);
 }
 
 #[cfg(windows)]
