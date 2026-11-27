@@ -335,7 +335,8 @@ async fn failed_put_is_unavailable_and_leaves_only_a_forgotten_row() {
     let result = store.put(&db.db, VALUE, b"ctx").await;
     assert!(
         matches!(&result, Err(SecretError::Unavailable(s)) if s == "The secret store could not be reached."),
-        "{result:?}"
+        "the put was not unavailable (ok: {})",
+        result.is_ok()
     );
     // Only a forgotten row is left: the value may have been stored before the answer was lost.
     assert_eq!(count_secrets(&db).await, 1);
@@ -706,13 +707,19 @@ async fn no_value_in_debug_or_errors() {
     let put = wrong.put(&provider_name(id), VALUE).await;
     let get = wrong.get(&provider_name(id)).await;
     let delete = wrong.delete(&provider_name(id)).await;
-    for result in [&put, &delete] {
+    // Failure messages name what was answered, never the answer itself (it could hold a value).
+    for (what, result) in [("put", &put), ("delete", &delete)] {
         assert!(
             matches!(result, Err(SecretError::Unavailable(_))),
-            "{result:?}"
+            "the {what} was not unavailable (ok: {})",
+            result.is_ok()
         );
     }
-    assert!(matches!(get, Err(SecretError::Unavailable(_))), "{get:?}");
+    assert!(
+        matches!(get, Err(SecretError::Unavailable(_))),
+        "the get was not unavailable (ok: {})",
+        get.is_ok()
+    );
     shown.push(format!("{put:?} {get:?} {delete:?}"));
     for e in [put.unwrap_err(), get.unwrap_err(), delete.unwrap_err()] {
         shown.push(e.to_string());
@@ -726,12 +733,13 @@ async fn no_value_in_debug_or_errors() {
     let down = reader.put(&db.db, VALUE, b"ctx").await.unwrap_err();
     shown.push(format!("{down:?} {down}"));
 
-    for text in &shown {
-        assert!(!text.contains(value), "a value is shown: {text}");
-        assert!(!text.contains(TOKEN), "the token is shown: {text}");
+    // A failure names the text by its place in `shown`, never prints it: it would hold the value.
+    for (index, text) in shown.iter().enumerate() {
+        assert!(!text.contains(value), "a value is shown in text {index}");
+        assert!(!text.contains(TOKEN), "the token is shown in text {index}");
         assert!(
             !text.contains("wrong-token-0000"),
-            "a token is shown: {text}"
+            "a token is shown in text {index}"
         );
         assert!(
             !text.contains(&STANDARD.encode(VALUE)),
@@ -790,4 +798,63 @@ async fn sweep_stops_at_the_first_failed_delete() {
     assert_eq!(fake.requests("DELETE"), 1, "one failure ends the sweep");
     fake.set_delete_down(false);
     assert_eq!(store.sweep_forgotten(&db.db).await, 3);
+}
+
+/// Set in the child process [`provider_requests_never_go_through_a_proxy`] starts, so that
+/// [`proxy_child`] runs there and nowhere else.
+const PROXY_CHILD: &str = "SHARECRAFT_SECRET_PROVIDER_PROXY_CHILD";
+
+/// A proxy set for the process (`HTTP_PROXY` and the like) never sees a request to the provider:
+/// each carries the bearer token, and over a loopback `http://` address the values in clear.
+/// Setting those variables in this process would race the other tests here, so a child process
+/// runs [`proxy_child`] with them pointing at an address where nothing listens. A request that
+/// went through the proxy would fail there.
+#[test]
+fn provider_requests_never_go_through_a_proxy() {
+    let dead = "http://127.0.0.1:9";
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["proxy_child", "--exact", "--ignored", "--test-threads=1"])
+        .env(PROXY_CHILD, "1");
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        child.env(name, dead);
+    }
+    child.env_remove("NO_PROXY").env_remove("no_proxy");
+    let output = child.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The child prints no value or token: its failure messages are labels.
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the child failed: {stdout}"
+    );
+}
+
+/// Run by [`provider_requests_never_go_through_a_proxy`] with a dead proxy set; does nothing
+/// anywhere else.
+#[tokio::test]
+#[ignore = "run in a child process by provider_requests_never_go_through_a_proxy"]
+async fn proxy_child() {
+    if std::env::var_os(PROXY_CHILD).is_none() {
+        return;
+    }
+    let fake = FakeProvider::start().await;
+    let provider = fake.provider();
+    let name = "sharecraft-0123456789abcdef0123456789abcdef";
+    let put = provider.put(name, VALUE).await;
+    assert!(put.is_ok(), "the put did not reach the provider");
+    let got = provider.get(name).await;
+    assert!(
+        matches!(&got, Ok(Some(value)) if value == VALUE),
+        "the get did not reach the provider (ok: {})",
+        got.is_ok()
+    );
+    assert_eq!(fake.requests("PUT"), 1);
+    assert_eq!(fake.requests("GET"), 1);
 }

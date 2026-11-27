@@ -207,11 +207,14 @@ impl SecretProvider {
     /// # Errors
     /// A sentence when the HTTPS client cannot be set up.
     pub fn new(settings: &SecretProviderSettings) -> Result<Self, String> {
-        // Redirects are not followed: the token must go only where it was set up to go.
+        // Redirects are not followed and no proxy is used (not even one set for the process by
+        // `HTTP_PROXY` and the like): the token, and over a loopback `http://` address the
+        // values in clear, must go only where the administrator set them up to go.
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .connect_timeout(TIMEOUT)
             .redirect(Policy::none())
+            .no_proxy()
             .build()
             .map_err(|_| "the secret provider's HTTPS client could not be set up".to_owned())?;
         Ok(SecretProvider {
