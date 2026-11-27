@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
+import { BLEED_DEFAULT } from './bleed.js';
 import {
   checkTheme,
   contrast,
@@ -485,6 +486,10 @@ test('look_input_sends_only_what_the_layout_uses', () => {
   assert.deepEqual(wide.header.image, { keep: SHA_A });
   assert.equal(wide.header.background, 'image');
   assert.equal(wide.header.align, 'right');
+  // With the image band goes its bleed, at the defaults unless changed.
+  assert.deepEqual(wide.header.bleed, BLEED_DEFAULT);
+  draft.header.bleed = { ...BLEED_DEFAULT, enabled: false, distance: 999, tint_dark: '#ABCDEF' };
+  assert.deepEqual(lookInput(draft, { current: STORED, themes: THEMES }).header.bleed, { ...BLEED_DEFAULT, enabled: false, distance: 400, tint_dark: '#abcdef' });
   assert.deepEqual(
     wide.footer.groups.map((g) => g.heading),
     ['Kept out', 'Second'],

@@ -114,6 +114,34 @@
       <small id="logo-alt-note" class="meta">Read out in place of the logo. Leave empty to use the site's name.</small>
      </div>
      <label class="check"><input type="checkbox" id="hide-title"> Hide the site's name beside the logo (needs a logo)</label>
+     <div id="bleed-part">
+      <h3 id="bleed-label">Banner bleed</h3>
+      <p class="meta" id="bleed-note">The banner picture shows through, blurred, behind the page around and below the banner. Pages show it fainter wherever it would make text hard to read.</p>
+      <label class="check"><input type="checkbox" id="bleed-enabled" aria-describedby="bleed-note"> Let the banner picture bleed past the banner</label>
+      <div id="bleed-fields" class="bleed-fields">
+       <div class="field">
+        <label for="bleed-distance">Distance</label>
+        <div class="range-row"><input type="range" id="bleed-distance" min="0" max="400" step="8"><output id="bleed-distance-out" for="bleed-distance"></output></div>
+       </div>
+       <div class="field">
+        <label for="bleed-blur">Blur</label>
+        <div class="range-row"><input type="range" id="bleed-blur" min="0" max="96" step="4"><output id="bleed-blur-out" for="bleed-blur"></output></div>
+       </div>
+       <div class="field">
+        <label for="bleed-transparency">Transparency</label>
+        <div class="range-row"><input type="range" id="bleed-transparency" min="0" max="100" step="5"><output id="bleed-transparency-out" for="bleed-transparency"></output></div>
+       </div>
+       <div class="field">
+        <label for="bleed-tint-light">Tint in light mode</label>
+        <div class="colour-row"><input type="color" id="bleed-tint-light"></div>
+       </div>
+       <div class="field">
+        <label for="bleed-tint-dark">Tint in dark mode</label>
+        <div class="colour-row"><input type="color" id="bleed-tint-dark"></div>
+       </div>
+       <button type="button" class="ghost small" id="bleed-reset">Reset the bleed</button>
+      </div>
+     </div>
     </div>
    </section>
 

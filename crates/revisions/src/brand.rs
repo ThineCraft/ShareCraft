@@ -1173,6 +1173,9 @@ pub struct Header {
     pub align: Align,
     /// Whether the site's name is left out because the logo says it; needs a logo.
     pub hide_title: bool,
+    /// How the banner picture bleeds past the banner; left out of the file at its defaults.
+    #[serde(default, skip_serializing_if = "Bleed::is_default")]
+    pub bleed: Bleed,
 }
 
 impl Default for Header {
@@ -1183,7 +1186,76 @@ impl Default for Header {
             image: None,
             align: Align::Left,
             hide_title: false,
+            bleed: Bleed::default(),
         }
+    }
+}
+
+/// The farthest a banner picture bleeds past the banner, in CSS pixels.
+pub const MAX_BLEED_DISTANCE: u16 = 400;
+/// The most a bleeding banner picture is blurred, in CSS pixels.
+pub const MAX_BLEED_BLUR: u16 = 96;
+
+/// How an image header's banner picture bleeds out past the banner: behind the page around and
+/// below it the same picture shows, blurred, partly transparent and washed with a tint, fading
+/// out over `distance`. Pages keep text readable by showing it fainter where the picture would
+/// take text below 4.5:1 (`web/bleed.js`), so these are upper bounds. Only a header with an
+/// image background bleeds. Each field left out takes its default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Bleed {
+    /// Whether the picture bleeds at all.
+    pub enabled: bool,
+    /// How far past the banner it reaches before it has faded out: 0 to
+    /// [`MAX_BLEED_DISTANCE`] pixels.
+    pub distance: u16,
+    /// How much it is blurred: 0 to [`MAX_BLEED_BLUR`] pixels.
+    pub blur: u16,
+    /// How see-through it is: 0 to 100 percent (100 shows nothing).
+    pub transparency: u8,
+    /// The colour it is washed with in light mode.
+    pub tint_light: Colour,
+    /// The colour it is washed with in dark mode.
+    pub tint_dark: Colour,
+}
+
+impl Default for Bleed {
+    fn default() -> Bleed {
+        Bleed {
+            enabled: true,
+            distance: 240,
+            blur: 48,
+            transparency: 30,
+            tint_light: Colour::rgb(0xff, 0xff, 0xff),
+            tint_dark: Colour::rgb(0x00, 0x00, 0x00),
+        }
+    }
+}
+
+impl Bleed {
+    /// Whether this is the default, which a record leaves out of its file.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Bleed::default()
+    }
+
+    /// Why it cannot be stored, if so: a distance, blur or transparency out of range.
+    #[must_use]
+    pub fn problem(&self) -> Option<String> {
+        if self.distance > MAX_BLEED_DISTANCE {
+            return Some(format!(
+                "a banner bleeds at most {MAX_BLEED_DISTANCE} pixels"
+            ));
+        }
+        if self.blur > MAX_BLEED_BLUR {
+            return Some(format!(
+                "a bleeding banner is blurred at most {MAX_BLEED_BLUR} pixels"
+            ));
+        }
+        if self.transparency > 100 {
+            return Some("transparency is 0 to 100 percent".to_owned());
+        }
+        None
     }
 }
 
@@ -1417,7 +1489,7 @@ impl Look {
         if h.hide_title && self.logo.is_none() {
             return Some("hiding the title needs a logo".to_owned());
         }
-        None
+        h.bleed.problem()
     }
 
     fn footer_problem(&self) -> Option<String> {
@@ -1520,6 +1592,9 @@ pub struct TemplateHeader {
     pub align: Align,
     /// Whether the site's name is left out because the logo says it.
     pub hide_title: bool,
+    /// How the banner picture bleeds past the banner.
+    #[serde(default, skip_serializing_if = "Bleed::is_default")]
+    pub bleed: Bleed,
 }
 
 /// A [`Footer`] whose logo is a reference.
@@ -1648,6 +1723,7 @@ impl TemplateLook {
                 image: image(&self.header.image),
                 align: self.header.align,
                 hide_title: self.header.hide_title,
+                bleed: self.header.bleed,
             },
             navigation: self.navigation,
             footer: Footer {
@@ -2390,6 +2466,7 @@ mod tests {
             image: Some(image(MAX_BACKGROUND_BYTES)),
             align: Align::Centre,
             hide_title: true,
+            bleed: Bleed::default(),
         };
         assert_eq!(extended.problem("Site"), None);
         // Footer.
@@ -2630,6 +2707,7 @@ mod tests {
             image: None,
             align: Align::Centre,
             hide_title: true,
+            bleed: Bleed::default(),
         };
         look.navigation = Navigation::Vertical;
         look.footer = Footer {
@@ -3718,5 +3796,51 @@ mod tests {
         let mut bad = look;
         bad.from = "javascript:1".into();
         assert!(bad.problem().is_some());
+    }
+
+    #[test]
+    fn bleed_defaults_stay_out_of_the_file_and_limits_hold() {
+        // A header without a bleed reads the defaults, and writes none back.
+        let header: Header = serde_json::from_value(
+            json!({"layout": "extended", "background": "none", "align": "left", "hide_title": false}),
+        )
+        .unwrap();
+        assert_eq!(header.bleed, Bleed::default());
+        assert!(
+            serde_json::to_value(&header)
+                .unwrap()
+                .get("bleed")
+                .is_none()
+        );
+        // A bleed given in part takes the defaults for the rest; one changed is written.
+        let mut header: Header = serde_json::from_value(json!({
+            "layout": "extended", "background": "none", "align": "left", "hide_title": false,
+            "bleed": {"enabled": false, "tint_dark": "#ABCDEF"}
+        }))
+        .unwrap();
+        assert!(!header.bleed.enabled);
+        assert_eq!(header.bleed.distance, Bleed::default().distance);
+        assert_eq!(
+            serde_json::to_value(&header).unwrap()["bleed"]["tint_dark"],
+            "#abcdef"
+        );
+        assert!(serde_json::from_value::<Bleed>(json!({"glow": 1})).is_err());
+        // Limits.
+        let mut look = Look::default();
+        assert_eq!(look.problem("Site"), None);
+        header.bleed.distance = MAX_BLEED_DISTANCE;
+        header.bleed.blur = MAX_BLEED_BLUR;
+        header.bleed.transparency = 100;
+        look.header = header.clone();
+        assert_eq!(look.problem("Site"), None);
+        for change in [
+            |b: &mut Bleed| b.distance = MAX_BLEED_DISTANCE + 1,
+            |b: &mut Bleed| b.blur = MAX_BLEED_BLUR + 1,
+            |b: &mut Bleed| b.transparency = 101,
+        ] {
+            let mut bad = look.clone();
+            change(&mut bad.header.bleed);
+            assert!(bad.problem("Site").is_some());
+        }
     }
 }

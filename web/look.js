@@ -4,6 +4,8 @@
 //
 // A colour is `{r, g, b}` with whole numbers 0-255; `parseColour` makes one from `#rrggbb`.
 
+import { BLEED_DEFAULT, bleedOf } from './bleed.js';
+
 /** The page reference colours, from style.css. */
 export const LIGHT_PAPER = '#ffffff';
 export const LIGHT_BACKGROUND = '#f5f7f8';
@@ -507,7 +509,7 @@ export const DEFAULT_LOOK = Object.freeze({
   logo: null,
   thumbnail: null,
   logo_alt: '',
-  header: { layout: 'compact', background: 'none', image: null, align: 'left', hide_title: false },
+  header: { layout: 'compact', background: 'none', image: null, align: 'left', hide_title: false, bleed: BLEED_DEFAULT },
   navigation: 'horizontal',
   footer: { enabled: false, layout: 'simple', logo: null, name: '', background: 'none', groups: [] },
 });
@@ -571,6 +573,7 @@ export function draftFromLook(look) {
       image: draftImage(header.image),
       align: header.align,
       hide_title: Boolean(header.hide_title),
+      bleed: bleedOf(header.bleed),
     },
     navigation: base.navigation === 'vertical' ? 'vertical' : 'horizontal',
     footer: {
@@ -660,6 +663,7 @@ export function previewEffective(draft, siteName) {
       background: draft.header.background,
       align: draft.header.align,
       hide_title: draft.header.hide_title,
+      bleed: bleedOf(draft.header.bleed),
     },
     'image_url',
     draft.header.image,
@@ -744,6 +748,8 @@ export function lookInput(draft, { themes = [] } = {}) {
   slot(out, 'logo', draft.logo);
   slot(out, 'thumbnail', draft.thumbnail);
   slot(out.header, 'image', band);
+  // Only a banner picture bleeds, so the bleed goes with the image band.
+  if (out.header.image) out.header.bleed = bleedOf(draft.header.bleed);
   slot(out.footer, 'logo', draft.footer.logo);
   slot(out, 'icon', draft.icon);
   // The dropdown is the default; a mega menu is for navigation across the top only.
@@ -827,6 +833,13 @@ function imageChange(name, from, to) {
 /** The menu styles in words. */
 const MENU_WORDS = Object.freeze({ cascading: 'dropdown', mega: 'mega' });
 
+/** The banner bleed's change in words: turned on or off, or changed; null when it is the same. */
+function bleedChange(from, to) {
+  if (canonical(from) === canonical(to)) return null;
+  if (from.enabled !== to.enabled) return to.enabled ? 'bleed turned on' : 'bleed turned off';
+  return 'bleed changed';
+}
+
 /** A field that went from one choice to another in words, or null when it did not. */
 function choiceChange(name, from, to) {
   return from === to ? null : `${name} ${from} to ${to}`;
@@ -853,6 +866,7 @@ export function describeLookChange(before, after) {
     imageChange('image', a.header.image, b.header.image),
     choiceChange('alignment', a.header.align, b.header.align),
     a.header.hide_title !== b.header.hide_title ? (b.header.hide_title ? 'title hidden' : 'title shown') : null,
+    bleedChange(a.header.bleed, b.header.bleed),
   ].filter(Boolean);
   if (layout) header.unshift(header.length ? `layout ${layout}` : layout);
   if (header.length) parts.push(`Header: ${header.join(', ')}`);

@@ -440,7 +440,9 @@ async fn look_round_trip_and_defaults() {
     );
     assert_eq!(
         seen["header"],
-        json!({ "layout": "compact", "background": "none", "align": "left", "hide_title": false })
+        json!({ "layout": "compact", "background": "none", "align": "left", "hide_title": false,
+                "bleed": { "enabled": true, "distance": 240, "blur": 48, "transparency": 30,
+                           "tint_light": "#ffffff", "tint_dark": "#000000" } })
     );
     assert_eq!(seen["navigation"], "horizontal");
     assert_eq!(seen["footer"]["enabled"], false);
@@ -2351,4 +2353,87 @@ async fn rollback_to_before_the_first_change() {
         effective(&server, &root, &team).await["theme"],
         resolved("builtin:sharecraft")
     );
+}
+
+#[tokio::test]
+async fn banner_bleed_round_trips_and_is_checked() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let (team, _) = create_site(&server, &root, "Team").await;
+    let header = |bleed: Value| {
+        json!({ "layout": "compact", "background": "none", "align": "left",
+                "hide_title": false, "bleed": bleed })
+    };
+
+    // Settings are kept as sent (colours in lower case) and shown on the effective look.
+    let bleed = json!({ "enabled": false, "distance": 120, "blur": 16, "transparency": 80,
+                        "tint_light": "#F0E0D0", "tint_dark": "#102030" });
+    let answer = set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "header": header(bleed) }),
+    )
+    .await;
+    let kept = json!({ "enabled": false, "distance": 120, "blur": 16, "transparency": 80,
+                       "tint_light": "#f0e0d0", "tint_dark": "#102030" });
+    assert_eq!(answer["look"]["header"]["bleed"], kept);
+    assert_eq!(
+        effective(&server, &root, &team).await["header"]["bleed"],
+        kept
+    );
+    let text = String::from_utf8(record_bytes(&server, &team)).unwrap();
+    assert!(text.contains("\"bleed\""), "{text}");
+
+    // A bleed left out, or sent in part, takes the defaults; at the defaults the file leaves it out.
+    let answer = set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "header": header(json!({ "blur": 8 })) }),
+    )
+    .await;
+    assert_eq!(answer["look"]["header"]["bleed"]["blur"], 8);
+    assert_eq!(answer["look"]["header"]["bleed"]["distance"], 240);
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" } }),
+    )
+    .await;
+    let text = String::from_utf8(record_bytes(&server, &team)).unwrap();
+    assert!(!text.contains("\"bleed\""), "{text}");
+    assert_eq!(
+        effective(&server, &root, &team).await["header"]["bleed"]["enabled"],
+        true
+    );
+
+    // Out of range is refused.
+    for bleed in [
+        json!({ "distance": 401 }),
+        json!({ "blur": 97 }),
+        json!({ "transparency": 101 }),
+    ] {
+        let (status, body) = put_look(
+            &server,
+            &root,
+            &team,
+            json!({ "theme": { "from": "builtin:sharecraft" }, "header": header(bleed) }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], "invalid_look", "{body}");
+    }
+    // As are a colour that is not #rrggbb and a field it does not have.
+    for bleed in [json!({ "tint_dark": "navy" }), json!({ "glow": 3 })] {
+        let (status, body) = put_look(
+            &server,
+            &root,
+            &team,
+            json!({ "theme": { "from": "builtin:sharecraft" }, "header": header(bleed) }),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status} {body}");
+    }
 }
