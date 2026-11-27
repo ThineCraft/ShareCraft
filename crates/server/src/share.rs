@@ -782,7 +782,7 @@ fn login_failed(failure: crate::share_login::LoginFailure, root: &SharePath) -> 
     let server = root.server().unwrap_or_default();
     let message = crate::share_login::failure_sentence(failure, &server);
     match failure {
-        LoginFailure::Refused => SyncError::NotConnected(message),
+        LoginFailure::Refused | LoginFailure::SecretLost => SyncError::NotConnected(message),
         LoginFailure::Conflict
         | LoginFailure::Unreachable
         | LoginFailure::SecretStoreUnavailable

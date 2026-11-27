@@ -1195,9 +1195,10 @@ async fn login_refusal(
             state.shares().mark_offline(item.library, OFFLINE_FOR);
             cached_while_offline(state, item).await.map(Some)
         }
-        LoginFailure::Conflict | LoginFailure::SecretStoreUnavailable | LoginFailure::Other(_) => {
-            Err(ExternalError::Failed)
-        }
+        LoginFailure::Conflict
+        | LoginFailure::SecretStoreUnavailable
+        | LoginFailure::SecretLost
+        | LoginFailure::Other(_) => Err(ExternalError::Failed),
     }
 }
 

@@ -29,6 +29,8 @@ pub enum LoginFailure {
     /// The secret store (the key file or the outside provider) could not be reached, so the
     /// password could not be read. Worth trying again later.
     SecretStoreUnavailable,
+    /// The provider answers but no longer holds the stored password. It has to be set again.
+    SecretLost,
     /// Anything else, with the operating system's error code (0 when there is none).
     Other(u32),
 }
@@ -339,6 +341,7 @@ impl ShareLogins {
                 return Err(LoginFailure::Other(0));
             }
             Err(SecretError::Unavailable(_)) => return Err(LoginFailure::SecretStoreUnavailable),
+            Err(SecretError::Lost) => return Err(LoginFailure::SecretLost),
             Err(e) => {
                 eprintln!("sharecraft-server: the stored login of {server} did not open: {e}");
                 return Err(LoginFailure::Other(0));
@@ -572,6 +575,9 @@ pub fn failure_sentence(failure: LoginFailure, server: &str) -> String {
             format!(r"The file server \\{server} could not be reached, so nothing was changed.")
         }
         LoginFailure::SecretStoreUnavailable => "The secret store could not be reached.".to_owned(),
+        LoginFailure::SecretLost => format!(
+            r"The stored password for \\{server} is gone from the secret store. Set the login again."
+        ),
         LoginFailure::Other(_) => {
             format!(r"The stored login for \\{server} could not be used, so nothing was changed.")
         }

@@ -487,6 +487,59 @@ async fn secret_store_failure_is_a_plain_error_and_a_retry() {
     );
 }
 
+/// A provider that answers and holds nothing: every request is a 404.
+async fn empty_provider() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+    (addr, task)
+}
+
+#[tokio::test]
+async fn a_stored_password_the_provider_lost_says_so_and_stops() {
+    let (addr, task) = empty_provider().await;
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("provider.token");
+    std::fs::write(&token, "provider-bearer-token\n").unwrap();
+    let settings = server::secret_provider::SecretProviderSettings::from_values(
+        Some(&format!("http://{addr}")),
+        Some(token.to_str().unwrap()),
+    )
+    .unwrap()
+    .expect("settings");
+    let env = Env::with(move |config| config.secret_provider = Some(settings)).await;
+    let db = env.server.records_db();
+    let id = db.put_external_secret().await.unwrap();
+    db.set_share_login(env.admin.id, "nas", "ann", id)
+        .await
+        .unwrap();
+
+    let answer = env.sync().await;
+    assert!(
+        matches!(&answer, Err(SyncError::NotConnected(message)) if message == r"The stored password for \\nas is gone from the secret store. Set the login again."),
+        "{answer:?}"
+    );
+    assert!(env.connector.connects().is_empty());
+    assert_eq!(env.ensure(ROOT).await, Err(LoginFailure::SecretLost));
+    task.abort();
+}
+
 #[tokio::test]
 async fn store_failure_after_good_sign_in_disconnects_the_remote() {
     // The secret store cannot be reached, so the new login cannot be stored after the file
