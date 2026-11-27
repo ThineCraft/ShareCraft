@@ -277,6 +277,8 @@ pub fn template_look_of(look: &Look, org: &OrgBrand) -> (TemplateLook, Vec<Dropp
             image: header_image,
             align: look.header.align,
             hide_title: look.header.hide_title,
+            bleed: look.header.bleed,
+            frame: look.header.frame,
         },
         navigation: look.navigation,
         footer: TemplateFooter {
@@ -419,6 +421,8 @@ pub fn look_from_references(look: &TemplateLook, org: &OrgBrand) -> Look {
             image: image("header.image", look.header.image),
             align: look.header.align,
             hide_title: look.header.hide_title,
+            bleed: look.header.bleed,
+            frame: look.header.frame,
         },
         navigation: look.navigation,
         footer: Footer {

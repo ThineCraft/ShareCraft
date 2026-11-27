@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
+import { BLEED_DEFAULT } from './bleed.js';
 import {
   checkTheme,
   contrast,
@@ -485,6 +486,16 @@ test('look_input_sends_only_what_the_layout_uses', () => {
   assert.deepEqual(wide.header.image, { keep: SHA_A });
   assert.equal(wide.header.background, 'image');
   assert.equal(wide.header.align, 'right');
+  // With the image band goes its bleed, at the defaults unless changed.
+  assert.deepEqual(wide.header.bleed, BLEED_DEFAULT);
+  draft.header.bleed = { ...BLEED_DEFAULT, enabled: false, distance: 999, tint_dark: '#ABCDEF' };
+  assert.deepEqual(lookInput(draft, { current: STORED, themes: THEMES }).header.bleed, { ...BLEED_DEFAULT, enabled: false, distance: 400, tint_dark: '#abcdef' });
+  // The part of the image shown goes with the image band, in range; none until one is chosen.
+  assert.equal(wide.header.frame, undefined);
+  draft.header.frame = { x: 1200, y: 250, zoom: 150 };
+  assert.deepEqual(lookInput(draft, { current: STORED, themes: THEMES }).header.frame, { x: 1000, y: 250, zoom: 150 });
+  draft.header.layout = 'compact';
+  assert.equal(lookInput(draft, { current: STORED, themes: THEMES }).header.frame, undefined);
   assert.deepEqual(
     wide.footer.groups.map((g) => g.heading),
     ['Kept out', 'Second'],
@@ -863,4 +874,19 @@ test('copy_preview_shows_a_hub_members_own_look', () => {
   // Without `own` (a site not in a hub) the effective look is the site's own already.
   assert.deepEqual(ownLook({ theme: hubTheme, fonts: serif }), { theme: hubTheme, fonts: serif });
   assert.equal(ownLook(null), null);
+});
+
+test('header_frame_in_draft_history_and_rollback', async () => {
+  const { describeLookChange, draftFromLook, withoutSlots } = await import('./look.js');
+  const band = { layout: 'extended', background: 'image', image: { sha256: 'a'.repeat(64), name: 'Band.png' }, align: 'left', hide_title: false };
+  const before = { ...structuredClone(STORED), header: band };
+  const after = { ...structuredClone(STORED), header: { ...band, frame: { x: 200, y: 800, zoom: 130 } } };
+  assert.equal(draftFromLook(before).header.frame, null);
+  assert.deepEqual(draftFromLook(after).header.frame, { x: 200, y: 800, zoom: 130 });
+  assert.match(describeLookChange(before, after), /image moved/);
+  // The middle at its smallest is the same as no framing.
+  const middle = { ...structuredClone(STORED), header: { ...band, frame: { x: 500, y: 500, zoom: 100 } } };
+  assert.doesNotMatch(describeLookChange(before, middle), /image moved/);
+  // Without its image the framing goes too.
+  assert.equal(withoutSlots(draftFromLook(after), ['header.image']).header.frame, null);
 });

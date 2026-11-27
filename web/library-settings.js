@@ -27,7 +27,8 @@ import {
   siteChrome,
   typeListText,
 } from './common.js';
-import { applyHeroFrame, heroFrame, heroWindow, HERO_FRAME_DEFAULT, HERO_ZOOM_MAX, HERO_ZOOM_MIN, moveHeroFrame, sameFrame } from './hero.js';
+import { mountFramer } from './framer.js';
+import { applyHeroFrame, sameFrame } from './hero.js';
 import { pickImage } from './image-picker.js';
 import { studioLimits } from './look-studio.js';
 import {
@@ -84,10 +85,25 @@ if (!first.ok) fail(first.status === 404 ? MISSING : messageFor(first.error));
 let library = first.data;
 /** The brand centre (its images and limits), fetched once when the banner picture picker first opens. */
 let brand = null;
-/** The banner picture's framing as shown in the framer, and the saving of it (one at a time). */
-let framing = { ...HERO_FRAME_DEFAULT };
+/** The saving of the banner picture's framing (one at a time). */
 let frameSaveTimer = 0;
 let frameSaving = Promise.resolve();
+/** The framer of the banner picture (framer.js); a person's changes are saved as they make them. */
+const framer = mountFramer({
+  stage: $('framer-stage'),
+  picture: $('framer-picture'),
+  window: $('framer-window'),
+  zoom: $('framer-zoom'),
+  zoomText: $('framer-zoom-text'),
+  reset: $('framer-reset'),
+  headerBox,
+  live: liveHero,
+  onChange: () => {
+    showMessage($('framer-saved'), '');
+    clearTimeout(frameSaveTimer);
+    frameSaveTimer = setTimeout(saveFraming, 400);
+  },
+});
 show(library);
 $('settings').hidden = false;
 
@@ -204,48 +220,13 @@ function headerBox() {
 function showFramer(image, frame) {
   const url = brandImageHref(image?.url) ? bannerSrc(image.url) : null;
   $('hero-framer').hidden = url === null;
-  if (url === null) return;
-  framing = heroFrame(frame);
-  const picture = $('framer-picture');
-  if (picture.getAttribute('src') !== url) {
-    picture.src = url;
-    picture.addEventListener('load', drawFramer, { once: true });
-  }
-  drawFramer();
-}
-
-/** Draws the bright box and the size from `framing`, and frames the header's picture alike. */
-function drawFramer() {
-  const picture = $('framer-picture');
-  $('framer-zoom').value = String(framing.zoom);
-  $('framer-zoom-text').textContent = `${framing.zoom}%`;
-  applyHeroFrame(liveHero(), framing);
-  if (!picture.naturalWidth || !picture.naturalHeight) return;
-  // The stage takes the picture's own shape, at most 280 pixels high.
-  $('framer-stage').style.setProperty('--ratio', String(picture.naturalWidth / picture.naturalHeight));
-  const shown = heroWindow(framing, headerBox(), { width: picture.naturalWidth, height: picture.naturalHeight });
-  const box = $('framer-window').style;
-  box.left = `${shown.left * 100}%`;
-  box.top = `${shown.top * 100}%`;
-  box.width = `${shown.width * 100}%`;
-  box.height = `${shown.height * 100}%`;
-}
-
-/** Takes `frame` as the framing, draws it, and saves it shortly after the last change. */
-function setFraming(frame) {
-  const next = heroFrame(frame);
-  if (sameFrame(next, framing)) return;
-  framing = next;
-  drawFramer();
-  showMessage($('framer-saved'), '');
-  clearTimeout(frameSaveTimer);
-  frameSaveTimer = setTimeout(saveFraming, 400);
+  if (url !== null) framer.show(url, frame);
 }
 
 /** Sends the framing as it now is (after any save already on its way) and says when it is kept. */
 function saveFraming() {
   frameSaving = frameSaving.then(async () => {
-    const frame = { ...framing };
+    const frame = framer.frame;
     if (sameFrame(frame, library.hero_frame)) return;
     showMessage(error, '');
     const result = await api('PATCH', `/libraries/${seg(libraryId)}`, { hero_frame: frame });
@@ -255,60 +236,9 @@ function saveFraming() {
       return showMessage(error, text);
     }
     library = { ...library, hero_frame: result.data.hero_frame ?? null };
-    if (sameFrame(framing, frame)) showMessage($('framer-saved'), 'Banner position saved.');
+    if (sameFrame(framer.frame, frame)) showMessage($('framer-saved'), 'Banner position saved.');
   });
 }
-
-/** Moves the bright box by `dx` and `dy` (fractions of the picture). */
-function moveFraming(dx, dy) {
-  const picture = $('framer-picture');
-  if (!picture.naturalWidth || !picture.naturalHeight) return;
-  setFraming(moveHeroFrame(framing, dx, dy, headerBox(), { width: picture.naturalWidth, height: picture.naturalHeight }));
-}
-
-{
-  const stage = $('framer-stage');
-  let last = null;
-  stage.addEventListener('pointerdown', (event) => {
-    if (event.button !== 0) return;
-    last = { x: event.clientX, y: event.clientY };
-    stage.setPointerCapture(event.pointerId);
-    stage.classList.add('dragging');
-    event.preventDefault();
-    stage.focus({ preventScroll: true });
-  });
-  stage.addEventListener('pointermove', (event) => {
-    if (!last) return;
-    const rect = $('framer-picture').getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
-    moveFraming((event.clientX - last.x) / rect.width, (event.clientY - last.y) / rect.height);
-    last = { x: event.clientX, y: event.clientY };
-  });
-  const stop = () => {
-    last = null;
-    stage.classList.remove('dragging');
-  };
-  stage.addEventListener('pointerup', stop);
-  stage.addEventListener('pointercancel', stop);
-  stage.addEventListener('keydown', (event) => {
-    const step = event.shiftKey ? 0.1 : 0.02;
-    const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
-    if (moves[event.key]) {
-      event.preventDefault();
-      moveFraming(...moves[event.key]);
-    } else if (event.key === '+' || event.key === '=' || event.key === '-') {
-      event.preventDefault();
-      const zoom = framing.zoom + (event.key === '-' ? -10 : 10);
-      setFraming({ ...framing, zoom: Math.min(HERO_ZOOM_MAX, Math.max(HERO_ZOOM_MIN, zoom)) });
-    }
-  });
-  $('framer-zoom').addEventListener('input', () => setFraming({ ...framing, zoom: Number($('framer-zoom').value) }));
-  $('framer-reset').addEventListener('click', () => setFraming(HERO_FRAME_DEFAULT));
-  addEventListener('resize', () => {
-    if (!$('hero-framer').hidden) drawFramer();
-  });
-}
-
 /** What the library takes in effect, one line each (the kind's own list included). */
 function showEffective(settings) {
   const lines = [];

@@ -492,6 +492,32 @@ input[type=file]{max-width:100%}
 .band-hero[data-motion=out]{animation:hero-out calc(var(--dur) * 3) var(--ease) both}
 @keyframes hero-in{from{transform:translateX(100%)}to{transform:none}}
 @keyframes hero-out{from{transform:none}to{transform:translateX(100%)}}
+/* The banner picture bleeding out of the banner (bleed.js): under the page (z-index -1, so the header and
+   anything with its own background stay on top): the picture's colour at the page colour's brightness (the glow
+   blends as color over .bleed-base), blurred, washed with a tint and fading with distance. The
+   pictures are drawn twice the blur larger than the layer so its edges do not fade, and more saturated (which keeps their brightness, so the contrast sums still hold); bleed.js sets the
+   opacity no higher than keeps text at 4.5:1. The banner's own pictures are clipped by .band-frame. */
+.band-frame{position:absolute;inset:0;overflow:hidden;border-radius:inherit}
+.site-header[data-bleed]{overflow:visible}
+/* the header's parent holds the layer's stacking, so it paints over the body's background and under the page */
+:has(> .site-header[data-bleed]){isolation:isolate}
+.band-bleed{position:absolute;z-index:-1;isolation:isolate;overflow:hidden;pointer-events:none;opacity:0;transition:opacity calc(var(--dur) * 2) var(--ease);mask-repeat:no-repeat;-webkit-mask-repeat:no-repeat;mask-composite:intersect;-webkit-mask-composite:source-in}
+.bleed-image{position:absolute;top:calc(-2 * var(--bleed-blur));left:calc(-2 * var(--bleed-blur));width:calc(100% + 4 * var(--bleed-blur));height:calc(100% + 4 * var(--bleed-blur));max-width:none;object-fit:cover;filter:blur(var(--bleed-blur)) saturate(1.6)}
+.bleed-base{position:absolute;inset:0;background:var(--bg)}
+.bleed-glow{position:absolute;inset:0;isolation:isolate;mix-blend-mode:color}
+.bleed-shade{position:absolute;inset:0;isolation:isolate;opacity:0}
+.bleed-tint{position:absolute;inset:0;background:var(--bleed-tint);opacity:var(--bleed-tint-mix)}
+.bleed-hero[data-motion=in]{animation:hero-in calc(var(--dur) * 3) var(--ease) both}
+.bleed-hero[data-motion=out]{animation:hero-out calc(var(--dur) * 3) var(--ease) both}
+@media (forced-colors:active){.band-bleed{display:none}}
+@media print{.band-bleed{display:none}}
+.look-preview .band-bleed{transition:none}
+/* Change the look: the banner bleed's settings */
+.bleed-fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:var(--space-2) var(--space-4);align-items:end}
+.bleed-fields[hidden],#bleed-part[hidden]{display:none}
+.range-row{display:flex;align-items:center;gap:var(--space-2)}
+.range-row input[type=range]{flex:1 1 auto;min-width:0}
+.range-row output{min-width:4.5ch;font-variant-numeric:tabular-nums;color:var(--muted);font-size:var(--text-sm)}
 /* Framing a library's banner picture (library settings): the whole picture, the part the header shows bright. */
 .framer-stage{position:relative;display:block;width:min(100%,calc(280px * var(--ratio,2)));aspect-ratio:var(--ratio,2);border-radius:var(--radius-sm);overflow:hidden;cursor:grab;touch-action:none;user-select:none;background:var(--band)}
 .framer-stage.dragging{cursor:grabbing}
@@ -665,7 +691,7 @@ dialog.preview-sheet[open]{animation:sheet-up var(--dur) var(--ease)}
 .colour-grid .field{max-width:none}
 .field-pair{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0 var(--space-4)}
 .field-pair .field{max-width:none}
-.look-preview{color-scheme:light;--soft:color-mix(in srgb,var(--accent) 11%,var(--paper));background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:var(--radius-md);padding:var(--space-2);font-size:var(--text-sm);min-width:0;overflow:hidden}
+.look-preview{isolation:isolate;color-scheme:light;--soft:color-mix(in srgb,var(--accent) 11%,var(--paper));background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:var(--radius-md);padding:var(--space-2);font-size:var(--text-sm);min-width:0;overflow:hidden}
 .look-preview[data-scheme=dark]{color-scheme:dark}
 .look-preview .preview-label{margin:0 0 var(--space-2);font-size:var(--text-xs);font-weight:600;color:var(--muted)}
 .look-preview .site-header{zoom:.7;margin:0}

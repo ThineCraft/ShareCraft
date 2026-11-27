@@ -8,7 +8,8 @@ import { existingSidebar, sidebar } from './workspace.js';
 import { prefetchCache, prefetchKey, setupPrefetch } from './prefetch.js';
 import { connection } from './connection.js';
 import { rememberChrome } from './skeleton.js';
-import { showHero } from './hero.js';
+import { showBleed } from './bleed.js';
+import { applyHeroFrame, showHero } from './hero.js';
 
 // Pointing at a link to another page asks for its first answers early (prefetch.js).
 setupPrefetch();
@@ -1696,8 +1697,20 @@ export function headerView(site, look, { draft = false } = {}) {
   const logo = logoUrl
     ? brandImage(logoUrl, { class: 'site-logo', alt }, () => name.setAttribute('class', 'site-name'))
     : null;
+  // The banner's pictures sit in a frame that clips them, so that the picture can bleed out
+  // past the header (bleed.js) while a library's picture slides in within it (hero.js).
+  const picture = imageUrl ? brandImage(bannerSrc(imageUrl), { class: 'band-image', alt: '' }) : null;
+  // The part of the image the look chose to show (as a library's banner picture is framed).
+  if (picture) applyHeroFrame(picture, header.frame ?? null);
   const band = imageUrl
-    ? [brandImage(bannerSrc(imageUrl), { class: 'band-image', alt: '' }), h('span', { class: 'band-shade', 'aria-hidden': 'true' })]
+    ? [
+        h(
+          'span',
+          { class: 'band-frame' },
+          picture,
+          h('span', { class: 'band-shade', 'aria-hidden': 'true' }),
+        ),
+      ]
     : [];
   return h(
     'header',
@@ -1910,8 +1923,13 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
     );
     // The heights the header and navigation took, so that the next visit reserves them (skeleton.js).
     rememberChrome();
-    // A library's banner picture slides in over the site's, and back out on leaving (hero.js).
-    showHero(header, { site: siteId, library: hero?.library ?? null, url: hero?.url ?? null, frame: hero?.frame ?? null });
+    // The banner picture bleeds out past the banner (bleed.js), unless the look turns it off.
+    const bleed = showBleed(header, shown.look?.header?.bleed, { bounds: document.documentElement });
+    // A library's banner picture slides in over the site's, and back out on leaving (hero.js);
+    // its bleed moves with it.
+    showHero(header, { site: siteId, library: hero?.library ?? null, url: hero?.url ?? null, frame: hero?.frame ?? null }, {
+      onShow: (shownHero) => bleed?.hero(shownHero),
+    });
   }
   return shown;
 }

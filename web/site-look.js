@@ -36,6 +36,8 @@ import {
   siteChrome,
   themeSwatches,
 } from './common.js';
+import { BLEED_DEFAULT, bleedOf, showBleed } from './bleed.js';
+import { mountFramer } from './framer.js';
 import { ROLES, roleChoices } from './brand-fonts.js';
 import { pickImage } from './image-picker.js';
 import { fontSpecimen } from './look-card-view.js';
@@ -94,6 +96,32 @@ document.title = `${info.name}: Change the look — ShareCraft`;
 if (!can(info.access, 'manage_site')) fail('Only the owners of this site can change its look.');
 
 const readOnly = Boolean(info.archived);
+
+/** Each bleed control: its setting, how its value is read, and how it is shown. */
+const BLEED_CONTROLS = Object.freeze([
+  ['bleed-distance', 'distance', Number, (v) => `${v} px`],
+  ['bleed-blur', 'blur', Number, (v) => `${v} px`],
+  ['bleed-transparency', 'transparency', Number, (v) => `${v} %`],
+  ['bleed-tint-light', 'tint_light', String, null],
+  ['bleed-tint-dark', 'tint_dark', String, null],
+]);
+
+/** The banner bleeds the preview shows now (bleed.js), stopped before it is drawn again. */
+let previewBleeds = [];
+
+/** The framer of the header image (framer.js), set up just before the page is first filled. */
+let headerFramer = null;
+
+/**
+ * The size of the header the image is framed for: the site header at the top of this page where
+ * it shows a banner picture, else a common desktop header (1200 by 160).
+ */
+function siteHeaderBox() {
+  const header = [...document.querySelectorAll('.site-header')].find((element) => !element.closest('.look-preview'));
+  const rect = header?.querySelector('.band-image') ? header.getBoundingClientRect() : null;
+  return rect && rect.width > 0 && rect.height > 0 ? { width: rect.width, height: rect.height } : { width: 1200, height: 160 };
+}
+
 const [settingsAnswer, brandAnswer, historyAnswer] = await Promise.all([
   api('GET', `/sites/${seg(siteId)}/look/settings`),
   api('GET', '/brand'),
@@ -804,7 +832,8 @@ function drawSlot(slot) {
     });
     if (!picked) return;
     slot.set(picked);
-    if (slot === SLOTS.header) session.change((draft) => (draft.header.background = 'image'));
+    // A new header image starts at its middle, at its smallest.
+    if (slot === SLOTS.header) session.change((draft) => ((draft.header.background = 'image'), (draft.header.frame = null)));
     fillHeader();
     drawSlot(slot);
     refresh();
@@ -839,6 +868,7 @@ function fillHeader() {
   $('hide-title').checked = draft.header.hide_title;
   checkCard($('navigation-choice'), draft.navigation);
   checkCard($('menu-choice'), draft.menu);
+  fillBleed();
 }
 
 $('logo-alt').addEventListener('input', () => {
@@ -851,6 +881,35 @@ $('header-align').addEventListener('change', () => {
 });
 $('hide-title').addEventListener('change', () => {
   session.change((draft) => (draft.header.hide_title = $('hide-title').checked));
+  refresh();
+});
+
+// ---- the banner bleed (bleed.js) ----
+
+function fillBleed() {
+  const bleed = bleedOf(session.draft.header.bleed);
+  $('bleed-enabled').checked = bleed.enabled;
+  for (const [id, key, , show] of BLEED_CONTROLS) {
+    $(id).value = String(bleed[key]);
+    if (show) $(`${id}-out`).textContent = show(bleed[key]);
+  }
+}
+
+$('bleed-enabled').addEventListener('change', () => {
+  session.change((draft) => (draft.header.bleed = { ...bleedOf(draft.header.bleed), enabled: $('bleed-enabled').checked }));
+  refresh();
+});
+for (const [id, key, read, show] of BLEED_CONTROLS) {
+  $(id).addEventListener('input', () => {
+    const value = read($(id).value);
+    if (show) $(`${id}-out`).textContent = show(value);
+    session.change((draft) => (draft.header.bleed = bleedOf({ ...bleedOf(draft.header.bleed), [key]: value })));
+    refresh();
+  });
+}
+$('bleed-reset').addEventListener('click', () => {
+  session.change((draft) => (draft.header.bleed = { ...BLEED_DEFAULT }));
+  fillBleed();
   refresh();
 });
 
@@ -977,6 +1036,8 @@ function drawGroups() {
 /** Draws the draft in each preview element, light and dark, with applyLook on that element only. */
 function drawPreview() {
   const effective = session.effective(info.name);
+  for (const bleed of previewBleeds) bleed.stop();
+  previewBleeds = [];
   for (const [id, label] of [
     ['preview-light', 'Light mode'],
     ['preview-dark', 'Dark mode'],
@@ -999,12 +1060,15 @@ function drawPreview() {
       h('button', { type: 'button', class: 'secondary', tabindex: '-1' }, 'New folder'),
       h('a', { href: '#' }, 'A link'),
     );
+    const header = headerView(info, effective, { draft: true });
     panel.replaceChildren(
       h('p', { class: 'preview-label' }, label),
-      headerView(info, effective, { draft: true }),
+      header,
       h('div', { class: effective.navigation === 'vertical' ? 'preview-body vertical' : 'preview-body' }, nav, h('div', {}, rows, buttons)),
       footerView(effective, { draft: true }) ?? h('p', { class: 'meta' }, 'No footer.'),
     );
+    const bleed = showBleed(header, effective.header.bleed);
+    if (bleed) previewBleeds.push(bleed);
   }
 }
 
@@ -1055,6 +1119,15 @@ function refresh() {
   $('align-field').hidden = !extended;
   $('header-image-slot').hidden = !(extended && draft.header.background === 'image');
   $('hide-title').disabled = readOnly || !draft.logo;
+  // The bleed is the banner picture's, so it is set only for an image band.
+  $('bleed-part').hidden = !(extended && draft.header.background === 'image');
+  // The header image's position, for an image band with its image.
+  const band = extended && draft.header.background === 'image' ? draftImageUrl(draft.header.image) : null;
+  $('header-framer').hidden = !band;
+  if (band) headerFramer?.show(band, draft.header.frame);
+  for (const control of $('header-framer').querySelectorAll('input, button')) control.disabled = readOnly;
+  $('bleed-fields').hidden = !bleedOf(draft.header.bleed).enabled;
+  for (const control of $('bleed-part').querySelectorAll('input, button')) control.disabled = readOnly;
   $('footer-fields').hidden = !draft.footer.enabled;
   $('menu-part').hidden = draft.navigation !== 'horizontal';
   $('menu-off').hidden = draft.navigation === 'horizontal';
@@ -1294,6 +1367,20 @@ if (!brandAnswer.ok) note(`The brand centre could not be read: ${messageFor(bran
 drawStudio();
 showPreviewMode();
 showSiteThemes();
+// The framer of the header image (framer.js): which part of it the header shows, kept in the draft.
+headerFramer = mountFramer({
+  stage: $('header-framer-stage'),
+  picture: $('header-framer-picture'),
+  window: $('header-framer-window'),
+  zoom: $('header-framer-zoom'),
+  zoomText: $('header-framer-zoom-text'),
+  reset: $('header-framer-reset'),
+  headerBox: siteHeaderBox,
+  onChange: (frame) => {
+    session.change((draft) => (draft.header.frame = frame));
+    refresh();
+  },
+});
 fill();
 if (limits.customColours.disabled || limits.builtinThemes.disabled || limits.siteImages.disabled || limits.siteThemes.disabled || limits.siteFonts.disabled) {
   $('limits-note').hidden = false;

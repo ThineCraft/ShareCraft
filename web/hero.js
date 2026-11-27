@@ -146,9 +146,11 @@ function storeHero(state) {
 /**
  * Shows the banner picture of this page on `header` (the site header drawn by `headerView`), as
  * [`heroStep`] decides, and keeps the state for the next page. A header with no banner picture
- * of its own takes none. Answers the picture's element, or null.
+ * of its own takes none. `onShow({src, position, motion, reduced})` runs as the picture starts
+ * to show (so the banner's bleed, bleed.js, can move with it). Answers the picture's element, or
+ * null.
  */
-export function showHero(header, here) {
+export function showHero(header, here, { onShow } = {}) {
   const step = heroStep(loadHero(), here);
   storeHero(step.keep);
   const band = header?.querySelector?.('.band-image');
@@ -165,6 +167,7 @@ export function showHero(header, here) {
   const reduced = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
   const start = () => {
     img.hidden = false;
+    onShow?.({ src: img.src, position: img.style.objectPosition, motion: step.motion, reduced: Boolean(reduced) });
     if (step.motion === 'none') return;
     if (step.motion === 'out' && reduced) return img.remove();
     img.dataset.motion = step.motion;

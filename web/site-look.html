@@ -108,12 +108,54 @@
       <div id="header-image-slot"></div>
       <div id="icon-slot"></div>
      </div>
+     <div id="header-framer" class="field framer" hidden>
+      <span class="label" id="header-framer-heading">Header image position and size</span>
+      <div id="header-framer-stage" class="framer-stage" tabindex="0" role="group" aria-labelledby="header-framer-heading" aria-describedby="header-framer-help">
+       <img id="header-framer-picture" alt="" draggable="false">
+       <div id="header-framer-window" class="framer-window" aria-hidden="true"></div>
+      </div>
+      <div class="framer-controls">
+       <label for="header-framer-zoom">Size</label>
+       <input id="header-framer-zoom" type="range" min="100" max="400" step="5" value="100">
+       <output id="header-framer-zoom-text" for="header-framer-zoom">100%</output>
+       <button type="button" id="header-framer-reset" class="ghost small">Centre it again</button>
+      </div>
+      <small id="header-framer-help" class="meta">The bright box is the part of the picture the header shows. Drag it, or select the picture and use the arrow keys, to choose that part. Make the picture bigger to show less of it. Narrower screens show less at the sides. The preview shows it at once; Apply saves it.</small>
+     </div>
      <div class="field">
       <label for="logo-alt">Logo description</label>
       <input type="text" id="logo-alt" maxlength="120" autocomplete="off" aria-describedby="logo-alt-note">
       <small id="logo-alt-note" class="meta">Read out in place of the logo. Leave empty to use the site's name.</small>
      </div>
      <label class="check"><input type="checkbox" id="hide-title"> Hide the site's name beside the logo (needs a logo)</label>
+     <div id="bleed-part">
+      <h3 id="bleed-label">Banner bleed</h3>
+      <p class="meta" id="bleed-note">The banner picture shows through, blurred, behind the page around and below the banner. Pages show it fainter wherever it would make text hard to read.</p>
+      <label class="check"><input type="checkbox" id="bleed-enabled" aria-describedby="bleed-note"> Let the banner picture bleed past the banner</label>
+      <div id="bleed-fields" class="bleed-fields">
+       <div class="field">
+        <label for="bleed-distance">Distance</label>
+        <div class="range-row"><input type="range" id="bleed-distance" min="0" max="400" step="8"><output id="bleed-distance-out" for="bleed-distance"></output></div>
+       </div>
+       <div class="field">
+        <label for="bleed-blur">Blur</label>
+        <div class="range-row"><input type="range" id="bleed-blur" min="0" max="96" step="4"><output id="bleed-blur-out" for="bleed-blur"></output></div>
+       </div>
+       <div class="field">
+        <label for="bleed-transparency">Transparency</label>
+        <div class="range-row"><input type="range" id="bleed-transparency" min="0" max="100" step="5"><output id="bleed-transparency-out" for="bleed-transparency"></output></div>
+       </div>
+       <div class="field">
+        <label for="bleed-tint-light">Tint in light mode</label>
+        <div class="colour-row"><input type="color" id="bleed-tint-light"></div>
+       </div>
+       <div class="field">
+        <label for="bleed-tint-dark">Tint in dark mode</label>
+        <div class="colour-row"><input type="color" id="bleed-tint-dark"></div>
+       </div>
+       <button type="button" class="ghost small" id="bleed-reset">Reset the bleed</button>
+      </div>
+     </div>
     </div>
    </section>
 
