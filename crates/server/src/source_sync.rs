@@ -1181,6 +1181,7 @@ pub fn start_worker(state: AppState) -> Worker {
     let task = tokio::spawn(async move {
         let mut running = JoinSet::new();
         let mut evicted: Option<tokio::time::Instant> = None;
+        let mut swept: Option<tokio::time::Instant> = None;
         loop {
             while let Some(finished) = running.try_join_next() {
                 if let Err(e) = finished {
@@ -1192,6 +1193,12 @@ pub fn start_worker(state: AppState) -> Worker {
             if evicted.is_none_or(|at| at.elapsed() >= POLL.saturating_sub(AGAIN_SOON)) {
                 crate::external::evict(&state).await;
                 evicted = Some(tokio::time::Instant::now());
+            }
+            // Secrets forgotten while their values live at the secret provider are deleted
+            // there, and a delete that failed is tried again.
+            if swept.is_none_or(|at| at.elapsed() >= POLL.saturating_sub(AGAIN_SOON)) {
+                state.secret_store().sweep_forgotten(state.db()).await;
+                swept = Some(tokio::time::Instant::now());
             }
             let wait = if state.sources().has_pending() {
                 AGAIN_SOON

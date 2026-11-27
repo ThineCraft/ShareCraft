@@ -555,6 +555,7 @@ pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
         github_api: server::config::DEFAULT_GITHUB_API.to_owned(),
         source_create_batch_size: server::config::DEFAULT_SOURCE_CREATE_BATCH_SIZE,
         s3_plain_loopback: true,
+        secret_provider: None,
     }
 }
 

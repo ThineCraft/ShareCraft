@@ -38,6 +38,7 @@ pub mod s3_source;
 pub mod s3_write;
 pub mod s3_xml;
 mod scan;
+pub mod secret_provider;
 pub mod secret_store;
 pub mod secrets;
 pub mod share;
@@ -180,6 +181,12 @@ impl AppState {
         let github = github::GithubClient::new(&config.github_api)
             .map_err(|e| std::io::Error::other(format!("cannot set up the GitHub client: {e}")))?;
         let s3 = s3::S3::new(config.s3_plain_loopback);
+        let mut secret_store = secret_store::SecretStore::local(secrets);
+        if let Some(settings) = &config.secret_provider {
+            let provider =
+                secret_provider::SecretProvider::new(settings).map_err(std::io::Error::other)?;
+            secret_store = secret_store.with_provider(provider);
+        }
         Ok(Self {
             shared: Arc::new(Shared {
                 config,
@@ -202,7 +209,7 @@ impl AppState {
                 tree_lock: tokio::sync::Mutex::new(()),
                 tree_out_of_step: AtomicBool::new(false),
                 tree_undos: std::sync::Mutex::new(Vec::new()),
-                secret_store: Arc::new(secret_store::SecretStore::local(secrets)),
+                secret_store: Arc::new(secret_store),
                 github: Arc::new(github),
                 shares: Arc::new(share::Shares::default()),
                 s3: Arc::new(s3),

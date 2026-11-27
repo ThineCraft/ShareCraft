@@ -1329,6 +1329,7 @@ mod tests {
             github_api: crate::config::DEFAULT_GITHUB_API.to_owned(),
             source_create_batch_size: crate::config::DEFAULT_SOURCE_CREATE_BATCH_SIZE,
             s3_plain_loopback: false,
+            secret_provider: None,
         };
         let store = RevisionStore::open(&crate::library_path(dir)).unwrap();
         let blobs = revisions::BlobStore::open(&crate::blobs_path(dir)).unwrap();

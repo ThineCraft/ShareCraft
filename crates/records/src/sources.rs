@@ -51,6 +51,15 @@ pub struct SealedRow {
     pub ciphertext: Vec<u8>,
 }
 
+/// A stored secret: sealed bytes, or a note that an outside provider keeps the value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredSecret {
+    /// Sealed under this server's key, kept here.
+    Local(SealedRow),
+    /// Kept by the outside provider, under a name made from the secret's id.
+    External,
+}
+
 impl std::fmt::Debug for SealedRow {
     /// Shows the key and sizes only, as a precaution.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -844,27 +853,93 @@ impl Db {
         Ok(SecretId(id))
     }
 
-    /// The sealed secret `id`, if there is one.
+    /// The sealed secret `id`, if there is one and it is kept here. A secret kept by an outside
+    /// provider is not held here: asking for it is an error (see [`Db::get_stored_secret`]).
     pub async fn get_secret(&self, id: SecretId) -> Result<Option<SealedRow>, DbError> {
-        let row = sqlx::query("select key_id, nonce, ciphertext from secrets where id = $1")
-            .bind(id.0)
-            .fetch_optional(self.pool())
-            .await?;
+        match self.get_stored_secret(id).await? {
+            None => Ok(None),
+            Some(StoredSecret::Local(sealed)) => Ok(Some(sealed)),
+            Some(StoredSecret::External) => {
+                Err(DbError::new("a secret is kept by an outside provider"))
+            }
+        }
+    }
+
+    /// The secret `id` as the table holds it: sealed bytes, or a note that an outside provider
+    /// has the value. `None` when there is no such secret or it has been forgotten.
+    pub async fn get_stored_secret(&self, id: SecretId) -> Result<Option<StoredSecret>, DbError> {
+        let row = sqlx::query(
+            "select provider, key_id, nonce, ciphertext from secrets \
+             where id = $1 and forgotten_at is null",
+        )
+        .bind(id.0)
+        .fetch_optional(self.pool())
+        .await?;
         row.map(|row| {
-            let key_id: i32 = row.try_get("key_id")?;
-            let nonce: Vec<u8> = row.try_get("nonce")?;
-            Ok::<_, sqlx::Error>(SealedRow {
+            let provider: String = row.try_get("provider")?;
+            if provider == "external" {
+                return Ok::<_, sqlx::Error>(StoredSecret::External);
+            }
+            let key_id: Option<i32> = row.try_get("key_id")?;
+            let nonce: Option<Vec<u8>> = row.try_get("nonce")?;
+            let ciphertext: Option<Vec<u8>> = row.try_get("ciphertext")?;
+            let (Some(key_id), Some(nonce), Some(ciphertext)) = (key_id, nonce, ciphertext) else {
+                return Err(sqlx::Error::Decode("a sealed secret with no bytes".into()));
+            };
+            Ok(StoredSecret::Local(SealedRow {
                 key_id: u32::try_from(key_id).map_err(|e| sqlx::Error::Decode(e.into()))?,
                 nonce: nonce
                     .try_into()
                     .map_err(|_| sqlx::Error::Decode("a nonce of the wrong length".into()))?,
-                ciphertext: row.try_get("ciphertext")?,
-            })
+                ciphertext,
+            }))
         })
         .transpose()
         .map_err(DbError::from)
     }
 
+    /// Records a secret whose value an outside provider keeps, and returns its id: the name at
+    /// the provider is made from it. The row holds no bytes.
+    pub async fn put_external_secret(&self) -> Result<SecretId, DbError> {
+        let id = Uuid::new_v4();
+        sqlx::query("insert into secrets (id, provider) values ($1, 'external')")
+            .bind(id)
+            .execute(self.pool())
+            .await?;
+        Ok(SecretId(id))
+    }
+
+    /// Forgets the secret `id`: a sealed one is deleted at once (a secret a connection still
+    /// uses cannot be, the database refuses); one kept by an outside provider is marked
+    /// forgotten, for [`Db::forgotten_secrets`] to list until the provider has deleted its value
+    /// and [`Db::delete_secret`] removes the row. Nothing happens if there is none.
+    pub async fn forget_secret(&self, id: SecretId) -> Result<(), DbError> {
+        sqlx::query("delete from secrets where id = $1 and provider = 'local'")
+            .bind(id.0)
+            .execute(self.pool())
+            .await?;
+        sqlx::query(
+            "update secrets set forgotten_at = now() \
+             where id = $1 and provider = 'external' and forgotten_at is null",
+        )
+        .bind(id.0)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Up to `limit` secrets that were forgotten but whose value the provider may still hold,
+    /// the oldest first.
+    pub async fn forgotten_secrets(&self, limit: i64) -> Result<Vec<SecretId>, DbError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select id from secrets where forgotten_at is not null \
+             order by forgotten_at, id limit $1",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(SecretId).collect())
+    }
     /// Deletes the secret `id`; nothing happens if there is none. A secret a connection still
     /// uses cannot be deleted (the database refuses).
     pub async fn delete_secret(&self, id: SecretId) -> Result<(), DbError> {
