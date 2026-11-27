@@ -14,11 +14,11 @@ use crate::s3_endpoints::{
 };
 use crate::scans::{SCANNER_SETTINGS, SCANNER_URL, valid_scanner_setting};
 use crate::share_paths::{
-    SHARE_CACHE_MAX_BYTES, SHARE_LIST_SECONDS, SHARE_ROOTS, valid_cache_setting,
-    valid_list_setting, valid_roots_setting,
+    SHARE_CACHE_MAX_BYTES, SHARE_LIST_SECONDS, SHARE_ROOTS, remove_logins_except, servers_of_roots,
+    valid_cache_setting, valid_list_setting, valid_roots_setting,
 };
 use crate::sites::{DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, validate_language, validate_time_zone};
-use crate::sources::{SOURCE_MAX_BYTES, SOURCE_MAX_FILES};
+use crate::sources::{SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SecretId};
 use crate::{AccessError, Db, DbError};
 
 /// Whether anyone links may be created and used (a boolean; off by default).
@@ -142,9 +142,24 @@ impl Db {
         actor: UserId,
         changes: Vec<(&str, Value)>,
     ) -> Result<(), AccessError> {
+        self.set_settings_pruning_logins(actor, changes)
+            .await
+            .map(drop)
+    }
+
+    /// As [`Db::set_settings`]. When the file-share roots are among `changes`, the stored
+    /// login of every server left with no approved UNC root is removed in the same
+    /// transaction, each with a `share_login_removed` event. The secrets those logins named,
+    /// for the caller to forget once this has committed.
+    pub async fn set_settings_pruning_logins(
+        &self,
+        actor: UserId,
+        changes: Vec<(&str, Value)>,
+    ) -> Result<Vec<SecretId>, AccessError> {
         for (key, value) in &changes {
             validate(key, value)?;
         }
+        let roots_changed = changes.iter().any(|(key, _)| *key == SHARE_ROOTS);
         let mut tx = self.pool().begin().await?;
         let admin: Option<bool> = sqlx::query_scalar(
             "select is_admin and disabled_at is null from users where id = $1 for share",
@@ -196,7 +211,17 @@ impl Db {
             )
             .await?;
         }
+        let mut forget = Vec::new();
+        if roots_changed {
+            let roots: Option<Value> =
+                sqlx::query_scalar("select value from settings where key = $1")
+                    .bind(SHARE_ROOTS)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let kept = roots.as_ref().map(servers_of_roots).unwrap_or_default();
+            forget = remove_logins_except(&mut tx, actor, &kept).await?;
+        }
         tx.commit().await?;
-        Ok(())
+        Ok(forget)
     }
 }
