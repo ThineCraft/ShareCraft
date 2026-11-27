@@ -33,7 +33,15 @@ import { relativeTime } from './files.js';
 import { libraryCardModel, libraryIcon, ownerChip, recentAcrossLibraries, recentIcon } from './site-home.js';
 import { checklistModel, readWelcome, showChecklist, unsetParts, unsetText, writeWelcome } from './new-site.js';
 import { settle, settleAll } from './skeleton.js';
-import { overwriteNote, sourceWriteErrorText, validBucket, validPrefix, validRepository } from './source-panel.js';
+import {
+  overwriteNote,
+  shareConnectErrorText,
+  sourceWriteErrorText,
+  validBucket,
+  validPrefix,
+  validRepository,
+  validSharePath,
+} from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -342,11 +350,22 @@ function s3ErrorText(result) {
   return messageFor(result.error);
 }
 
+function shareLibraryChosen() {
+  return document.querySelector('input[name="library-source"]:checked')?.value === 'share';
+}
+
+function showShareLibraryFields() {
+  const chosen = shareLibraryChosen();
+  $('share-library-fields').hidden = !chosen;
+  $('share-path').required = chosen;
+}
+
 for (const choice of document.querySelectorAll('input[name="library-source"]')) {
   choice.addEventListener('change', () => {
     showGithubLibraryFields();
     showS3LibraryFields();
     showS3ModeChoice();
+    showShareLibraryFields();
   });
 }
 
@@ -370,6 +389,7 @@ $('new-library').addEventListener('submit', async (event) => {
     return say('Give the library a name.', $('library-name'));
   }
   if (s3LibraryChosen()) return createS3Library(name, say);
+  if (shareLibraryChosen()) return createShareLibrary(name, say);
   const fromGithub = githubLibraryChosen();
   const repository = $('github-repository').value.trim();
   if (fromGithub && !validRepository(repository)) {
@@ -462,6 +482,43 @@ async function createS3Library(name, say) {
   say(`${s3ErrorText(result)} Retype the secret access key before trying again.`, field);
 }
 
+/** The sentence for a refused file-share library: the server's own words where it gives them. */
+function shareErrorText(result) {
+  if (result.error === 'share_not_approved') {
+    return 'That folder is not approved. Ask an administrator to approve this folder under Sharing settings.';
+  }
+  if (result.error === 'invalid_request') {
+    return typeof result.data?.message === 'string'
+      ? result.data.message
+      : 'This kind of library cannot be read from a file share. Choose a document or image library.';
+  }
+  if (typeof result.data?.message === 'string') return result.data.message;
+  return shareConnectErrorText(result.error) || messageFor(result.error);
+}
+
+/** Makes a library that shows a folder of a file share (read-only in this release). */
+async function createShareLibrary(name, say) {
+  const pathField = $('share-path');
+  const path = pathField.value.trim();
+  const check = validSharePath(path);
+  if (!check.ok) return say(check.reason, pathField);
+  say('');
+  $('new-library-submit').disabled = true;
+  const result = await api('POST', `/sites/${seg(siteId)}/libraries/share`, {
+    name,
+    path,
+    kind: $('library-kind').value,
+    mode: 'read_only',
+  });
+  $('new-library-submit').disabled = false;
+  if (result.ok) {
+    location.assign(pageFor('library', result.data.id));
+    return;
+  }
+  // The refusal is read where it appears: the error line takes the focus.
+  say(shareErrorText(result));
+}
+
 $('s3-readonly-instead').addEventListener('click', () => {
   document.querySelector('input[name="s3-mode"][value="read_only"]').checked = true;
   $('s3-readonly-row').hidden = true;
@@ -484,6 +541,8 @@ function newLibraryCard() {
     for (const id of ['github-repository', 'github-branch', 'github-folder', 'github-token']) $(id).value = '';
     for (const id of ['s3-bucket', 's3-prefix', 's3-key-id']) $(id).value = '';
     clearS3Secret();
+    $('share-path').value = '';
+    showShareLibraryFields();
     showGithubLibraryFields();
     showS3LibraryFields();
     document.querySelector('input[name="s3-mode"][value="read_only"]').checked = true;

@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
+  contentRevision,
+  shareConnectErrorText,
   sourceAccess,
   sourceControlsEnabled,
   relativeTime,
@@ -31,6 +33,13 @@ import {
   moveStaysInLibrary,
   moveAcrossLibrariesText,
   blockedText,
+  validSharePath,
+  hiddenLines,
+  fetchingFromShare,
+  openRefusedText,
+  FETCHING_TEXT,
+  SHARE_RETRIES,
+  SHARE_RETRY_MS,
 } from './source-panel.js';
 
 test('shouldReload follows a changed commit or a completed update', () => {
@@ -468,6 +477,163 @@ test('the new-library note is read with the link that takes the focus', () => {
   assert.match(html, /<p id="new-library-note"/);
 });
 
+const SHARE = {
+  kind: 'share',
+  mode: 'read_only',
+  path: null,
+  last_checked_at: '2026-11-17T14:20:00Z',
+  last_synced_at: '2026-11-17T14:20:00Z',
+  last_error: null,
+  listing_now: null,
+  hidden: 0,
+  hidden_by: {},
+};
+
+test('sourceAccess treats a share answer like any connected source', () => {
+  assert.equal(sourceAccess({ ok: true, status: 200, data: { ...SHARE, state: 'ok' } }), 'connected');
+  assert.equal(sourceAccess({ ok: true, status: 200, data: { kind: 'share' } }), 'unknown');
+  assert.deepEqual(sourceActions('connected', { ...SHARE, state: 'ok' }), NONE);
+});
+
+test('sourceSummary describes a share that is shown and checked, with the path only for owners', () => {
+  assert.deepEqual(sourceSummary({ ...SHARE, state: 'ok' }, NOW), {
+    headline: 'Shows the files in a file share.',
+    detail:
+      'Checked 4 minutes ago. Files open from the share when you ask for them; this library cannot be changed here.',
+    tone: 'ok',
+  });
+  assert.equal(
+    sourceSummary({ ...SHARE, state: 'ok', path: '\\\\server\\share\\docs' }, NOW).headline,
+    'Shows the files in \\\\server\\share\\docs.',
+  );
+});
+
+test('sourceSummary words each state of a share', () => {
+  assert.deepEqual(sourceSummary({ ...SHARE, state: 'syncing', listing_now: { files_so_far: 12400 } }, NOW), {
+    headline: 'Listing the share… 12,400 files so far',
+    detail: 'Files shown are from the last update. This library cannot be changed here.',
+    tone: 'working',
+  });
+  assert.equal(sourceSummary({ ...SHARE, state: 'syncing' }, NOW).headline, 'Listing the share…');
+  assert.deepEqual(sourceSummary({ ...SHARE, state: 'connecting', last_checked_at: null }, NOW), {
+    headline: 'Connecting…',
+    detail: 'Files will appear after the first listing. This library cannot be changed here.',
+    tone: 'working',
+  });
+  const unreachable = 'The share could not be reached. Files already opened still open; others will not until it is back.';
+  assert.deepEqual(sourceSummary({ ...SHARE, state: 'failed' }, NOW), {
+    headline: unreachable,
+    detail: 'Files shown are from the last update. This library cannot be changed here.',
+    tone: 'attention',
+  });
+  assert.equal(
+    sourceSummary({ ...SHARE, state: 'failed', last_error: 'The share could not be reached, so nothing was changed.' }, NOW)
+      .headline,
+    unreachable,
+  );
+  assert.deepEqual(sourceSummary({ ...SHARE, state: 'not_connected' }, NOW), {
+    headline: 'This folder is no longer approved, so its files cannot be opened.',
+    detail: 'Files shown are from the last update. This library cannot be changed here.',
+    tone: 'attention',
+  });
+  // A listing over its limits says the server's own sentence.
+  const limit = 'The folder holds more than 200,000 files, the most this server shows for one library, so nothing was changed.';
+  assert.equal(sourceSummary({ ...SHARE, state: 'failed', last_error: limit }, NOW).headline, limit);
+});
+
+test('the GitHub and S3 summaries are unchanged by the share wording', () => {
+  assert.equal(
+    sourceSummary({ ...base, state: 'ok' }, NOW).headline,
+    'Kept in step with github.com/owner/repo (branch main).',
+  );
+  assert.equal(sourceSummary({ ...s3, state: 'ok' }, S3_NOW).headline, 'Shows the files in S3 storage.');
+});
+
+test('validSharePath accepts network, drive and absolute paths', () => {
+  for (const path of ['\\\\server\\share\\a', '//server/share/a', 'D:\\data\\a', '/mnt/a', '\\\\server\\share', 'D:\\data\\']) {
+    assert.deepEqual(validSharePath(path), { ok: true, reason: '' }, path);
+  }
+});
+
+test('validSharePath refuses what could never be a share folder, with a reason each', () => {
+  for (const path of ['', '   ', 'a\\b', '\\\\server', '\\\\?\\C:\\a', '\\\\s\\sh\\..\\x', 'C:\\', '\\\\s\\sh\\a\\\\b', '/a/./b', '\\\\s\\sh\\a:b']) {
+    const answer = validSharePath(path);
+    assert.equal(answer.ok, false, JSON.stringify(path));
+    assert.notEqual(answer.reason, '', JSON.stringify(path));
+  }
+  assert.equal(validSharePath(undefined).ok, false);
+  assert.equal(validSharePath('\\\\server\\share\\' + 'x'.repeat(1100)).ok, false);
+});
+
+test('validSharePath refuses administrative shares with the owner sentence, and only those', () => {
+  const sentence = 'Administrative shares such as \\\\server\\C$ open a whole drive or system area and ought not to be shared. Share only the folder you need, then approve that path.';
+  for (const path of ['\\\\server\\C$', '\\\\server\\c$\\Users', '//server/D$/x', '\\\\localhost\\ADMIN$', '\\\\s\\ipc$', '\\\\s\\Print$\\a']) {
+    assert.deepEqual(validSharePath(path), { ok: false, reason: sentence }, path);
+  }
+  for (const path of ['\\\\server\\Projects$\\Users', '\\\\server\\C$folder', '\\\\server\\share\\C$', 'C:\\Users', '/mnt/c$/x']) {
+    assert.equal(validSharePath(path).ok, true, path);
+  }
+});
+
+test('hiddenLines words each kind plainly and leaves zero counts out', () => {
+  assert.deepEqual(hiddenLines({ links: 0, system: 0, offline: 0 }), []);
+  assert.deepEqual(hiddenLines(null), []);
+  assert.deepEqual(hiddenLines(undefined), []);
+  assert.deepEqual(
+    hiddenLines({ links: 2, submodules: 0, types: 1, size: 3, names: 1, system: 12, offline: 1, long: 4, unreadable: 1, archived: 9 }),
+    [
+      '2 links to other places, not followed',
+      '12 hidden or system files',
+      '1 cloud-only file that is not on the share itself',
+      '1 file with a name ShareCraft cannot use',
+      '1 file of a type this library does not take',
+      '3 files that are too large',
+      '4 files with paths that are too long',
+      '1 folder the server may not read',
+    ],
+  );
+  assert.deepEqual(hiddenLines({ system: 1200 }), ['1,200 hidden or system files']);
+});
+
+test('unavailableText gives a share its own words and leaves the bucket words alone', () => {
+  assert.equal(unavailableText('gone', 'share'), 'Not on the share');
+  assert.equal(unavailableText('denied', 'share'), 'Access refused');
+  assert.equal(unavailableText('offline', 'share'), 'Share not reachable');
+  assert.equal(unavailableText('changing', 'share'), 'Changing, try again');
+  assert.equal(unavailableText('too_large', 'share'), 'Too large to open');
+  assert.equal(unavailableText('not_approved', 'share'), 'Folder not approved');
+  assert.equal(unavailableText('anything', 'share'), 'Unavailable');
+  assert.equal(unavailableText(undefined, 'share'), 'Unavailable');
+  assert.equal(unavailableText('gone'), 'Not in the bucket');
+  assert.equal(unavailableMarkFor({ unavailable: 'gone' }, 'share'), 'Not on the share');
+  assert.equal(unavailableMarkFor({ name: 'a.txt' }, 'share'), '');
+});
+
+test('sourceName for a share never shows a path the source does not carry', () => {
+  assert.equal(sourceName({ kind: 'share', path: null }), 'a file share');
+  assert.equal(sourceName({ kind: 'share' }), 'a file share');
+  assert.equal(sourceName({ kind: 'share', path: '' }), 'a file share');
+  assert.equal(sourceName({ kind: 'share', path: '\\\\server\\share\\docs' }), '\\\\server\\share\\docs');
+});
+
+test('opening a file: which answers mean ask again, and which are words to show', () => {
+  assert.equal(SHARE_RETRIES, 5);
+  assert.equal(SHARE_RETRY_MS, 2000);
+  assert.equal(FETCHING_TEXT, 'Fetching from the share…');
+  assert.equal(fetchingFromShare(503, { error: 'busy' }), true);
+  assert.equal(fetchingFromShare(423, { error: 'held', scan: 'pending' }), true);
+  assert.equal(fetchingFromShare(423, { error: 'held', scan: 'infected' }), false);
+  assert.equal(fetchingFromShare(423, null), false);
+  assert.equal(fetchingFromShare(503, { error: 'unavailable' }), false);
+  assert.equal(fetchingFromShare(200, null), false);
+  assert.equal(openRefusedText(409, { error: 'source_unavailable', reason: 'gone', message: 'The file is no longer available on the file share.' }), 'The file is no longer available on the file share.');
+  assert.equal(openRefusedText(409, { error: 'source_unavailable', reason: 'gone' }), 'Not on the share.');
+  assert.equal(openRefusedText(409, { error: 'source_copy_unavailable', message: 'Download the file instead.' }), 'Download the file instead.');
+  assert.equal(openRefusedText(404, { error: 'not_found' }), '');
+  assert.equal(openRefusedText(409, { error: 'source_read_only' }), '');
+  assert.equal(openRefusedText(409, null), '');
+});
+
 test('mayResolve is true only when the server said the person may Retry or Discard', () => {
   assert.equal(mayResolve({ saving: 'failed', may_resolve: true }), true);
   assert.equal(mayResolve({ state: 'failed', may_resolve: true }), true);
@@ -475,4 +641,19 @@ test('mayResolve is true only when the server said the person may Retry or Disca
   assert.equal(mayResolve({ saving: 'failed' }), false);
   assert.equal(mayResolve({ saving: 'failed', may_resolve: 'true' }), false);
   assert.equal(mayResolve(null), false);
+});
+
+test('contentRevision uses the share tag only for an external file with no session revision', () => {
+  const external = { external: { modified_at: 1 }, revision: 'tag-1' };
+  assert.equal(contentRevision(null, external), 'tag-1');
+  assert.equal(contentRevision(undefined, external), 'tag-1');
+  assert.equal(contentRevision(null, { revision: 'r9' }), null);
+  assert.equal(contentRevision(null, { external: { modified_at: 1 }, revision: null }), null);
+  assert.equal(contentRevision('sess', external), 'sess');
+  assert.equal(contentRevision('sess', { revision: 'r9' }), 'sess');
+});
+
+test('shareConnectErrorText words the folder-in-use refusal and leaves other codes empty', () => {
+  assert.match(shareConnectErrorText('share_location_in_use'), /Another library already shows this folder/);
+  assert.equal(shareConnectErrorText('name_taken'), '');
 });

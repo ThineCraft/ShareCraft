@@ -3,12 +3,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use records::SharePath;
-use server::share::{FsBudget, FsEntry, FsKind, FsStat, ShareFs};
+use server::share::{FileIdentity, FsBudget, FsEntry, FsKind, FsStat, ShareFs};
 
 #[derive(Clone)]
 pub struct FakeShare {
@@ -44,6 +44,9 @@ struct Inner {
     read_started: AtomicUsize,
     stat_delayed: AtomicUsize,
     opened_paths: Mutex<Vec<PathBuf>>,
+    identities: Mutex<HashMap<PathBuf, FileIdentity>>,
+    failing_identities: Mutex<HashSet<PathBuf>>,
+    next_inode: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -94,6 +97,9 @@ impl FakeShare {
                 read_started: AtomicUsize::new(0),
                 stat_delayed: AtomicUsize::new(0),
                 opened_paths: Mutex::new(Vec::new()),
+                identities: Mutex::new(HashMap::new()),
+                failing_identities: Mutex::new(HashSet::new()),
+                next_inode: AtomicU64::new(1),
             }),
         }
     }
@@ -183,6 +189,36 @@ impl FakeShare {
         if let Some(node) = self.nodes().get_mut(&self.path(path)) {
             node.attributes = bits;
         }
+    }
+
+    /// Gives every one of `paths` one new file-system identity, as names that reach one folder
+    /// (a case-insensitive mount, another alias) have. Paths given no identity have none, as on
+    /// a platform without stable identities.
+    #[allow(dead_code)]
+    pub fn alias(&self, paths: &[&str]) {
+        let identity = FileIdentity {
+            device: 7,
+            inode: self.inner.next_inode.fetch_add(1, Ordering::SeqCst),
+        };
+        let mut identities = self
+            .inner
+            .identities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for path in paths {
+            identities.insert(self.path(path), identity);
+        }
+    }
+
+    /// Makes every identity lookup of `path` fail with operating-system text that must never
+    /// reach an answer, while its canonical lookup still works.
+    #[allow(dead_code)]
+    pub fn fail_identity(&self, path: &str) {
+        self.inner
+            .failing_identities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(self.path(path));
     }
 
     pub fn deny(&self, path: &str) {
@@ -497,6 +533,10 @@ impl Drop for ActiveList<'_> {
     }
 }
 
+/// The operating-system text of an injected identity failure.
+#[allow(dead_code)]
+pub const IDENTITY_FAILURE: &str = "injected identity failure at \\\\fileserver\\secret";
+
 fn path_refused() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "path refused")
 }
@@ -739,6 +779,29 @@ impl ShareFs for FakeShare {
         }
         self.unavailable(path)?;
         self.contained(approved_root, path)
+    }
+
+    fn identity(&self, approved_root: &Path, path: &Path) -> io::Result<Option<FileIdentity>> {
+        self.unavailable(path)?;
+        if self
+            .inner
+            .failing_identities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(path)
+        {
+            return Err(io::Error::other(IDENTITY_FAILURE));
+        }
+        let canonical = self.contained(approved_root, path)?;
+        let identities = self
+            .inner
+            .identities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Ok(identities
+            .get(path)
+            .or_else(|| identities.get(&canonical))
+            .copied())
     }
 }
 

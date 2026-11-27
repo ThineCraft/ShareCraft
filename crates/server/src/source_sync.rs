@@ -18,7 +18,10 @@
 //!
 //! The worker ([`start_worker`], [`tick_once`]) syncs the libraries that are due (their poll
 //! time passed and no retry time ahead) every minute, and a library at once when it is woken
-//! ([`Sources::wake`]: a webhook delivery, a change of the connection). At most [`MAX_SYNCS`]
+//! ([`Sources::wake`]: a webhook delivery, a change of the connection, a read that found a
+//! changed file). A file share is listed again at its next check time ([`next_share_check`]):
+//! the wait doubles with each listing in a row that changed nothing, at most an hour, and is
+//! never less than four times the last listing took. At most [`MAX_SYNCS`]
 //! run at once. A rate limit is waited out (`retry_at`); a connection that no longer works
 //! (`not_connected`) is not tried again until an owner changes it or presses "Sync now"; any
 //! other failure is retried after a back-off of a minute, doubled for each failure in a row, at
@@ -690,6 +693,42 @@ const BATCH: i64 = 32;
 const FIRST_BACK_OFF: i64 = 60;
 /// The longest wait after failed syncs, in seconds.
 const MAX_BACK_OFF: i64 = 60 * 60;
+/// The longest a quiet share waits for its next listing, in seconds, unless its own poll time
+/// is longer or its listing is slow (see [`next_share_check`]).
+const MAX_SHARE_INTERVAL: u64 = 60 * 60;
+/// A share is listed again no sooner than this many times as long as its last listing took, so
+/// listing loads the file server at most about a fifth of the time.
+const LISTING_SPACING: u32 = 4;
+
+/// When a share listed at `now` is listed again: `poll_seconds × 2^quiet_polls` (the listings in
+/// a row that changed nothing), at most an hour or `poll_seconds` if that is longer, and never
+/// sooner than four times `listing_took` after `now`. Pure; saturates rather than overflows.
+#[must_use]
+pub fn next_share_check(
+    now: OffsetDateTime,
+    poll_seconds: u32,
+    quiet_polls: u32,
+    listing_took: std::time::Duration,
+) -> OffsetDateTime {
+    let poll = u64::from(poll_seconds.max(1));
+    let cap = MAX_SHARE_INTERVAL.max(poll);
+    let doubled = 1_u64
+        .checked_shl(quiet_polls)
+        .and_then(|factor| poll.checked_mul(factor))
+        .map_or(cap, |seconds| seconds.min(cap));
+    let interval =
+        std::time::Duration::from_secs(doubled).max(listing_took.saturating_mul(LISTING_SPACING));
+    let longest = std::time::Duration::from_secs(cap);
+    time::Duration::try_from(interval)
+        .ok()
+        .and_then(|interval| now.checked_add(interval))
+        .or_else(|| {
+            time::Duration::try_from(longest)
+                .ok()
+                .and_then(|longest| now.checked_add(longest))
+        })
+        .unwrap_or(now)
+}
 
 /// The sync worker's shared state: the libraries woken (a set, so wakes coalesce), the ones
 /// being synced, the failures in a row of each, and the turns.
@@ -700,6 +739,12 @@ pub struct Sources {
     running: Mutex<HashMap<NodeId, bool>>,
     /// Failed syncs in a row, for the back-off. Kept in memory only.
     failures: Mutex<HashMap<NodeId, u32>>,
+    /// Share listings in a row that changed nothing, for the adaptive poll (see
+    /// [`next_share_check`]). Kept in memory only, so a restart starts every count over.
+    quiet: Mutex<HashMap<NodeId, u32>>,
+    /// Libraries being disconnected: no sync of them starts, a listing under way gives up at
+    /// its next folder, and a sync that ends meanwhile does not make them due again.
+    stopping: Mutex<HashMap<NodeId, usize>>,
     /// Taken by each running sync.
     turns: Arc<Semaphore>,
     /// A test seam held immediately before a worker starts a chosen source.
@@ -720,6 +765,8 @@ impl Default for Sources {
             pending: Mutex::new(HashSet::new()),
             running: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
+            quiet: Mutex::new(HashMap::new()),
+            stopping: Mutex::new(HashMap::new()),
             turns: Arc::new(Semaphore::new(MAX_SYNCS)),
             start_gate: Arc::new(RwLock::new(())),
             start_held: Notify::new(),
@@ -739,8 +786,10 @@ impl Sources {
     /// Asks the worker to sync `library` at once, without waiting for its poll time (a webhook
     /// delivery, a change of the connection). Wakes before it runs coalesce into one sync; a
     /// wake while it runs syncs it again after. A connection that stopped (`not_connected`) or
-    /// waits for a retry time is not synced by a wake.
+    /// waits for a retry time is not synced by a wake. A wake ignores a share's next check
+    /// time and starts its count of quiet listings over.
     pub fn wake(&self, library: NodeId) {
+        lock(&self.quiet).remove(&library);
         lock(&self.pending).insert(library);
         self.wake.notify_one();
     }
@@ -755,6 +804,46 @@ impl Sources {
     /// Forgets the failures in a row of `library`: someone changed the connection.
     pub(crate) fn forget_failures(&self, library: NodeId) {
         lock(&self.failures).remove(&library);
+    }
+
+    /// Counts a finished share listing of `library` and answers its quiet listings in a row: a
+    /// listing that `changed` something, or one woken again while it ran (the wake asked for a
+    /// fresh start), starts the count over; one that changed nothing adds one.
+    fn quiet_after(&self, library: NodeId, changed: bool) -> u32 {
+        let woken = lock(&self.running).get(&library).copied().unwrap_or(false);
+        let mut quiet = lock(&self.quiet);
+        if changed || woken {
+            quiet.remove(&library);
+            return 0;
+        }
+        let count = quiet.entry(library).or_insert(0);
+        // From 32 on the interval is at its cap whatever the count.
+        *count = count.saturating_add(1).min(32);
+        *count
+    }
+
+    /// Starts the count of quiet listings of `library` over: its listing failed.
+    fn forget_quiet(&self, library: NodeId) {
+        lock(&self.quiet).remove(&library);
+    }
+
+    /// Stops the syncs of `library` until the answer is dropped (a disconnect): none starts, a
+    /// listing under way gives up at its next folder, and one that ends meanwhile does not make
+    /// the library due again; a listing that gives up records nothing. Stops of one library
+    /// are counted, so the syncs stay stopped until every holder has dropped its answer.
+    pub fn stop(&self, library: NodeId) -> Stopping<'_> {
+        let mut stopping = lock(&self.stopping);
+        let holders = stopping.entry(library).or_insert(0);
+        *holders = holders.saturating_add(1);
+        Stopping {
+            sources: self,
+            library,
+        }
+    }
+
+    /// Whether `library` is being disconnected (see [`Sources::stop`]).
+    pub(crate) fn is_stopping(&self, library: NodeId) -> bool {
+        lock(&self.stopping).contains_key(&library)
     }
 
     /// Holds worker source starts until the returned guard is dropped.
@@ -826,10 +915,29 @@ impl Sources {
     }
 }
 
+/// The syncs of a library stopped by [`Sources::stop`], until this is dropped.
+pub struct Stopping<'a> {
+    sources: &'a Sources,
+    library: NodeId,
+}
+
+impl Drop for Stopping<'_> {
+    fn drop(&mut self) {
+        let mut stopping = lock(&self.sources.stopping);
+        if let HashEntry::Occupied(mut holders) = stopping.entry(self.library) {
+            *holders.get_mut() = holders.get().saturating_sub(1);
+            if *holders.get() == 0 {
+                holders.remove();
+            }
+        }
+    }
+}
+
 /// Syncs every library that is woken (see [`Sources::wake`]) or due (see
 /// [`records::Db::due_sources`]) as of `now`, at most [`MAX_SYNCS`] at once, and waits for
 /// them. Answers how many syncs it started. A library already being synced is left to that
-/// sync.
+/// sync. It ends by keeping the file-share cache within its size ([`crate::external::evict`]),
+/// so a lowered size takes effect by the next tick.
 pub async fn tick_once(state: &AppState, now: OffsetDateTime) -> usize {
     let mut running = JoinSet::new();
     let count = start_due(state, now, &mut running).await;
@@ -838,6 +946,7 @@ pub async fn tick_once(state: &AppState, now: OffsetDateTime) -> usize {
             eprintln!("sharecraft-server: a sync did not finish: {e}");
         }
     }
+    crate::external::evict(state).await;
     count
 }
 
@@ -867,10 +976,9 @@ async fn start_due(state: &AppState, now: OffsetDateTime, running: &mut JoinSet<
         Err(e) => eprintln!("sharecraft-server: database failure: {e}"),
     }
     let mut started = 0;
-    for (library, _) in chosen
-        .into_iter()
-        .filter(|(library, woken)| sources.start(*library, *woken))
-    {
+    for (library, _) in chosen.into_iter().filter(|(library, woken)| {
+        !sources.is_stopping(*library) && sources.start(*library, *woken)
+    }) {
         started += 1;
         let mut guard = RunningGuard::new(state.clone(), library);
         running.spawn({
@@ -950,6 +1058,10 @@ async fn start_worker_sync(state: &AppState, library: NodeId, now: OffsetDateTim
             return WorkerStart::Ineligible;
         }
     };
+    // Being disconnected: the turn is given up at once for the disconnect to take.
+    if state.sources().is_stopping(library) {
+        return WorkerStart::Ineligible;
+    }
     let generation = match db.source_generation(library).await {
         Ok(Some(generation)) => generation,
         Ok(None) => return WorkerStart::Ineligible,
@@ -994,11 +1106,13 @@ async fn start_worker_sync(state: &AppState, library: NodeId, now: OffsetDateTim
 /// the count over. Whether it is to be tried again soon: it was busy (`Ok(None)` while
 /// another sync of it ran), or changed meanwhile (due again at once).
 async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> bool {
+    let waiting = std::time::Instant::now();
     let Ok(_turn) = Arc::clone(&state.sources().turns).acquire_owned().await else {
         return false;
     };
     let outcome = match start_worker_sync(state, library, now).await {
         WorkerStart::Started(started) => {
+            let queued = waiting.elapsed();
             let StartedSync {
                 source_lock,
                 config,
@@ -1014,7 +1128,7 @@ async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> boo
                 }
                 SourceKind::S3 => run(&S3Source, state, &config, &status, now, generation).await,
             };
-            let finished = finish(state, &config, status, now, outcome, generation).await;
+            let finished = finish(state, &config, status, now, queued, outcome, generation).await;
             drop(source_lock);
             finished
         }
@@ -1061,10 +1175,12 @@ impl Drop for Worker {
 
 /// Starts the sync worker: it starts the syncs of woken and due libraries whenever a library
 /// is woken and every minute (every second while a woken library waits), without waiting for
-/// them to finish.
+/// them to finish. At most once a minute it also keeps the file-share cache within its size
+/// ([`crate::external::evict`]), so a lowered size takes effect within a minute.
 pub fn start_worker(state: AppState) -> Worker {
     let task = tokio::spawn(async move {
         let mut running = JoinSet::new();
+        let mut evicted: Option<tokio::time::Instant> = None;
         loop {
             while let Some(finished) = running.try_join_next() {
                 if let Err(e) = finished {
@@ -1073,6 +1189,10 @@ pub fn start_worker(state: AppState) -> Worker {
             }
             // The JoinSet owns every started sync, so dropping this worker stops them too.
             start_due(&state, OffsetDateTime::now_utc(), &mut running).await;
+            if evicted.is_none_or(|at| at.elapsed() >= POLL.saturating_sub(AGAIN_SOON)) {
+                crate::external::evict(&state).await;
+                evicted = Some(tokio::time::Instant::now());
+            }
             let wait = if state.sources().has_pending() {
                 AGAIN_SOON
             } else {
@@ -1135,7 +1255,16 @@ pub async fn sync_once(
         SourceKind::Share => run(&ShareSource, state, &config, &status, now, generation).await,
         SourceKind::S3 => run(&S3Source, state, &config, &status, now, generation).await,
     };
-    finish(state, &config, status, now, outcome, generation).await
+    finish(
+        state,
+        &config,
+        status,
+        now,
+        std::time::Duration::ZERO,
+        outcome,
+        generation,
+    )
+    .await
 }
 
 /// What a sync that did not fail found.
@@ -1144,6 +1273,8 @@ enum Outcome {
     Unchanged {
         etag: Option<String>,
         listing_detail: Option<serde_json::Value>,
+        /// How long the listing took (zero when nothing was listed).
+        took: std::time::Duration,
     },
     /// The library now mirrors `report.commit`.
     Synced {
@@ -1159,15 +1290,26 @@ enum Outcome {
 /// status is written only if the connection is still at `generation`: a change made meanwhile
 /// (another branch or folder, a token, "Sync now") must not be undone by this sync's bookmark.
 /// Then the connection is only made due again at once, marked half applied when it is.
+/// `queued` is how long the sync waited after `now` before it started listing.
 async fn finish(
     state: &AppState,
     config: &SourceConfig,
     before: SourceStatus,
     now: OffsetDateTime,
+    queued: std::time::Duration,
     outcome: Result<Outcome, Failure>,
     generation: i64,
 ) -> Result<Option<SyncReport>, SyncError> {
     let library = config.library;
+    // Being disconnected (see [`Sources::stop`]): a sync that gave up, or failed meanwhile,
+    // records no failure, event or back-off; the disconnect removes the connection, or makes
+    // it due again itself if it fails.
+    if state.sources().is_stopping(library)
+        && let Err(Failure { error, .. }) = outcome
+    {
+        state.sources().forget_quiet(library);
+        return Err(error);
+    }
     let mut status = SourceStatus {
         last_checked_at: Some(now),
         ..before
@@ -1175,11 +1317,32 @@ async fn finish(
     // Recorded only with the status: a sync whose connection changed meanwhile records neither.
     let event: Option<NewEvent>;
     let listing_detail: Option<serde_json::Value>;
+    // A share is listed again after an interval that grows while its listings change nothing
+    // (see [`next_share_check`]); other sources keep their poll time.
+    let share = matches!(config.kind, SourceKind::Share);
+    let sources = state.sources();
+    let next_check = |changed: bool, took: std::time::Duration| {
+        share.then(|| {
+            let quiet = sources.quiet_after(library, changed);
+            // Counted from when the listing finished, not from `now`: a sync that waited for a
+            // turn must not find its next check already past. Whole seconds, so a quick listing
+            // keeps the times a tick was given.
+            let listed = time::Duration::try_from(std::time::Duration::from_secs(
+                queued.saturating_add(took).as_secs(),
+            ))
+            .ok()
+            .and_then(|elapsed| now.checked_add(elapsed))
+            .unwrap_or(now);
+            next_share_check(listed, config.poll_seconds, quiet, took)
+        })
+    };
     let answer = match outcome {
         Ok(Outcome::Unchanged {
             etag,
             listing_detail: detail,
+            took,
         }) => {
+            status.next_check_at = next_check(false, took);
             status.state = SourceState::Ok;
             status.etag = etag;
             status.last_error = None;
@@ -1195,6 +1358,7 @@ async fn finish(
             content,
             took,
         }) => {
+            status.next_check_at = next_check(true, took);
             status.state = SourceState::Ok;
             status.etag = etag;
             status.last_commit = (!report.commit.is_empty()).then(|| report.commit.clone());
@@ -1243,6 +1407,11 @@ async fn finish(
         }
         Err(Failure { error: e, applying }) => {
             listing_detail = None;
+            // Retried after the back-off (`retry_at`), not after a quiet share's long interval.
+            status.next_check_at = None;
+            if share {
+                sources.forget_quiet(library);
+            }
             if applying {
                 // Half applied: never answered as unchanged, even at the last commit.
                 status.etag = Some(DIRTY_ETAG.to_owned());
@@ -1273,7 +1442,9 @@ async fn finish(
     let recorded = match db.set_source_status_if(library, &status, generation).await {
         Ok(true) => {
             if let Some(detail) = listing_detail
-                && let Err(e) = db.record_listing(library, generation, None, &detail).await
+                && let Err(e) = db
+                    .record_listing(library, generation, status.next_check_at, &detail)
+                    .await
             {
                 eprintln!(
                     "sharecraft-server: cannot record the listing of library {}: {e}",
@@ -1286,7 +1457,14 @@ async fn finish(
             Ok(())
         }
         // Changed meanwhile: due again at once, still marked if the library is half applied.
+        // Being disconnected: not made due again; the disconnect removes the connection, or
+        // makes it due itself if it fails.
+        Ok(false) if sources.is_stopping(library) => {
+            sources.forget_quiet(library);
+            Ok(())
+        }
         Ok(false) => {
+            sources.forget_quiet(library);
             let dirty = (status.etag.as_deref() == Some(DIRTY_ETAG)).then_some(DIRTY_ETAG);
             if let (SourceState::RateLimited, Some(until), Some(error)) =
                 (status.state, status.retry_at, status.last_error.as_deref())
@@ -1495,6 +1673,7 @@ async fn run<S: StorageSource>(
             return Ok(Outcome::Unchanged {
                 etag,
                 listing_detail: None,
+                took: std::time::Duration::ZERO,
             });
         }
         Look::Listing(listing) => *listing,
@@ -1506,6 +1685,7 @@ async fn run<S: StorageSource>(
         return Ok(Outcome::Unchanged {
             etag: listing.etag.or_else(|| status.etag.clone()),
             listing_detail: None,
+            took: listing.took,
         });
     }
     let user = connector(state, config, &listing.bookmark, listing.credit.as_deref()).await?;
@@ -1727,6 +1907,7 @@ async fn run<S: StorageSource>(
         return Ok(Outcome::Unchanged {
             etag: None,
             listing_detail: Some(hidden.detail()),
+            took: listing.took,
         });
     }
 

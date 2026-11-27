@@ -38,6 +38,7 @@ pub(super) fn path_reason(reason: PathRefusal) -> &'static str {
         PathRefusal::Stream => "stream",
         PathRefusal::TooLong => "too_long",
         PathRefusal::WholeDrive => "whole_drive",
+        PathRefusal::AdministrativeShare => "administrative_share",
         PathRefusal::OtherSystem => "other_system",
         PathRefusal::EmptySegment
         | PathRefusal::BadCharacter
@@ -47,29 +48,52 @@ pub(super) fn path_reason(reason: PathRefusal) -> &'static str {
 }
 
 /// Whether `path` and the server's private data folder overlap, lexically or after resolving
-/// links. Canonicalization uses the file-system seam and never exposes its error text.
-pub(super) async fn overlaps_data_folder(state: &AppState, path: &SharePath) -> bool {
+/// links. Canonicalization uses the file-system seam and never exposes its error text. Like
+/// every other connect lookup it holds one of the server's lookup permits
+/// ([`crate::share::SHARE_LOOKUPS`]) for its whole blocking call and is waited for no later
+/// than `deadline`.
+///
+/// # Errors
+/// `503 unavailable` when no lookup permit comes free by `deadline` (the server's lookups are
+/// already tied up, most likely by a hung share server); `share_unreachable` (`offline`) when
+/// the lookup does not finish by `deadline`. A lookup that fails answers no overlap.
+pub(super) async fn overlaps_data_folder(
+    state: &AppState,
+    path: &SharePath,
+    deadline: tokio::time::Instant,
+) -> Result<bool, ApiError> {
     let data_text = state.config().data_dir.to_string_lossy();
     if let Ok(data) = SharePath::parse(&data_text)
         && (path.is_within(&data) || data.is_within(path))
     {
-        return true;
+        return Ok(true);
     }
+    let permit = tokio::time::timeout_at(deadline, state.shares().lookups().acquire_owned())
+        .await
+        .map_err(|_| ApiError::Unavailable)?
+        .map_err(|_| ApiError::Unavailable)?;
     let fs = state.shares().fs();
     let share = path.to_path_buf();
     let data = state.config().data_dir.clone();
-    tokio::task::spawn_blocking(move || {
-        let share = fs.canonical(&share, &share).ok()?;
-        let data = fs.canonical(&data, &data).ok()?;
-        // Windows canonical paths carry a `\\?\` prefix, which only this conversion removes.
-        let share = canonical_share_path(&share).ok()?;
-        let data = canonical_share_path(&data).ok()?;
-        Some(share.is_within(&data) || data.is_within(&share))
-    })
+    let overlap = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            let overlap = (|| {
+                let share = fs.canonical(&share, &share).ok()?;
+                let data = fs.canonical(&data, &data).ok()?;
+                // Windows canonical paths carry a `\\?\` prefix, which only this conversion
+                // removes.
+                let share = canonical_share_path(&share).ok()?;
+                let data = canonical_share_path(&data).ok()?;
+                Some(share.is_within(&data) || data.is_within(&share))
+            })();
+            drop(permit);
+            overlap
+        }),
+    )
     .await
-    .ok()
-    .flatten()
-    .unwrap_or(false)
+    .map_err(|_| ApiError::ShareUnreachable("offline"))?;
+    Ok(overlap.ok().flatten().unwrap_or(false))
 }
 
 #[derive(Deserialize)]
@@ -128,6 +152,14 @@ pub(crate) async fn change_shares(
     let roots = match change.roots {
         None => None,
         Some(values) => {
+            // Every root's data-folder lookup together waits no longer than one listing may.
+            let list_seconds = state
+                .db()
+                .share_settings()
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?
+                .list_seconds;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(list_seconds);
             let mut parsed = Vec::with_capacity(values.len());
             for value in &values {
                 let path = SharePath::parse(value)
@@ -135,7 +167,7 @@ pub(crate) async fn change_shares(
                 valid_root(&path)
                     .and_then(|()| usable_here(&path))
                     .map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
-                if overlaps_data_folder(&state, &path).await {
+                if overlaps_data_folder(&state, &path, deadline).await? {
                     return Err(ApiError::ShareNotApproved);
                 }
                 parsed.push(path.display());
@@ -172,7 +204,8 @@ pub(crate) async fn change_shares(
         .into_iter()
         .filter_map(|(key, value)| value.map(|v| (key, v)))
         .collect();
-    let mut roots_turn = if changes.iter().any(|(key, _)| *key == SHARE_ROOTS) {
+    let roots_changed = changes.iter().any(|(key, _)| *key == SHARE_ROOTS);
+    let mut roots_turn = if roots_changed {
         Some(
             state
                 .db()
@@ -189,6 +222,19 @@ pub(crate) async fn change_shares(
         .set_settings(signed.session.user.id, changes)
         .await?;
     drop(roots_turn.take());
+    if roots_changed {
+        // A share stopped because its folder was not approved is not retried on its own; the
+        // roots changed, so each is made due and woken. Nothing about it fails this request.
+        match state.db().requeue_stopped_shares().await {
+            Ok(libraries) => {
+                for library in libraries {
+                    state.sources().forget_failures(library);
+                    state.sources().wake(library);
+                }
+            }
+            Err(e) => eprintln!("sharecraft-server: cannot wake stopped shares: {e}"),
+        }
+    }
     Ok(Json(shares_out(&state).await?))
 }
 

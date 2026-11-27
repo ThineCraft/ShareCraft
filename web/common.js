@@ -109,6 +109,12 @@ const MESSAGES = {
   repository_too_large: 'That repository is too large to connect as a library.',
   source_read_only: 'This library is kept in step with an outside source, so it cannot be changed here.',
   source_busy: 'An update is running. Wait for it to finish, then try again.',
+  source_unavailable: 'This file cannot be read from where it is kept right now.',
+  source_copy_unavailable:
+    'Files in this library are read from a file share when opened and cannot be copied here yet. Download the file instead.',
+  invalid_share_path: 'That is not a folder path ShareCraft can use. Write it like \\\\server\\share\\folder.',
+  share_not_approved: 'That folder is not approved. Ask an administrator to approve this folder under Sharing settings.',
+  share_unreachable: 'ShareCraft could not open that folder. Check the path and that the server may read it.',
   source_exists: 'This library is already connected to a repository.',
   library_not_empty: 'Only an empty library can be connected to a repository.',
   invalid_template:

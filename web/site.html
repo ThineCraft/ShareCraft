@@ -86,7 +86,15 @@
    <label class="check"><input type="radio" name="library-source" value="empty" checked> Empty library</label>
    <label class="check"><input type="radio" name="library-source" value="github"> From a GitHub repository</label>
    <label class="check"><input type="radio" name="library-source" value="s3"> From S3 storage</label>
+   <label class="check"><input type="radio" name="library-source" value="share"> From a file share</label>
   </fieldset>
+  <div id="share-library-fields" hidden>
+   <div class="field">
+    <label for="share-path">Folder</label>
+    <input type="text" id="share-path" autocomplete="off" spellcheck="false" placeholder="\\server\share\folder" aria-describedby="share-path-note">
+    <small id="share-path-note" class="meta">A network path such as \\server\share\folder that an administrator has approved. Files stay on the share: ShareCraft reads one when someone opens it. In this release the library is read-only.</small>
+   </div>
+  </div>
   <div id="github-library-fields" hidden>
    <div class="field">
     <label for="github-repository">Repository</label>

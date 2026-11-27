@@ -75,6 +75,20 @@ pub trait ShareFs: Send + Sync + 'static {
     fn open(&self, approved_root: &Path, path: &Path) -> io::Result<Box<dyn Read + Send>>;
     /// Resolves links and refuses a result outside `approved_root`.
     fn canonical(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf>;
+    /// The file-system identity of a contained `path` (read only), so two names for one folder
+    /// can be told apart from two folders: a case-insensitive CIFS mount on Linux gives
+    /// `/mnt/s/Projects` and `/mnt/s/projects` different canonical paths. `None` where the
+    /// platform offers no stable identity; callers then rely on path comparisons alone.
+    fn identity(&self, _approved_root: &Path, _path: &Path) -> io::Result<Option<FileIdentity>> {
+        Ok(None)
+    }
+}
+
+/// What identifies a file or folder on its file system, whatever name reaches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
 }
 
 /// A deadline and shared entry allowance used by all folder reads in one listing.
@@ -163,6 +177,34 @@ impl ShareFs for OsFs {
     fn canonical(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
         canonical_within(approved_root, path)
     }
+
+    fn identity(&self, approved_root: &Path, path: &Path) -> io::Result<Option<FileIdentity>> {
+        // Where there is no identity to read, nothing touches the share: each lookup here runs
+        // inside a connect's timed canonical lookup.
+        if cfg!(not(unix)) {
+            return Ok(None);
+        }
+        let canonical = canonical_within(approved_root, path)?;
+        os_identity(&canonical)
+    }
+}
+
+/// On Unix the device and inode numbers.
+#[cfg(unix)]
+fn os_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path)?;
+    Ok(Some(FileIdentity {
+        device: meta.dev(),
+        inode: meta.ino(),
+    }))
+}
+
+/// Elsewhere none: Windows canonical paths already come back in on-disk case, and its file
+/// index is not stable on every file system (and reading it needs unsafe code).
+#[cfg(not(unix))]
+fn os_identity(_path: &Path) -> io::Result<Option<FileIdentity>> {
+    Ok(None)
 }
 
 fn canonical_within(approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
@@ -242,6 +284,7 @@ pub struct Shares {
     cache_max_bytes_for_tests: Mutex<Option<u64>>,
     listing_progress: Mutex<HashMap<NodeId, Arc<AtomicUsize>>>,
     lookups: Arc<tokio::sync::Semaphore>,
+    listing_took_for_tests: Mutex<Option<Duration>>,
 }
 
 /// How many canonical-path lookups a connect may have in flight across the whole server. A
@@ -269,6 +312,7 @@ impl Shares {
             cache_max_bytes_for_tests: Mutex::new(None),
             listing_progress: Mutex::new(HashMap::new()),
             lookups: Arc::new(tokio::sync::Semaphore::new(SHARE_LOOKUPS)),
+            listing_took_for_tests: Mutex::new(None),
         }
     }
 
@@ -342,6 +386,16 @@ impl Shares {
         flight
     }
 
+    /// [`Shares::flight`], waited for no longer than a read turn is; `None` if it did not come
+    /// free in time (a read of the node, perhaps stuck in the operating system, holds it).
+    pub(crate) async fn flight_within(&self, node: NodeId) -> Option<Flight> {
+        let wait = *self
+            .read_wait
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tokio::time::timeout(wait, self.flight(node)).await.ok()
+    }
+
     pub(crate) async fn read_turn(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let wait = *self
             .read_wait
@@ -412,6 +466,24 @@ impl Shares {
             .cache_max_bytes_for_tests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bytes);
+    }
+
+    /// Makes every later share listing report that it took `took`, whatever it really took, so
+    /// tests can drive the spacing after a slow listing without waiting that long.
+    #[doc(hidden)]
+    pub fn set_listing_took_for_tests(&self, took: Duration) {
+        *self
+            .listing_took_for_tests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(took);
+    }
+
+    /// How long a listing that really took `took` is taken to have lasted.
+    fn listing_took(&self, took: Duration) -> Duration {
+        self.listing_took_for_tests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or(took)
     }
 
     /// Number of node-flight entries. Used to prove cancellation cleanup in integration tests.
@@ -513,7 +585,12 @@ pub enum ListError {
     TooManyFiles(usize),
     TooSlow,
     TooDeep,
+    /// The library is being disconnected; the walk gave up.
+    Stopped,
 }
+
+/// How often a listing waiting for a folder looks whether it was asked to stop.
+const STOP_POLL: Duration = Duration::from_millis(50);
 
 /// A connected file share as a storage source.
 pub(crate) struct ShareSource;
@@ -543,16 +620,35 @@ impl StorageSource for ShareSource {
             max_depth: 100,
         };
         let progress = state.shares().begin_listing(config.library);
+        let library = config.library;
+        let stopped = || state.sources().is_stopping(library);
         let listed = list_share_progress(
             state.shares().fs(),
             approved,
             &root,
             &limits,
             Some(progress.counter()),
+            Some(&stopped),
         )
         .await;
         drop(progress);
         let mut listed = listed.map_err(|error| listing_failed(error, &settings))?;
+
+        // A folder that shows nothing at all while the library holds items is far more often
+        // an unmounted mount point (an empty local folder) or a share that came back empty
+        // than a folder whose every file was deleted: nothing is removed on its word.
+        if listed.entries.is_empty()
+            && listed.unreadable.is_empty()
+            && listed.hidden.total() == 0
+            && !state
+                .db()
+                .source_items(config.library)
+                .await
+                .map_err(database_failed)?
+                .is_empty()
+        {
+            return Err(SyncError::Failed(EMPTY_LISTING.to_owned()));
+        }
 
         let mut protected = HashSet::new();
         if !listed.unreadable.is_empty() {
@@ -603,7 +699,7 @@ impl StorageSource for ShareSource {
             etag: None,
             credit: None,
             hidden: listed.hidden,
-            took: listed.took,
+            took: state.shares().listing_took(listed.took),
             seen: (),
         })))
     }
@@ -636,6 +732,9 @@ impl StorageSource for ShareSource {
     }
 }
 
+/// The failure recorded when a listing finds nothing at all while the library holds items.
+pub const EMPTY_LISTING: &str = "The folder is empty or not mounted; nothing was removed.";
+
 fn not_approved() -> SyncError {
     SyncError::NotConnected(
         "This folder is no longer approved for ShareCraft. An administrator can approve it again."
@@ -661,6 +760,10 @@ fn listing_failed(error: ListError, settings: &records::ShareSettings) -> SyncEr
             "Listing the folder took longer than {} seconds, so nothing was changed.",
             settings.list_seconds
         ),
+        ListError::Stopped => {
+            "The library is being disconnected, so its listing stopped and nothing was changed."
+                .to_owned()
+        }
         ListError::Unreachable | ListError::NotAFolder | ListError::TooDeep => {
             "The share could not be reached, so nothing was changed.".to_owned()
         }
@@ -697,16 +800,20 @@ pub async fn list_share(
     root: &SharePath,
     limits: &ListLimits,
 ) -> Result<ShareListing, ListError> {
-    list_share_progress(fs, approved_root, root, limits, None).await
+    list_share_progress(fs, approved_root, root, limits, None, None).await
 }
 
+/// [`list_share`], counting accepted files in `progress`, and giving up with
+/// [`ListError::Stopped`] before any further folder is read once `stopped` answers `true`.
 async fn list_share_progress(
     fs: Arc<dyn ShareFs>,
     approved_root: &SharePath,
     root: &SharePath,
     limits: &ListLimits,
     progress: Option<&AtomicUsize>,
+    stopped: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Result<ShareListing, ListError> {
+    let stop_asked = || stopped.is_some_and(|stopped| stopped());
     let started = Instant::now();
     let deadline = started.checked_add(limits.max_time).unwrap_or(started);
     let budget = FsBudget::new(limits.max_files, deadline);
@@ -715,16 +822,20 @@ async fn list_share_progress(
     let stat_fs = Arc::clone(&fs);
     let stat_approved = approved_path.clone();
     let stat_path = root_path.clone();
-    let stat_permit = acquire_permit(started, limits.max_time).await?;
-    let stat = wait_for(
-        started,
-        limits.max_time,
-        tokio::task::spawn_blocking(move || {
-            let _permit = stat_permit;
-            stat_fs.stat(&stat_approved, &stat_path)
-        }),
+    let stat_permit =
+        unless_stopped(acquire_permit(started, limits.max_time), &stop_asked).await??;
+    let stat = unless_stopped(
+        wait_for(
+            started,
+            limits.max_time,
+            tokio::task::spawn_blocking(move || {
+                let _permit = stat_permit;
+                stat_fs.stat(&stat_approved, &stat_path)
+            }),
+        ),
+        &stop_asked,
     )
-    .await?;
+    .await??;
     let stat = stat.map_err(|error| kind_of_failure(&error))?;
     if stat.kind != FsKind::Dir {
         return Err(ListError::NotAFolder);
@@ -738,6 +849,9 @@ async fn list_share_progress(
     let at_once = limits.at_once.max(1);
 
     while !queue.is_empty() {
+        if stop_asked() {
+            return Err(ListError::Stopped);
+        }
         if started.elapsed() > limits.max_time {
             return Err(ListError::TooSlow);
         }
@@ -746,7 +860,8 @@ async fn list_share_progress(
             let Some((path, relative, depth, root)) = queue.pop_front() else {
                 break;
             };
-            let permit = acquire_permit(started, limits.max_time).await?;
+            let permit =
+                unless_stopped(acquire_permit(started, limits.max_time), &stop_asked).await??;
             let turn_fs = Arc::clone(&fs);
             let turn_approved = approved_path.clone();
             let turn_budget = budget.clone();
@@ -763,13 +878,21 @@ async fn list_share_progress(
         }
 
         while !turns.is_empty() {
-            let remaining = limits.max_time.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return Err(ListError::TooSlow);
-            }
-            let joined = tokio::time::timeout(remaining, turns.join_next())
-                .await
-                .map_err(|_| ListError::TooSlow)?;
+            // Waited for in short steps, so a stop is noticed while a slow folder is read.
+            let joined = loop {
+                if stop_asked() {
+                    return Err(ListError::Stopped);
+                }
+                let remaining = limits.max_time.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(ListError::TooSlow);
+                }
+                if let Ok(joined) =
+                    tokio::time::timeout(remaining.min(STOP_POLL), turns.join_next()).await
+                {
+                    break joined;
+                }
+            };
             let Some(joined) = joined else {
                 break;
             };
@@ -886,6 +1009,24 @@ async fn list_share_progress(
         temps,
         took: started.elapsed(),
     })
+}
+
+/// Waits for `future`, looking every [`STOP_POLL`] whether the listing was asked to stop; then
+/// [`ListError::Stopped`] (the future is dropped; a blocking call it started finishes on its
+/// own thread).
+async fn unless_stopped<F: std::future::Future>(
+    future: F,
+    stop_asked: &impl Fn() -> bool,
+) -> Result<F::Output, ListError> {
+    tokio::pin!(future);
+    loop {
+        if stop_asked() {
+            return Err(ListError::Stopped);
+        }
+        if let Ok(output) = tokio::time::timeout(STOP_POLL, &mut future).await {
+            return Ok(output);
+        }
+    }
 }
 
 async fn acquire_permit(

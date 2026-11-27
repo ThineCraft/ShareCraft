@@ -21,6 +21,7 @@ import {
 } from './common.js';
 import { mountAdminShell } from './admin-shell.js';
 import { navigationBody, navigationEditor, placePicker } from './navigation.js';
+import { validSharePath } from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -44,6 +45,8 @@ let scanner = null; // the scanner settings as the server last answered them
 // ---- S3 storage state and wording (declared before the first call that can reach it) ----
 
 let s3Answer = null; // the S3 settings as the server last answered them: endpoints and in_use
+let sharesAnswer = null; // the file-share settings as the server last answered them
+const MIB = 1024 * 1024;
 
 /** The sentence for each reason the server gives for an endpoint, in plain words. */
 const S3_REASON = {
@@ -98,6 +101,7 @@ if (!me.is_admin) {
   await showFiles();
   await showScanner();
   await showS3Storage();
+  await showShares();
   await showGlobal();
 }
 
@@ -390,6 +394,145 @@ $('s3-rows').addEventListener('click', async (event) => {
     -1,
     `Removed ${endpoint.name}.`,
   );
+});
+
+// ---- file shares ----
+
+/** The sentence for a refused folder: the server's own words, then what to do about it. */
+function shareRefusal(result) {
+  if (result.error === 'share_not_approved') {
+    return 'That folder holds, or is inside, the folder ShareCraft keeps its own data in, so it cannot be approved.';
+  }
+  if (result.error === 'invalid_share_path') {
+    return typeof result.data?.message === 'string' ? result.data.message : 'That is not a folder path ShareCraft can use.';
+  }
+  if (result.error === 'invalid_request') return 'Check the values: the cache is at least 256 MB, a listing 30 to 3600 seconds, and the file count at least 1.';
+  return messageFor(result.error);
+}
+
+function showShareSettings(answer) {
+  sharesAnswer = answer;
+  const roots = Array.isArray(answer.roots) ? answer.roots : [];
+  $('shares-roots').replaceChildren(
+    ...roots.map((root, index) =>
+      h(
+        'li',
+        {},
+        h('span', {}, root),
+        h('button', { type: 'button', class: 'plain', 'data-index': String(index), 'aria-label': `Remove ${root}` }, 'Remove'),
+      ),
+    ),
+  );
+  $('shares-roots').hidden = roots.length === 0;
+  $('shares-none').hidden = roots.length > 0;
+  $('shares-runs-as-name').textContent = answer.runs_as ? `: ${answer.runs_as}` : '';
+  const used = Number(answer.cache?.bytes);
+  $('shares-cache-use').textContent = Number.isFinite(used) ? `The cache holds ${megabytesText(used)} MB now.` : '';
+  $('shares-cache').value = megabytesText(answer.cache_max_bytes);
+  $('shares-list-seconds').value = String(answer.list_seconds ?? '');
+  $('shares-max-files').value = String(answer.max_files ?? '');
+}
+
+async function showShares() {
+  const result = await api('GET', '/settings/shares');
+  if (!result.ok) return showMessage(error, messageFor(result.error));
+  showShareSettings(result.data);
+  $('shares').hidden = false;
+}
+
+/** Sends the whole list of approved folders; the server accepts all of it or none. */
+async function sendRoots(roots, done) {
+  const result = await api('PUT', '/settings/shares', { roots });
+  if (!result.ok) {
+    noteIn('shares-msg', '');
+    return result;
+  }
+  showShareSettings(result.data);
+  noteIn('shares-msg', done, true);
+  return result;
+}
+
+$('shares-add').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!sharesAnswer) return;
+  noteIn('shares-msg', '');
+  showMessage($('shares-path-error'), '');
+  const path = $('shares-path').value.trim();
+  const check = validSharePath(path);
+  if (!check.ok) {
+    showMessage($('shares-path-error'), check.reason);
+    return $('shares-path').focus();
+  }
+  if (sharesAnswer.roots.includes(path)) {
+    showMessage($('shares-path-error'), 'That folder is already approved.');
+    return $('shares-path').focus();
+  }
+  const result = await sendRoots([...sharesAnswer.roots, path], 'Approved. Libraries can connect to it now.');
+  if (result.ok) {
+    $('shares-path').value = '';
+    return;
+  }
+  // The server names the reason, not the folder: the new folder is the one just typed.
+  showMessage($('shares-path-error'), shareRefusal(result));
+  $('shares-path-error').focus();
+});
+
+$('shares-roots').addEventListener('click', async (event) => {
+  const button = event.target.closest('button[data-index]');
+  if (!button || !sharesAnswer) return;
+  const root = sharesAnswer.roots[Number(button.dataset.index)];
+  if (root === undefined) return;
+  const sure = await confirmDialog(
+    `Stop approving ${root}? Libraries that read from it stop opening files at once, and their next check shows that the folder is no longer approved. Nothing on the share is changed.`,
+    'Remove folder',
+  );
+  if (!sure) return button.focus();
+  noteIn('shares-msg', '');
+  const result = await sendRoots(
+    sharesAnswer.roots.filter((_, position) => position !== Number(button.dataset.index)),
+    `Removed ${root}.`,
+  );
+  if (!result.ok) {
+    noteIn('shares-msg', shareRefusal(result));
+    $('shares-msg').focus();
+  } else $('shares-msg').focus(); // the button is gone: the confirmation takes the focus
+});
+
+/** A whole number in `text` between `low` and `high`, or null. */
+function wholeNumber(text, low, high) {
+  const typed = text.trim();
+  if (!/^[0-9]{1,12}$/.test(typed)) return null;
+  const number = Number(typed);
+  return number >= low && number <= high ? number : null;
+}
+
+$('shares-limits').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!sharesAnswer) return;
+  noteIn('shares-msg', '');
+  const fail = (text, field) => {
+    noteIn('shares-msg', text);
+    field.focus();
+  };
+  const cacheText = $('shares-cache').value.trim();
+  const megabytes = /^\d+(\.\d+)?$/.test(cacheText) ? Number(cacheText) : NaN;
+  if (!(megabytes >= 256)) return fail('Enter the cache size as a number of megabytes, at least 256.', $('shares-cache'));
+  const seconds = wholeNumber($('shares-list-seconds').value, 30, 3600);
+  if (seconds === null) return fail('Enter the longest listing as a whole number of seconds from 30 to 3600.', $('shares-list-seconds'));
+  const files = wholeNumber($('shares-max-files').value, 1, Number.MAX_SAFE_INTEGER);
+  if (files === null) return fail('Enter the most files as a whole number, 1 or more.', $('shares-max-files'));
+  const wanted = { cache_max_bytes: Math.round(megabytes * MIB), list_seconds: seconds, max_files: files };
+  const change = {};
+  for (const [key, value] of Object.entries(wanted)) if (value !== sharesAnswer[key]) change[key] = value;
+  if (Object.keys(change).length === 0) return noteIn('shares-msg', 'Nothing has changed.', true);
+  const result = await api('PUT', '/settings/shares', change);
+  if (!result.ok) {
+    noteIn('shares-msg', shareRefusal(result));
+    $('shares-msg').focus();
+    return;
+  }
+  showShareSettings(result.data);
+  noteIn('shares-msg', 'Saved. The new limits apply to the next listing and the next file opened.', true);
 });
 
 $('scan-existing').addEventListener('click', async () => {

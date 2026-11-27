@@ -176,11 +176,25 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
     };
     match item.kind {
         SourceKind::Share => {
-            if approved_item(state, node).await?.is_none() {
+            let Some(approved) = approved_item(state, node).await? else {
                 return Ok(None);
+            };
+            // A share known to be offline answers at once, before waiting behind a read of
+            // this file that may be stuck in the operating system.
+            remembered_refusal(&approved.item)?;
+            if state.shares().offline(approved.item.library) {
+                return cached_while_offline(state, &approved.item).await.map(Some);
             }
-            let flight = Arc::new(state.shares().flight(node).await);
-            materialise_share(state, node, flight).await
+            // The file's single flight is waited for no longer than a read turn: a read that
+            // is stuck keeps it until the operating system gives up. Meanwhile a cached copy
+            // is served, or the answer is busy.
+            let Some(flight) = state.shares().flight_within(node).await else {
+                return match serve_cached(state, &approved.item).await? {
+                    Some(ready) => Ok(Some(ready)),
+                    None => Err(ExternalError::Busy),
+                };
+            };
+            materialise_share(state, node, Arc::new(flight)).await
         }
         SourceKind::S3 => {
             let flight = Arc::new(state.shares().flight(node).await);

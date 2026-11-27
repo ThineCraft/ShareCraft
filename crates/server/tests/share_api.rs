@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use collab_core::ids::NodeId;
-use common::fake_share::{FakeShare, native};
+use common::fake_share::{FakeShare, IDENTITY_FAILURE, native};
 use common::{TestServer, TestUser, spawn_server_config_without_workers};
 use records::{Principal, SHARE_LIST_SECONDS, SHARE_ROOTS, SourceKind, SourceState};
 use reqwest::{Method, StatusCode};
@@ -270,7 +270,9 @@ async fn each_bad_path_is_refused_with_its_reason() {
         (r"\\?\C:\approved".to_owned(), "device"),
     ];
     if cfg!(windows) {
-        cases.push((r"\\server\C$".to_owned(), "whole_drive"));
+        cases.push((r"\\server\C$".to_owned(), "administrative_share"));
+        cases.push((r"\\server\c$\Users".to_owned(), "administrative_share"));
+        cases.push((r"\\server\Projects$".to_owned(), "whole_drive"));
     } else {
         // The Linux counterpart of a whole drive is the whole file system, and a server
         // there cannot open a UNC or drive path, which it says instead of "not found".
@@ -852,6 +854,45 @@ async fn a_bad_root_is_refused_and_the_setting_is_unchanged() {
 }
 
 #[tokio::test]
+async fn an_administrative_share_cannot_be_approved_and_the_setting_is_unchanged() {
+    let env = Env::new().await;
+    let sentence = "Administrative shares such as \\\\server\\C$ open a whole drive or system area and ought not to be shared. Share only the folder you need, then approve that path.";
+    let (status, answer) = env
+        .call(
+            &env.admin,
+            Method::PUT,
+            "/api/settings/shares",
+            Some(json!({"roots":[r"\\server\C$\Users"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"], "invalid_share_path", "{answer}");
+    assert_eq!(answer["reason"], "administrative_share", "{answer}");
+    assert_eq!(answer["message"], sentence, "{answer}");
+    let settings = env.server.records_db().share_settings().await.unwrap();
+    assert_eq!(
+        settings
+            .roots
+            .iter()
+            .map(records::SharePath::display)
+            .collect::<Vec<_>>(),
+        [ROOT]
+    );
+}
+
+#[tokio::test]
+async fn connecting_below_an_administrative_share_is_refused() {
+    let env = Env::new().await;
+    let (status, answer) = env
+        .connect(json!({"name": "Admin share", "path": r"\\server\C$\Users"}))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"], "invalid_share_path", "{answer}");
+    assert_eq!(answer["reason"], "administrative_share", "{answer}");
+    assert_eq!(env.fake.lists(), 0);
+}
+
+#[tokio::test]
 async fn removing_a_root_stops_reads_at_once_and_the_next_listing_is_not_connected() {
     let env = Env::new().await;
     env.fake.put("Gone.txt", b"gone");
@@ -1306,4 +1347,200 @@ async fn lookups_against_a_hanging_share_are_bounded_across_connects() {
         env.fake.canonical_hanging_peak(),
         server::share::SHARE_LOOKUPS
     );
+}
+
+/// Connects `path` (written in Windows form, see [`native`]) as a library named `name`.
+async fn connect_at(env: &Env, name: &str, path: &str) -> (StatusCode, Value) {
+    env.connect(json!({"name": name, "path": native(path)}))
+        .await
+}
+
+#[tokio::test]
+async fn a_case_different_alias_of_a_connected_folder_is_refused() {
+    let env = Env::new().await;
+    env.fake.mkdir("Projects");
+    env.fake.mkdir("projects");
+    env.fake.alias(&["Projects", "projects"]);
+    let (status, answer) = connect_at(&env, "First", r"C:\approved\Projects").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    let (status, answer) = connect_at(&env, "Second", r"C:\approved\projects").await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+}
+
+#[tokio::test]
+async fn a_folder_inside_an_alias_of_a_connected_folder_is_refused() {
+    let env = Env::new().await;
+    env.fake.mkdir("Projects");
+    env.fake.mkdir("Mirror/Plans");
+    env.fake.alias(&["Projects", "Mirror"]);
+    let (status, answer) = connect_at(&env, "First", r"C:\approved\Projects").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    let (status, answer) = connect_at(&env, "Second", r"C:\approved\Mirror\Plans").await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+    assert!(!answer.to_string().contains("Projects"));
+}
+
+#[tokio::test]
+async fn a_folder_around_an_alias_of_a_connected_folder_is_refused() {
+    let env = Env::new().await;
+    env.fake.mkdir("Projects/Plans");
+    env.fake.mkdir("Mirror");
+    env.fake.alias(&["Projects", "Mirror"]);
+    let (status, answer) = connect_at(&env, "First", r"C:\approved\Projects\Plans").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    let (status, answer) = connect_at(&env, "Second", r"C:\approved\Mirror").await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+}
+
+#[tokio::test]
+async fn folders_without_identity_fall_back_to_path_checks() {
+    let env = Env::new().await;
+    env.fake.mkdir("Projects/Plans");
+    env.fake.mkdir("Mirror");
+    // No identities: two names for one folder cannot be told from two folders, so only the
+    // paths are compared.
+    let (status, answer) = connect_at(&env, "First", r"C:\approved\Projects").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let (status, answer) = connect_at(&env, "Second", r"C:\approved\Mirror").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    let (status, answer) = connect_at(&env, "Third", r"C:\approved\Projects\Plans").await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+}
+
+#[tokio::test]
+async fn a_failed_identity_lookup_falls_back_to_path_checks_without_leaking_its_text() {
+    let env = Env::new().await;
+    env.fake.mkdir("Projects/Plans");
+    env.fake.mkdir("Mirror");
+    env.fake.alias(&["Projects", "Mirror"]);
+    env.fake.fail_identity("Mirror");
+    env.fake.fail_identity("Projects/Plans");
+    let (status, answer) = connect_at(&env, "First", r"C:\approved\Projects").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    // The alias cannot be told: the paths do not overlap, so it is connected.
+    let (status, answer) = connect_at(&env, "Second", r"C:\approved\Mirror").await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    assert!(!answer.to_string().contains("injected"), "{answer}");
+
+    // The path check still refuses a folder inside a connected one, in our words only.
+    let (status, answer) = connect_at(&env, "Third", r"C:\approved\Projects\Plans").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+    let text = answer.to_string();
+    assert!(
+        !text.contains("injected") && !text.contains("fileserver"),
+        "{answer}"
+    );
+    assert!(!text.contains(IDENTITY_FAILURE), "{answer}");
+}
+
+#[tokio::test]
+async fn data_folder_lookups_against_a_hanging_share_are_bounded() {
+    const CONNECTS: usize = server::share::SHARE_LOOKUPS + 4;
+    let env = Env::new().await;
+    env.fake.mkdir("hung");
+    // The first lookup of every connect (whether the folder overlaps the data folder)
+    // resolves the folder itself, and that hangs.
+    env.fake.hang_canonical("hung");
+    struct Release(FakeShare);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release_canonical();
+        }
+    }
+    let release = Release(env.fake.clone());
+
+    let route = format!("/api/sites/{}/libraries/share", env.site.0);
+    let connecting: Vec<_> = (0..CONNECTS)
+        .map(|n| {
+            spawn_call(
+                &env,
+                &env.admin,
+                Method::POST,
+                &route,
+                Some(json!({
+                    "name": format!("Hung {n}"),
+                    "path": native(r"C:\approved\hung"),
+                })),
+            )
+        })
+        .collect();
+    wait_until("the lookup bound is reached", || async {
+        env.fake.canonical_hanging() >= server::share::SHARE_LOOKUPS
+    })
+    .await;
+    // Every connect has had ample time to start its own lookup of the hanging share.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        env.fake.canonical_hanging_peak(),
+        server::share::SHARE_LOOKUPS
+    );
+
+    drop(release);
+    for connecting in connecting {
+        let (status, answer) = connecting.await.unwrap();
+        assert!(
+            status == StatusCode::CREATED
+                || status == StatusCode::CONFLICT
+                || status == StatusCode::SERVICE_UNAVAILABLE,
+            "{status} {answer}"
+        );
+    }
+    assert_eq!(
+        env.fake.canonical_hanging_peak(),
+        server::share::SHARE_LOOKUPS
+    );
+}
+
+#[tokio::test]
+async fn a_hanging_data_folder_lookup_times_out_as_offline() {
+    let env = Env::new().await;
+    env.server
+        .records_db()
+        .set_setting(env.admin.id, SHARE_LIST_SECONDS, json!(30))
+        .await
+        .unwrap();
+    env.fake.mkdir("hung");
+    env.fake.hang_canonical("hung");
+    struct Release(FakeShare);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release_canonical();
+        }
+    }
+    let _release = Release(env.fake.clone());
+
+    let started = std::time::Instant::now();
+    let (status, answer) = spawn_call(
+        &env,
+        &env.admin,
+        Method::POST,
+        &format!("/api/sites/{}/libraries/share", env.site.0),
+        Some(json!({"name": "Hung", "path": native(r"C:\approved\hung")})),
+    )
+    .await
+    .unwrap();
+
+    // Answered by the 30-second deadline, not when the share server gives up.
+    assert!(
+        started.elapsed() < Duration::from_secs(30 + 15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"], "share_unreachable", "{answer}");
+    assert_eq!(answer["reason"], "offline", "{answer}");
 }

@@ -812,6 +812,21 @@ impl Db {
         .await?)
     }
 
+    /// Makes every connected share that stopped (`not_connected`, for example because its
+    /// folder was no longer approved) due at once, as [`Db::requeue_source`] does, and returns
+    /// their libraries so the caller can wake them. The approved roots changed: a stop may be over.
+    pub async fn requeue_stopped_shares(&self) -> Result<Vec<NodeId>, DbError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "update library_sources set state = 'connecting', last_checked_at = null, \
+                 next_check_at = null, retry_at = null, last_error = null \
+             where kind = 'share' and state = 'not_connected' \
+             returning library_id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
+    }
+
     /// Stores a sealed secret and returns its id. A secret with no ciphertext is refused: only
     /// sealed bytes belong here.
     pub async fn put_secret(&self, s: &SealedRow) -> Result<SecretId, DbError> {

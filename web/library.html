@@ -58,14 +58,20 @@
   <span id="accepts-text"></span>
   <details id="source-hidden" hidden>
    <summary id="source-hidden-summary"></summary>
-   <p>File rules can hide these categories:</p>
-   <ul>
-    <li>links</li>
-    <li>submodules</li>
-    <li>names</li>
-    <li>types</li>
-    <li>size</li>
-   </ul>
+   <div id="source-hidden-rules">
+    <p>File rules can hide these categories:</p>
+    <ul>
+     <li>links</li>
+     <li>submodules</li>
+     <li>names</li>
+     <li>types</li>
+     <li>size</li>
+    </ul>
+   </div>
+   <div id="source-hidden-share" hidden>
+    <p>These are not shown in this library:</p>
+    <ul id="source-hidden-lines" class="list"></ul>
+   </div>
   </details>
  </div>
  <input type="file" id="pick-files" multiple hidden tabindex="-1" aria-hidden="true">
