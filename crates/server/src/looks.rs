@@ -31,7 +31,7 @@ use revisions::brand::{
     Navigation, OrgBrand, OrgTheme, ResolvedTheme, TemplateLook, Theme, check_theme, clean_text,
     family_name, fonts_match_source, icon_problem, image_policy_problems, policy_problems,
 };
-use revisions::{SiteRecord, SiteTheme};
+use revisions::{HeroFrame, SiteRecord, SiteTheme};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
@@ -91,6 +91,7 @@ pub(crate) struct HeaderInput {
     align: Option<Align>,
     hide_title: Option<bool>,
     bleed: Option<Bleed>,
+    frame: Option<HeroFrame>,
 }
 
 /// A footer as sent: each field left out takes its default.
@@ -659,6 +660,7 @@ async fn built_look(
             align: header_in.align.unwrap_or(header_default.align),
             hide_title: header_in.hide_title.unwrap_or(header_default.hide_title),
             bleed: header_in.bleed.unwrap_or(header_default.bleed),
+            frame: header_in.frame,
         },
         navigation: input.navigation.unwrap_or_default(),
         footer: revisions::brand::Footer {
@@ -1233,6 +1235,7 @@ pub(crate) async fn effective(
         "align": header.align,
         "hide_title": header.hide_title,
         "bleed": header.bleed,
+        "frame": header.frame,
     });
     let footer = &look.footer;
     let mut footer_out = json!({

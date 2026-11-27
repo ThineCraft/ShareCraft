@@ -108,6 +108,20 @@
       <div id="header-image-slot"></div>
       <div id="icon-slot"></div>
      </div>
+     <div id="header-framer" class="field framer" hidden>
+      <span class="label" id="header-framer-heading">Header image position and size</span>
+      <div id="header-framer-stage" class="framer-stage" tabindex="0" role="group" aria-labelledby="header-framer-heading" aria-describedby="header-framer-help">
+       <img id="header-framer-picture" alt="" draggable="false">
+       <div id="header-framer-window" class="framer-window" aria-hidden="true"></div>
+      </div>
+      <div class="framer-controls">
+       <label for="header-framer-zoom">Size</label>
+       <input id="header-framer-zoom" type="range" min="100" max="400" step="5" value="100">
+       <output id="header-framer-zoom-text" for="header-framer-zoom">100%</output>
+       <button type="button" id="header-framer-reset" class="ghost small">Centre it again</button>
+      </div>
+      <small id="header-framer-help" class="meta">The bright box is the part of the picture the header shows. Drag it, or select the picture and use the arrow keys, to choose that part. Make the picture bigger to show less of it. Narrower screens show less at the sides. The preview shows it at once; Apply saves it.</small>
+     </div>
      <div class="field">
       <label for="logo-alt">Logo description</label>
       <input type="text" id="logo-alt" maxlength="120" autocomplete="off" aria-describedby="logo-alt-note">

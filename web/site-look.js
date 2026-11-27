@@ -37,6 +37,7 @@ import {
   themeSwatches,
 } from './common.js';
 import { BLEED_DEFAULT, bleedOf, showBleed } from './bleed.js';
+import { mountFramer } from './framer.js';
 import { ROLES, roleChoices } from './brand-fonts.js';
 import { pickImage } from './image-picker.js';
 import { fontSpecimen } from './look-card-view.js';
@@ -107,6 +108,19 @@ const BLEED_CONTROLS = Object.freeze([
 
 /** The banner bleeds the preview shows now (bleed.js), stopped before it is drawn again. */
 let previewBleeds = [];
+
+/** The framer of the header image (framer.js), set up just before the page is first filled. */
+let headerFramer = null;
+
+/**
+ * The size of the header the image is framed for: the site header at the top of this page where
+ * it shows a banner picture, else a common desktop header (1200 by 160).
+ */
+function siteHeaderBox() {
+  const header = [...document.querySelectorAll('.site-header')].find((element) => !element.closest('.look-preview'));
+  const rect = header?.querySelector('.band-image') ? header.getBoundingClientRect() : null;
+  return rect && rect.width > 0 && rect.height > 0 ? { width: rect.width, height: rect.height } : { width: 1200, height: 160 };
+}
 
 const [settingsAnswer, brandAnswer, historyAnswer] = await Promise.all([
   api('GET', `/sites/${seg(siteId)}/look/settings`),
@@ -818,7 +832,8 @@ function drawSlot(slot) {
     });
     if (!picked) return;
     slot.set(picked);
-    if (slot === SLOTS.header) session.change((draft) => (draft.header.background = 'image'));
+    // A new header image starts at its middle, at its smallest.
+    if (slot === SLOTS.header) session.change((draft) => ((draft.header.background = 'image'), (draft.header.frame = null)));
     fillHeader();
     drawSlot(slot);
     refresh();
@@ -1106,6 +1121,11 @@ function refresh() {
   $('hide-title').disabled = readOnly || !draft.logo;
   // The bleed is the banner picture's, so it is set only for an image band.
   $('bleed-part').hidden = !(extended && draft.header.background === 'image');
+  // The header image's position, for an image band with its image.
+  const band = extended && draft.header.background === 'image' ? draftImageUrl(draft.header.image) : null;
+  $('header-framer').hidden = !band;
+  if (band) headerFramer?.show(band, draft.header.frame);
+  for (const control of $('header-framer').querySelectorAll('input, button')) control.disabled = readOnly;
   $('bleed-fields').hidden = !bleedOf(draft.header.bleed).enabled;
   for (const control of $('bleed-part').querySelectorAll('input, button')) control.disabled = readOnly;
   $('footer-fields').hidden = !draft.footer.enabled;
@@ -1347,6 +1367,20 @@ if (!brandAnswer.ok) note(`The brand centre could not be read: ${messageFor(bran
 drawStudio();
 showPreviewMode();
 showSiteThemes();
+// The framer of the header image (framer.js): which part of it the header shows, kept in the draft.
+headerFramer = mountFramer({
+  stage: $('header-framer-stage'),
+  picture: $('header-framer-picture'),
+  window: $('header-framer-window'),
+  zoom: $('header-framer-zoom'),
+  zoomText: $('header-framer-zoom-text'),
+  reset: $('header-framer-reset'),
+  headerBox: siteHeaderBox,
+  onChange: (frame) => {
+    session.change((draft) => (draft.header.frame = frame));
+    refresh();
+  },
+});
 fill();
 if (limits.customColours.disabled || limits.builtinThemes.disabled || limits.siteImages.disabled || limits.siteThemes.disabled || limits.siteFonts.disabled) {
   $('limits-note').hidden = false;

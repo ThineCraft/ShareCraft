@@ -9,7 +9,7 @@ import { prefetchCache, prefetchKey, setupPrefetch } from './prefetch.js';
 import { connection } from './connection.js';
 import { rememberChrome } from './skeleton.js';
 import { showBleed } from './bleed.js';
-import { showHero } from './hero.js';
+import { applyHeroFrame, showHero } from './hero.js';
 
 // Pointing at a link to another page asks for its first answers early (prefetch.js).
 setupPrefetch();
@@ -1699,12 +1699,15 @@ export function headerView(site, look, { draft = false } = {}) {
     : null;
   // The banner's pictures sit in a frame that clips them, so that the picture can bleed out
   // past the header (bleed.js) while a library's picture slides in within it (hero.js).
+  const picture = imageUrl ? brandImage(bannerSrc(imageUrl), { class: 'band-image', alt: '' }) : null;
+  // The part of the image the look chose to show (as a library's banner picture is framed).
+  if (picture) applyHeroFrame(picture, header.frame ?? null);
   const band = imageUrl
     ? [
         h(
           'span',
           { class: 'band-frame' },
-          brandImage(bannerSrc(imageUrl), { class: 'band-image', alt: '' }),
+          picture,
           h('span', { class: 'band-shade', 'aria-hidden': 'true' }),
         ),
       ]

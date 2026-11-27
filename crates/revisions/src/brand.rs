@@ -17,6 +17,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::libraries::HeroFrame;
 use crate::sites::SiteTheme;
 
 /// The least contrast ratio text needs (WCAG AA for normal text).
@@ -1176,6 +1177,10 @@ pub struct Header {
     /// How the banner picture bleeds past the banner; left out of the file at its defaults.
     #[serde(default, skip_serializing_if = "Bleed::is_default")]
     pub bleed: Bleed,
+    /// Which part of the image the header shows, as a library's banner picture is framed;
+    /// None (left out of the file) for the middle at its smallest. Only with an image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<HeroFrame>,
 }
 
 impl Default for Header {
@@ -1187,6 +1192,7 @@ impl Default for Header {
             align: Align::Left,
             hide_title: false,
             bleed: Bleed::default(),
+            frame: None,
         }
     }
 }
@@ -1489,6 +1495,14 @@ impl Look {
         if h.hide_title && self.logo.is_none() {
             return Some("hiding the title needs a logo".to_owned());
         }
+        if let Some(frame) = &h.frame {
+            if h.image.is_none() {
+                return Some("a header frame goes with a header image".to_owned());
+            }
+            if !frame.is_valid() {
+                return Some("a header frame is x and y 0 to 1000 and zoom 100 to 400".to_owned());
+            }
+        }
         h.bleed.problem()
     }
 
@@ -1595,6 +1609,9 @@ pub struct TemplateHeader {
     /// How the banner picture bleeds past the banner.
     #[serde(default, skip_serializing_if = "Bleed::is_default")]
     pub bleed: Bleed,
+    /// Which part of the image the header shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<HeroFrame>,
 }
 
 /// A [`Footer`] whose logo is a reference.
@@ -1724,6 +1741,7 @@ impl TemplateLook {
                 align: self.header.align,
                 hide_title: self.header.hide_title,
                 bleed: self.header.bleed,
+                frame: self.header.frame,
             },
             navigation: self.navigation,
             footer: Footer {
@@ -2467,6 +2485,7 @@ mod tests {
             align: Align::Centre,
             hide_title: true,
             bleed: Bleed::default(),
+            frame: None,
         };
         assert_eq!(extended.problem("Site"), None);
         // Footer.
@@ -2708,6 +2727,7 @@ mod tests {
             align: Align::Centre,
             hide_title: true,
             bleed: Bleed::default(),
+            frame: None,
         };
         look.navigation = Navigation::Vertical;
         look.footer = Footer {

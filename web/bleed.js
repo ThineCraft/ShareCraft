@@ -350,7 +350,8 @@ export function showBleed(header, settings, { bounds = null } = {}) {
     update();
   };
 
-  picture(band.currentSrc || band.getAttribute('src'));
+  // The site's picture, about the point of it the header keeps in view.
+  picture(band.currentSrc || band.getAttribute('src'), band.style.objectPosition);
 
   const place = () => {
     if (!header.isConnected) return stop();

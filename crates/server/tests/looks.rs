@@ -442,7 +442,7 @@ async fn look_round_trip_and_defaults() {
         seen["header"],
         json!({ "layout": "compact", "background": "none", "align": "left", "hide_title": false,
                 "bleed": { "enabled": true, "distance": 240, "blur": 48, "transparency": 30,
-                           "tint_light": "#ffffff", "tint_dark": "#000000" } })
+                           "tint_light": "#ffffff", "tint_dark": "#000000" }, "frame": null })
     );
     assert_eq!(seen["navigation"], "horizontal");
     assert_eq!(seen["footer"]["enabled"], false);
@@ -2435,5 +2435,53 @@ async fn banner_bleed_round_trips_and_is_checked() {
         )
         .await;
         assert!(status.is_client_error(), "{status} {body}");
+    }
+}
+
+#[tokio::test]
+async fn header_frame_goes_with_the_image_and_is_checked() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let (team, documents) = create_site(&server, &root, "Team").await;
+    let doc = upload(&server, &root, &documents, "Band.png", &png(400, 100)).await;
+    let header = |frame: Value| {
+        json!({ "layout": "extended", "background": "image", "align": "left",
+                "hide_title": false, "image": { "doc": doc }, "frame": frame })
+    };
+    let answer = set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" },
+                "header": header(json!({ "x": 250, "y": 900, "zoom": 150 })) }),
+    )
+    .await;
+    let frame = json!({ "x": 250, "y": 900, "zoom": 150 });
+    assert_eq!(answer["look"]["header"]["frame"], frame);
+    assert_eq!(
+        effective(&server, &root, &team).await["header"]["frame"],
+        frame
+    );
+
+    // Out of range, or without an image, is refused.
+    for (body, why) in [
+        (header(json!({ "x": 1001, "y": 0, "zoom": 100 })), "frame"),
+        (header(json!({ "x": 0, "y": 0, "zoom": 99 })), "frame"),
+        (
+            json!({ "layout": "extended", "background": "none", "align": "left",
+                    "hide_title": false, "frame": { "x": 0, "y": 0, "zoom": 100 } }),
+            "image",
+        ),
+    ] {
+        let (status, answer) = put_look(
+            &server,
+            &root,
+            &team,
+            json!({ "theme": { "from": "builtin:sharecraft" }, "header": body }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+        assert_eq!(answer["error"], "invalid_look", "{answer}");
+        assert!(answer["reason"].as_str().unwrap().contains(why), "{answer}");
     }
 }
