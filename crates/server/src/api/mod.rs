@@ -422,6 +422,8 @@ pub(crate) enum ApiError {
     LoginsWindowsOnly,
     /// 503: the secret store (the key file or the outside provider) could not be used.
     SecretStoreUnavailable,
+    /// 422: the secret store answers but no longer holds a stored value; it must be entered again.
+    SecretLost,
     /// 422: the approved folder cannot be listed.
     ShareUnreachable(&'static str),
     /// 422: the S3 endpoint named is not one an administrator approved (or a built-in
@@ -624,6 +626,7 @@ impl ApiError {
         eprintln!("sharecraft-server: a secret could not be stored or read: {error}");
         match error {
             crate::secrets::SecretError::Unavailable(_) => ApiError::SecretStoreUnavailable,
+            crate::secrets::SecretError::Lost => ApiError::SecretLost,
             _ => ApiError::Unavailable,
         }
     }
@@ -672,6 +675,7 @@ impl ApiError {
             ApiError::SecretStoreUnavailable => {
                 (StatusCode::SERVICE_UNAVAILABLE, "secret_store_unavailable")
             }
+            ApiError::SecretLost => (StatusCode::UNPROCESSABLE_ENTITY, "secret_lost"),
             ApiError::ShareUnreachable(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "share_unreachable")
             }
@@ -1109,6 +1113,10 @@ impl IntoResponse for ApiError {
             ApiError::SecretStoreUnavailable => json!({
                 "error": code,
                 "message": "The secret store could not be reached.",
+            }),
+            ApiError::SecretLost => json!({
+                "error": code,
+                "message": crate::secrets::SecretError::Lost.to_string(),
             }),
             _ => json!({ "error": code }),
         };

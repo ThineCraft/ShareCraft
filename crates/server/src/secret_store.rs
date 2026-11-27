@@ -160,7 +160,8 @@ impl SecretStore {
     ///
     /// # Errors
     /// `WrongKey` or `Corrupt` when it does not open; `Unavailable` when it could not be read,
-    /// or it is kept by a provider this server has not been given.
+    /// or it is kept by a provider this server has not been given; `Lost` when the provider
+    /// answers but no longer holds the value.
     pub async fn get(
         &self,
         db: &Db,
@@ -188,11 +189,12 @@ impl SecretStore {
                 let Some(provider) = &self.provider else {
                     return Err(SecretError::Unavailable(NO_PROVIDER.to_owned()));
                 };
-                let value = provider.get(&provider_name(id)).await?;
-                if let Some(value) = &value {
-                    self.keep(id, value);
-                }
-                Ok(value)
+                // The row is there and not forgotten, so a 404 means the provider lost the value.
+                let Some(value) = provider.get(&provider_name(id)).await? else {
+                    return Err(SecretError::Lost);
+                };
+                self.keep(id, &value);
+                Ok(Some(value))
             }
         }
     }

@@ -2077,6 +2077,8 @@ pub(crate) async fn token_of(
         Ok(None) => return Err(gone()),
         // Worth trying again later: the sync is not marked disconnected.
         Err(SecretError::Unavailable(sentence)) => return Err(failed(&sentence)),
+        // The provider lost the value: the library says so, and the token is entered again.
+        Err(lost @ SecretError::Lost) => return Err(SyncError::NotConnected(lost.to_string())),
         Err(_) => return Err(gone()),
     };
     String::from_utf8(plain)

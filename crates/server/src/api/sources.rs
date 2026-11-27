@@ -37,7 +37,7 @@ use crate::libraries;
 use crate::s3::{S3Error, S3Target};
 use crate::s3_sign::Credentials;
 use crate::s3_write;
-use crate::secrets::Secret;
+use crate::secrets::{Secret, SecretError};
 use crate::share::{FileIdentity, FsBudget, canonical_share_path};
 use crate::source_sync::{
     SyncError, abandon_uploads_into, caps, token_context, token_of, webhook_context,
@@ -1049,6 +1049,11 @@ pub(crate) async fn change(
                 .await
                 .map_err(|error| match error {
                     SyncError::Failed(_) => ApiError::SecretStoreUnavailable,
+                    SyncError::NotConnected(sentence)
+                        if sentence == SecretError::Lost.to_string() =>
+                    {
+                        ApiError::SecretLost
+                    }
                     _ => ApiError::TokenRejected,
                 })?
         };

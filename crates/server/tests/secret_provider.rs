@@ -239,6 +239,11 @@ fn front_end(provider: Option<SecretProvider>) -> (SecretStore, tempfile::TempDi
     (store, dir)
 }
 
+/// Whether a read answered the value `want`. A failed assertion on this never prints a value.
+fn is_value(got: &Result<Option<Vec<u8>>, SecretError>, want: &[u8]) -> bool {
+    matches!(got, Ok(Some(value)) if value.as_slice() == want)
+}
+
 async fn count_secrets(db: &TestDb) -> i64 {
     let mut conn = sqlx::PgConnection::connect(&db.url()).await.unwrap();
     sqlx::query_scalar("select count(*) from secrets")
@@ -253,8 +258,8 @@ async fn put_and_get_through_provider() {
     let db = TestDb::create().await;
     let (store, _dir) = front_end(Some(fake.provider()));
     let id = store.put(&db.db, VALUE, b"ctx").await.unwrap();
-    let got = store.get(&db.db, id, b"ctx").await.unwrap();
-    assert_eq!(got.as_deref(), Some(VALUE));
+    let got = store.get(&db.db, id, b"ctx").await;
+    assert!(is_value(&got, VALUE), "the value was not read back");
     // The row holds no ciphertext: the vault protects the value.
     assert!(matches!(
         db.db.get_stored_secret(id).await.unwrap(),
@@ -287,15 +292,9 @@ async fn second_store_reads_after_cache_expiry() {
     let id = first.put(&db.db, VALUE, b"ctx").await.unwrap();
 
     // The other front end reads it through the provider, then from its cache.
-    assert_eq!(
-        second.get(&db.db, id, b"ctx").await.unwrap().as_deref(),
-        Some(VALUE)
-    );
+    assert!(is_value(&second.get(&db.db, id, b"ctx").await, VALUE));
     assert_eq!(fake.requests("GET"), 1);
-    assert_eq!(
-        second.get(&db.db, id, b"ctx").await.unwrap().as_deref(),
-        Some(VALUE)
-    );
+    assert!(is_value(&second.get(&db.db, id, b"ctx").await, VALUE));
     assert_eq!(
         fake.requests("GET"),
         1,
@@ -309,21 +308,18 @@ async fn second_store_reads_after_cache_expiry() {
         .unwrap()
         .values
         .insert(name, STANDARD.encode(b"a-changed-value"));
-    assert_eq!(
-        second.get(&db.db, id, b"ctx").await.unwrap().as_deref(),
-        Some(VALUE)
-    );
+    assert!(is_value(&second.get(&db.db, id, b"ctx").await, VALUE));
     second.set_cache_ttl_for_tests(Duration::from_millis(40));
     tokio::time::sleep(Duration::from_millis(120)).await;
-    assert_eq!(
-        second.get(&db.db, id, b"ctx").await.unwrap().as_deref(),
-        Some(&b"a-changed-value"[..])
-    );
+    assert!(is_value(
+        &second.get(&db.db, id, b"ctx").await,
+        b"a-changed-value"
+    ));
     assert_eq!(fake.requests("GET"), 2);
 
     // A forget made by this process drops its own entry at once.
     second.forget(&db.db, id).await;
-    assert_eq!(second.get(&db.db, id, b"ctx").await, Ok(None));
+    assert!(matches!(second.get(&db.db, id, b"ctx").await, Ok(None)));
 }
 
 #[tokio::test]
@@ -499,9 +495,9 @@ async fn forget_marks_then_sweep_deletes_at_provider() {
     // Marked, not yet gone from the provider; reads already say gone.
     assert_eq!(db.db.forgotten_secrets(10).await.unwrap(), vec![id]);
     assert_eq!(fake.names(), vec![provider_name(id)]);
-    assert_eq!(store.get(&db.db, id, b"ctx").await, Ok(None));
+    assert!(matches!(store.get(&db.db, id, b"ctx").await, Ok(None)));
     let (other, _d) = front_end(Some(fake.provider()));
-    assert_eq!(other.get(&db.db, id, b"ctx").await, Ok(None));
+    assert!(matches!(other.get(&db.db, id, b"ctx").await, Ok(None)));
 
     assert_eq!(store.sweep_forgotten(&db.db).await, 1);
     assert!(fake.names().is_empty());
@@ -533,6 +529,44 @@ async fn sweep_retries_after_failed_delete() {
     store.forget(&db.db, lost).await;
     assert_eq!(store.sweep_forgotten(&db.db).await, 1);
     assert_eq!(count_secrets(&db).await, 0);
+}
+
+/// A token the provider no longer holds is answered `422 secret_lost` with a plain sentence, not
+/// as a token GitHub refused.
+#[tokio::test]
+async fn api_answers_secret_lost_when_provider_lost_the_token() {
+    let fake = FakeProvider::start().await;
+    let settings = fake.settings();
+    let server = spawn_server_config_without_workers(|c| c.secret_provider = Some(settings)).await;
+    let admin = server.admin("Ada Admin").await;
+    let library = common::Site::library(&server).await;
+    let state = server.app_state().await;
+    let db = server.records_db();
+    let token = state
+        .secret_store()
+        .put(&db, b"ghp_lost_token", b"source-token")
+        .await
+        .unwrap();
+    connect(&db, library, admin.id, Some(token), None).await;
+    fake.inner.lock().unwrap().values.clear();
+
+    let response = server
+        .http(Some(&admin))
+        .request(
+            Method::PATCH,
+            server.url(&format!("/api/libraries/{}/source", library.0)),
+        )
+        .json(&serde_json::json!({ "branch": "next" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["error"], "secret_lost");
+    assert_eq!(
+        answer["message"],
+        "The secret store no longer holds this value. Enter it again."
+    );
 }
 
 #[tokio::test]
@@ -586,18 +620,14 @@ async fn old_local_rows_still_open_with_provider_configured() {
     let id = old.put(&db.db, VALUE, b"ctx").await.unwrap();
 
     let with_provider = SecretStore::local(key()).with_provider(fake.provider());
-    assert_eq!(
-        with_provider
-            .get(&db.db, id, b"ctx")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(VALUE)
-    );
-    assert_eq!(
+    assert!(is_value(
+        &with_provider.get(&db.db, id, b"ctx").await,
+        VALUE
+    ));
+    assert!(matches!(
         with_provider.get(&db.db, id, b"other").await,
         Err(SecretError::WrongKey)
-    );
+    ));
     assert_eq!(
         fake.requests("GET"),
         0,
@@ -611,11 +641,30 @@ async fn old_local_rows_still_open_with_provider_configured() {
     let outside = with_provider.put(&db.db, VALUE, b"ctx").await.unwrap();
     let (bare, _d) = front_end(None);
     let result = bare.get(&db.db, outside, b"ctx").await;
+    assert!(
+        matches!(&result, Err(SecretError::Unavailable(s)) if s == "this server has no secret provider configured"),
+        "an outside row without a provider was not unavailable"
+    );
+}
+
+/// A row kept by the provider whose value the provider no longer holds (it answers 404) is its
+/// own plain error, not "no such secret" and not a rejected token.
+#[tokio::test]
+async fn a_value_missing_at_the_provider_is_lost() {
+    let fake = FakeProvider::start().await;
+    let db = TestDb::create().await;
+    let (store, _dir) = front_end(Some(fake.provider()));
+    let id = store.put(&db.db, VALUE, b"ctx").await.unwrap();
+    fake.inner.lock().unwrap().values.clear();
+    let got = store.get(&db.db, id, b"ctx").await;
+    assert!(
+        matches!(got, Err(SecretError::Lost)),
+        "the read was not Lost"
+    );
+    let sentence = SecretError::Lost.to_string();
     assert_eq!(
-        result,
-        Err(SecretError::Unavailable(
-            "this server has no secret provider configured".to_owned()
-        ))
+        sentence,
+        "The secret store no longer holds this value. Enter it again."
     );
 }
 

@@ -25,8 +25,11 @@ async fn put_then_get_round_trips() {
         .put(&db.db, b"ghp_token", b"source-token:one")
         .await
         .unwrap();
-    let got = store.get(&db.db, id, b"source-token:one").await.unwrap();
-    assert_eq!(got.as_deref(), Some(&b"ghp_token"[..]));
+    let got = store.get(&db.db, id, b"source-token:one").await;
+    assert!(
+        matches!(&got, Ok(Some(value)) if value.as_slice() == b"ghp_token"),
+        "the token was not read back"
+    );
 }
 
 #[tokio::test]
@@ -37,7 +40,7 @@ async fn get_with_another_context_is_wrong_key() {
         .await
         .unwrap();
     let got = store.get(&db.db, id, b"source-token:two").await;
-    assert_eq!(got, Err(SecretError::WrongKey));
+    assert!(matches!(got, Err(SecretError::WrongKey)));
 }
 
 #[tokio::test]
@@ -45,7 +48,7 @@ async fn forget_then_get_is_none() {
     let (store, db, _dir) = store().await;
     let id = store.put(&db.db, b"ghp_token", b"ctx").await.unwrap();
     store.forget(&db.db, id).await;
-    assert_eq!(store.get(&db.db, id, b"ctx").await, Ok(None));
+    assert!(matches!(store.get(&db.db, id, b"ctx").await, Ok(None)));
     // Forgetting what is already gone does not fail.
     store.forget(&db.db, id).await;
 }
@@ -54,5 +57,5 @@ async fn forget_then_get_is_none() {
 async fn an_unknown_id_is_none() {
     let (store, db, _dir) = store().await;
     let id = SecretId(uuid::Uuid::new_v4());
-    assert_eq!(store.get(&db.db, id, b"ctx").await, Ok(None));
+    assert!(matches!(store.get(&db.db, id, b"ctx").await, Ok(None)));
 }
