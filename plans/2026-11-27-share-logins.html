@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stored share logins</title>
+<style>
+:root{--bg:#fff;--fg:#1d1d1f;--muted:#5f6368;--line:#d9dce1;--band:#f3f5f8;--head:#e8ecf2;--accent:#0b57d0;--card:#fafbfc;--code:#eef1f5}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e8eaed;--muted:#a0a6ad;--line:#33373d;--band:#1f2228;--head:#262a31;--accent:#8ab4f8;--card:#1b1e23;--code:#23272e}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:900px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.6rem;margin:0 0 4px}h2{font-size:1.25rem;margin:36px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
+h3{font-size:1.08rem;margin:0 0 8px}h4{font-size:.98rem;margin:14px 0 6px}
+p{margin:0 0 12px}p.sub{color:var(--muted);margin:0 0 16px}
+a{color:var(--accent)}
+.scroll{position:relative;overflow-x:auto;margin:0 0 16px}
+table{border-collapse:collapse;width:100%;min-width:520px}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{background:var(--head)}
+tbody tr:nth-child(even){background:var(--band)}
+ul,ol{padding-left:1.3em;margin:0 0 12px}li{margin-bottom:5px}
+ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:var(--band);border-radius:4px}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:var(--code);padding:1px 4px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:10px 12px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}
+pre code{background:none;padding:0;font-size:inherit;overflow-wrap:normal}
+.task{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:14px 16px 6px;margin:20px 0}
+.note{border-left:4px solid var(--accent);background:var(--card);padding:10px 14px;margin:0 0 14px}
+.note p:last-child{margin:0}
+</style>
+</head>
+<body>
+<main>
+<h1>Stored share logins, and secrets from an outside provider</h1>
+<p class="sub">Implementation plan, 27 November 2026. Branch <code>share-logins</code> in <code>H:\Source\repos\ThineCraft\ShareCraft-logins</code>, cut from main 2472d85. Build target <code>J:\cargo-target\sharecraft-logins</code>. It follows File Share Phase 1 (<a href="2026-11-17-file-share-surfacing.html">2026-11-17-file-share-surfacing.html</a>; BUILDING section 36; scope D72 to D74). Nothing below is built yet.</p>
+
+<div class="note">
+<p><b>What this adds.</b> An administrator can store a login (user name and password) for a file server. ShareCraft then signs in to that server with it before reading any approved folder there. Today the server can read a share only as the account it runs under (D73).</p>
+<p><b>Why it starts with secrets.</b> The owner plans to run several ShareCraft front ends later. They must all read the same stored logins, tokens and keys from a cloud key vault. Today every secret is sealed with <code>secret.key</code> in one server's data folder, which a second front end cannot open. The owner asked that the vault not be built into the ShareCraft executable (27 November 2026). So secrets move behind a small documented HTTPS contract. Any vault can sit behind it as a separate adapter service. Today's sealed store stays built in as the default for a single server.</p>
+</div>
+
+<h2>Contents</h2>
+<div class="scroll"><table>
+<thead><tr><th>Task</th><th>What it builds</th><th>Needs</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>The secret store seam: every secret is read and written through <code>SecretStore</code>; no change in behaviour</td><td>-</td></tr>
+<tr><td>2</td><td>The outside secret provider: the contract, its client, the 60-second cache, forgetting through a sweep, and <code>cargo xtask fake-secret-provider</code></td><td>1</td></tr>
+<tr><td>3</td><td>Records and API for share logins, one per server</td><td>1</td></tr>
+<tr><td>4</td><td>Signing in on Windows (WNetAddConnection2W) before reading a share, retrying once on refusal</td><td>3</td></tr>
+<tr><td>5</td><td>The Logins part of the administrator's File shares settings</td><td>3</td></tr>
+<tr><td>6</td><td>Whole-branch review and one fix wave</td><td>1 to 5</td></tr>
+<tr><td>7</td><td>Real check (controller): the fake provider, and a share that needs its own login</td><td>6, owner's share</td></tr>
+<tr><td>8</td><td>The records: BUILDING, scope, sequencing</td><td>7</td></tr>
+</tbody></table></div>
+
+<h2>Rulings already made</h2>
+<ul class="band">
+<li><b>One login per server, not per folder.</b> Windows lets one account hold only one set of credentials per server at a time; a second set fails with error 1219. So a login belongs to a server (<code>\\host</code>), and it covers every approved folder on that server. (Claude's recommendation, adopted 27 November 2026, when the owner answered with the provider instruction instead.)</li>
+<li><b>Signing in uses the Windows API, not <code>net use</code>.</b> ShareCraft calls <code>WNetAddConnection2W</code>, the call <code>net use</code> makes itself. There is no child process, the password is never on a command line, and no drive letter is mapped. The connection is temporary (<code>CONNECT_TEMPORARY</code>) and is not restored at the next sign-in. This needs <code>windows-sys</code> as a direct dependency of <code>crates/server</code>, for Windows targets only. The crate is already in <code>Cargo.lock</code> through other crates.</li>
+<li><b>Linux keeps the administrator's mounts.</b> On Linux the mount's own credentials decide, as before. A login can be stored only for a UNC root, which is usable only on Windows. A Linux server refuses a login with <code>422 logins_windows_only</code>.</li>
+<li><b>Secrets come from an outside provider over HTTPS (owner's choice, 27 November 2026).</b> ShareCraft knows only the contract below. A vault adapter, such as one for Azure Key Vault, is a separate service and is not part of this plan. Without a configured provider, the built-in sealed store is used.</li>
+<li><b>Existing secrets stay where they are.</b> Each <code>secrets</code> row records which store holds it. Old rows stay local and keep working. New secrets go to the configured provider. Moving old secrets to the provider is not in this plan; a later command can do it.</li>
+<li><b>A login is tried before it is stored.</b> The PUT signs in with the new login first. If Windows refuses, nothing is stored and the answer says why.</li>
+<li><b>Removing the last approved folder on a server removes its login</b>, in the same transaction as the settings write. Its secret is forgotten.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li>No password, token or key ever appears in a log line, an error message, an API answer, an audit event or a test's printed output. <code>Secret</code>'s <code>Debug</code> and <code>Display</code> stay <code>[hidden]</code>.</li>
+<li>The provider contract (verbatim):
+<pre><code>PUT    {base}/v1/secrets/{name}   body {"value":"&lt;base64&gt;"}   → 204
+GET    {base}/v1/secrets/{name}                                → 200 {"value":"&lt;base64&gt;"} | 404
+DELETE {base}/v1/secrets/{name}                                → 204 | 404 (both mean gone)
+Authorization: Bearer &lt;token&gt;      Content-Type: application/json
+name = "sharecraft-" + the secret's uuid as 32 lower-case hex digits (matches ^sharecraft-[0-9a-f]{32}$)</code></pre></li>
+<li>Configuration: <code>SHARECRAFT_SECRET_PROVIDER</code> is the base URL. It must be <code>https://</code>, or <code>http://</code> to a loopback address only. <code>SHARECRAFT_SECRET_PROVIDER_TOKEN_FILE</code> is the path of a file holding the bearer token. The token is not an environment variable, so it stays out of environment dumps. A URL without a token file, or a token file without a URL, stops the server at start with a plain sentence.</li>
+<li>Provider requests time out after 10 seconds. A failure is <code>SecretError::Unavailable</code>. The API answers <code>503 secret_store_unavailable</code>, and a library shows "The secret store could not be reached."</li>
+<li>Opened values are cached in memory for 60 seconds, keyed by secret id. A put or forget made by this process drops that entry. Other front ends see a change within 60 seconds.</li>
+<li>Share login user names are 1 to 256 characters, with no control characters and no <code>/</code>. Passwords are 1 to 256 bytes with no NUL.</li>
+<li>Migration number <code>0029</code>, after main's <code>0028_live_checkpoint_stamp.sql</code>.</li>
+<li>Decision numbers: scope D75 onwards (D74 is the last used).</li>
+<li>Pages: they pass at 375 px and in dark mode, use the existing settings-page styles, and band long lists.</li>
+<li>Commits end with <code>Co-Authored-By: Claude Opus 5.5 &lt;noreply@anthropic.com&gt;</code>. Merging and pushing wait for the owner.</li>
+</ul>
+
+<h2>How this plan is executed</h2>
+<p>Use superpowers:subagent-driven-development. Helpers implement one task each, and a reviewer checks each task. The controller keeps the ledger at <code>.superpowers/sdd/2026-11-27-share-logins.html/progress.md</code>. Local builds run targeted tests only; the full suite runs on GitHub <code>check.yml</code> after a push, and pushing needs the owner's yes. Never print <code>.env</code>, database URLs or passwords.</p>
+
+<h2>Review focus</h2>
+<ul class="band">
+<li><b>The provider is down during a sync or a webhook.</b> The library shows a plain error and retries. The webhook answers 503, not 404, so GitHub redelivers. Nothing is deleted. Test in Task 2.</li>
+<li><b>Two front ends.</b> One front end stores a login and another reads it through the provider. Test in Task 2: two <code>SecretStore</code>s share one fake provider; a put on one is read on the other after its cache expires.</li>
+<li><b>The server already holds a connection to the host with other credentials</b> (error 1219), for example a drive the service account mapped. The answer is <code>409 login_conflict</code>, with a sentence naming the server. Test in Task 4 with the fake connector.</li>
+<li><b>The password is changed on the file server, so the stored login now fails.</b> The library shows "The stored login for \\host was refused", and a new login from the settings page fixes it without a restart. Test in Task 4.</li>
+<li><b>A site is purged while its secrets live in the provider.</b> The secrets are deleted from the provider by the sweep, not left behind. Test in Task 2.</li>
+</ul>
+
+<h2>File structure</h2>
+<div class="scroll"><table>
+<thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>crates/server/src/secret_store.rs</code> (new)</td><td><code>SecretStore</code>: put, get, forget, sweep; picks the local or outside store per row; the cache.</td></tr>
+<tr><td><code>crates/server/src/secret_provider.rs</code> (new)</td><td>The HTTPS client for the contract.</td></tr>
+<tr><td><code>crates/server/src/secrets.rs</code></td><td>Unchanged sealing (<code>SecretBox</code>); <code>SecretError</code> gains <code>Unavailable</code>.</td></tr>
+<tr><td><code>crates/server/src/share_login.rs</code> (new)</td><td><code>ShareConnector</code> trait, <code>WNetConnector</code> (Windows), <code>NoConnector</code> (others), <code>FakeConnector</code> (tests), <code>ShareLogins</code> (which remotes are connected, ensure and invalidate).</td></tr>
+<tr><td><code>crates/server/src/api/settings.rs</code></td><td>Login routes; <code>logins</code> in <code>shares_out</code>; removing logins with their last root.</td></tr>
+<tr><td><code>crates/server/src/share.rs</code></td><td>Calls <code>ensure</code> before listing, stat and open; retries once after a refusal.</td></tr>
+<tr><td><code>crates/records/migrations/0029_secret_providers_and_share_logins.sql</code> (new)</td><td><code>secrets.provider</code>, <code>forgotten_at</code>, and the <code>share_logins</code> table.</td></tr>
+<tr><td><code>crates/records/src/sources.rs</code>, <code>crates/records/src/share_paths.rs</code></td><td>Secret rows by provider; <code>SharePath::server()</code>; share login records.</td></tr>
+<tr><td><code>xtask/src/fake_secret_provider.rs</code> (new)</td><td>The in-memory provider on loopback, for development and the real check.</td></tr>
+<tr><td><code>web/sharing.js</code> (+ test)</td><td>The Logins part of the File shares settings.</td></tr>
+</tbody></table></div>
+
+<h2>What the code looks like today (verified 27 November 2026)</h2>
+<ul class="band">
+<li><code>AppState::secrets()</code> returns the <code>SecretBox</code> (<code>lib.rs:230</code>). It is opened from <code>data_dir</code> at start (<code>lib.rs:177</code>).</li>
+<li>Secrets are written by <code>store_secret</code> and <code>forget_secret</code> in <code>api/sources.rs:202-230</code>, which call <code>seal</code>, then <code>db.put_secret(&amp;SealedRow)</code> and <code>db.delete_secret</code>.</li>
+<li>Secrets are read in three places:
+<ul>
+<li><code>source_sync::token_of</code> (<code>source_sync.rs:2042</code>), for the GitHub token. S3 also uses it for its keys (<code>s3.rs:803</code>).</li>
+<li><code>webhooks.rs:107-122</code>, for the webhook secret.</li>
+<li><code>api/sources.rs:1894</code>.</li>
+</ul>
+Each one calls <code>db.get_secret</code>, builds a <code>Sealed</code> and calls <code>unseal</code> with a context such as <code>token_context(library)</code>.</li>
+<li><code>sites.rs:852-900</code> deletes a purged site's <code>secrets</code> rows in its own SQL transaction.</li>
+<li>Approved roots are the <code>SHARE_ROOTS</code> setting, a JSON list of strings. They are changed by <code>change_shares</code> (<code>api/settings.rs</code>) under <code>lock_share_connections</code>. <code>shares_out</code> answers <code>roots</code>, the limits and <code>runs_as</code>. The page is <code>web/sharing.js</code> (around line 428).</li>
+<li><code>reqwest</code> 0.13 with native TLS is already a dependency of the server. <code>xtask</code> already has <code>fake_icap.rs</code> as a model for the fake provider.</li>
+</ul>
+
+<h2>Task cards</h2>
+
+<div class="task">
+<h3>Task 1: the secret store seam</h3>
+<p><b>Files:</b> create <code>crates/server/src/secret_store.rs</code>. Modify <code>lib.rs</code>, <code>api/sources.rs</code>, <code>source_sync.rs</code>, <code>webhooks.rs</code> and <code>secrets.rs</code>. Tests go in <code>crates/server/tests/secret_store.rs</code>.</p>
+<p><b>Produces:</b></p>
+<pre><code>pub struct SecretStore { /* SecretBox, Option&lt;SecretProvider&gt; (None until Task 2), cache */ }
+impl SecretStore {
+    pub async fn put(&amp;self, db: &amp;Db, plain: &amp;[u8], context: &amp;[u8]) -&gt; Result&lt;SecretId, SecretError&gt;;
+    pub async fn get(&amp;self, db: &amp;Db, id: SecretId, context: &amp;[u8]) -&gt; Result&lt;Option&lt;Vec&lt;u8&gt;&gt;, SecretError&gt;; // None: no such row
+    pub async fn forget(&amp;self, db: &amp;Db, id: SecretId);   // logs, never fails the caller
+}
+impl AppState { pub fn secret_store(&amp;self) -&gt; &amp;SecretStore; }
+// secrets.rs
+pub enum SecretError { …, Unavailable(String) }   // a plain sentence, never a value</code></pre>
+<ol>
+<li>Write tests:
+<ul>
+<li><code>put_then_get_round_trips</code></li>
+<li><code>get_with_another_context_is_wrong_key</code></li>
+<li><code>forget_then_get_is_none</code></li>
+</ul>
+Run them; they fail.</li>
+<li>Implement the local path only, as a wrapper over today's <code>seal</code>/<code>put_secret</code> and <code>get_secret</code>/<code>unseal</code>.</li>
+<li>Move every caller listed under "What the code looks like today" onto <code>secret_store()</code>.
+<ul>
+<li><code>AppState::secrets()</code> becomes private to <code>secret_store.rs</code>, or is removed if nothing else needs it.</li>
+<li>The webhook keeps its present answers. A missing row answers 404. An <code>Unavailable</code> error answers 503.</li>
+</ul></li>
+<li>Run the new tests and the existing tests in <code>secrets</code>, <code>source_api</code>, <code>source_worker</code>, <code>webhooks</code> and <code>s3_*</code>; all pass. Commit with the message "Secrets: one store for every secret".</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 2: the outside secret provider</h3>
+<p><b>Files:</b> create <code>crates/server/src/secret_provider.rs</code>, <code>xtask/src/fake_secret_provider.rs</code> and the first half of migration <code>0029</code>. Modify <code>secret_store.rs</code>, <code>config</code> (environment), <code>sites.rs</code>, <code>records/src/sources.rs</code>, the worker loop (to add the sweep) and the xtask command list. Tests go in <code>crates/server/tests/secret_provider.rs</code>.</p>
+<p><b>Migration (first half):</b></p>
+<pre><code>alter table secrets
+  add column provider text not null default 'local' check (provider in ('local', 'external')),
+  add column forgotten_at timestamptz,
+  alter column key_id drop not null, alter column nonce drop not null, alter column ciphertext drop not null,
+  add constraint secrets_local_has_ciphertext
+    check (provider = 'external' or (key_id is not null and nonce is not null and ciphertext is not null));
+create index secrets_forgotten on secrets (forgotten_at) where forgotten_at is not null;</code></pre>
+<p><b>Produces:</b></p>
+<pre><code>pub struct SecretProvider { /* base Url, token: Secret, reqwest::Client (10 s timeout) */ }
+impl SecretProvider {
+    pub fn from_env() -&gt; Result&lt;Option&lt;SecretProvider&gt;, String&gt;;   // Err: a sentence for start-up
+    pub async fn put(&amp;self, name: &amp;str, value: &amp;[u8]) -&gt; Result&lt;(), SecretError&gt;;
+    pub async fn get(&amp;self, name: &amp;str) -&gt; Result&lt;Option&lt;Vec&lt;u8&gt;&gt;, SecretError&gt;;
+    pub async fn delete(&amp;self, name: &amp;str) -&gt; Result&lt;(), SecretError&gt;;      // 404 is Ok
+}
+pub fn provider_name(id: SecretId) -&gt; String;   // "sharecraft-" + 32 lower-case hex
+impl SecretStore { pub async fn sweep_forgotten(&amp;self, db: &amp;Db) -&gt; usize; }</code></pre>
+<p><b>Behaviour:</b></p>
+<ul class="band">
+<li><code>put</code> with a provider configured works in this order:
+<ol>
+<li>Insert a row with <code>provider='external'</code> and no ciphertext, to get its id.</li>
+<li>Put the value to the provider under that id's name.</li>
+<li>If the provider put fails, delete the row and return <code>Unavailable</code>.</li>
+</ol>
+The context is not used for outside values; the vault protects them.</li>
+<li><code>get</code> follows the row's own <code>provider</code>. An external row with no provider configured is <code>Unavailable("this server has no secret provider configured")</code>.</li>
+<li><code>forget</code> deletes a local row at once, as today, and sets <code>forgotten_at</code> on an external row. <code>sweep_forgotten</code>, run every minute by the existing worker loop, deletes each forgotten value at the provider and then its row. A failed delete is retried at the next sweep.</li>
+<li><code>sites.rs</code> purge: in its transaction it deletes local rows and marks external rows <code>forgotten_at = now()</code>.</li>
+<li>Cache: 60 seconds per id, dropped by this process's put and forget.</li>
+<li><code>cargo xtask fake-secret-provider --port &lt;n&gt; --token-file &lt;path&gt;</code> serves the contract from memory on 127.0.0.1 only. It writes a random token to the file when the file does not exist. Requests with the wrong token answer 401.</li>
+</ul>
+<p><b>Tests</b> (an in-process axum fake on loopback):</p>
+<ul class="band">
+<li><code>put_and_get_through_provider</code></li>
+<li><code>values_reach_provider_under_contract_name</code></li>
+<li><code>second_store_reads_after_cache_expiry</code>, which uses a cache time set for tests</li>
+<li><code>provider_down_is_unavailable_and_put_leaves_no_row</code></li>
+<li><code>webhook_answers_503_when_provider_down</code></li>
+<li><code>forget_marks_then_sweep_deletes_at_provider</code></li>
+<li><code>sweep_retries_after_failed_delete</code></li>
+<li><code>site_purge_forgets_external_secrets</code></li>
+<li><code>old_local_rows_still_open_with_provider_configured</code></li>
+<li><code>from_env_refuses_plain_http_to_non_loopback</code></li>
+<li><code>from_env_refuses_url_without_token_file</code></li>
+<li><code>no_value_in_debug_or_errors</code></li>
+</ul>
+<p>Commit with the message "Secrets: an outside provider over HTTPS".</p>
+</div>
+
+<div class="task">
+<h3>Task 3: share login records and API</h3>
+<p><b>Files:</b> the second half of migration <code>0029</code>; <code>records/src/share_paths.rs</code> (<code>server()</code> and the login records); <code>api/settings.rs</code>; the routes in <code>lib.rs</code>. Tests go in <code>crates/records/tests/share_logins.rs</code> and <code>crates/server/tests/share_logins_api.rs</code>.</p>
+<p><b>Migration (second half):</b></p>
+<pre><code>create table share_logins (
+  server text primary key check (server = lower(server) and char_length(server) between 1 and 255),
+  username text not null check (char_length(username) between 1 and 256),
+  password_secret uuid not null references secrets(id),
+  set_by uuid not null references users(id),
+  set_at timestamptz not null default now()
+);</code></pre>
+<p><b>Produces:</b></p>
+<pre><code>impl SharePath { pub fn server(&amp;self) -&gt; Option&lt;String&gt;; }  // UNC host, lower-cased; None for drive/Linux paths
+pub struct ShareLogin { pub server: String, pub username: String, pub password_secret: SecretId, pub set_at: DateTime&lt;Utc&gt; }
+impl Db {
+    pub async fn share_logins(&amp;self) -&gt; Result&lt;Vec&lt;ShareLogin&gt;, DbError&gt;;
+    pub async fn share_login(&amp;self, server: &amp;str) -&gt; Result&lt;Option&lt;ShareLogin&gt;, DbError&gt;;
+    pub async fn set_share_login(&amp;self, by: UserId, server: &amp;str, username: &amp;str, secret: SecretId)
+        -&gt; Result&lt;Option&lt;SecretId&gt;, DbError&gt;;   // the replaced secret, to forget
+    pub async fn remove_share_login(&amp;self, server: &amp;str) -&gt; Result&lt;Option&lt;SecretId&gt;, DbError&gt;;
+}
+PUT    /api/settings/shares/logins/{server}   {"username": "...", "password": "..."}  → shares_out
+DELETE /api/settings/shares/logins/{server}                                          → shares_out
+shares_out gains "logins": [{"server", "username", "set_at"}]   // never a password</code></pre>
+<p><b>Rules:</b></p>
+<ul class="band">
+<li>Administrators only; anyone else gets 403.</li>
+<li>A login for a server with no approved UNC root answers <code>422 no_root_on_server</code>.</li>
+<li>A user name or password outside the global constraints answers <code>422 invalid_request</code>.</li>
+<li>On a non-Windows server the PUT answers <code>422 logins_windows_only</code>.</li>
+<li>Task 4 inserts the sign-in test before storing. In this task the PUT stores without it.</li>
+<li>Audit events <code>share_login_set</code> and <code>share_login_removed</code> carry the server and user name only.</li>
+<li><code>change_shares</code> removes the login of every server left with no approved root, in the same transaction, and forgets its secret.</li>
+<li>Routes take the server in lower case and refuse anything that is not a valid host name with <code>422 invalid_request</code>.</li>
+</ul>
+<p><b>Tests:</b></p>
+<ul class="band">
+<li><code>server_of_unc_root_is_lower_case_host</code></li>
+<li><code>server_of_drive_or_linux_path_is_none</code></li>
+<li><code>non_admin_gets_403</code></li>
+<li><code>login_needs_an_approved_root_on_server</code></li>
+<li><code>answer_never_contains_password</code>, which checks the whole JSON text and the audit rows</li>
+<li><code>replacing_a_login_forgets_the_old_secret</code></li>
+<li><code>removing_last_root_removes_login</code></li>
+<li><code>bad_username_and_password_refused</code></li>
+</ul>
+<p>Commit with the message "File shares: one stored login per server".</p>
+</div>
+
+<div class="task">
+<h3>Task 4: signing in before reading a share</h3>
+<p><b>Files:</b> create <code>crates/server/src/share_login.rs</code>. Modify <code>share.rs</code>, <code>api/settings.rs</code> (the sign-in test before storing), <code>lib.rs</code> (state) and <code>crates/server/Cargo.toml</code>, which adds <code>[target.'cfg(windows)'.dependencies] windows-sys</code> with features <code>Win32_Foundation</code> and <code>Win32_NetworkManagement_WNet</code>. Tests go in <code>crates/server/tests/share_logins_connect.rs</code>.</p>
+<p><b>Produces:</b></p>
+<pre><code>pub enum LoginFailure { Refused, Conflict, Unreachable, Other(u32) }
+pub trait ShareConnector: Send + Sync {
+    fn connect(&amp;self, remote: &amp;str, username: &amp;str, password: &amp;Secret) -&gt; Result&lt;(), LoginFailure&gt;; // remote = \\host\share
+    fn disconnect(&amp;self, remote: &amp;str);
+}
+pub struct WNetConnector;   // cfg(windows)
+pub struct NoConnector;     // elsewhere: connect is Other(0)
+pub struct ShareLogins { /* connector, connected: Mutex&lt;HashMap&lt;String /*remote*/, SecretId&gt;&gt; */ }
+impl ShareLogins {
+    pub async fn ensure(&amp;self, state: &amp;AppState, root: &amp;SharePath) -&gt; Result&lt;(), LoginFailure&gt;; // no login: Ok
+    pub fn invalidate(&amp;self, remote: &amp;str);
+    pub fn forget_server(&amp;self, server: &amp;str);   // disconnect every remote of the server
+    pub fn set_connector_for_tests(&amp;self, c: Arc&lt;dyn ShareConnector&gt;);
+}
+impl AppState { pub fn share_logins(&amp;self) -&gt; &amp;ShareLogins; }</code></pre>
+<p><b>Behaviour:</b></p>
+<ul class="band">
+<li><code>WNetConnector::connect</code> calls <code>WNetAddConnection2W</code> with <code>NETRESOURCEW { dwType: RESOURCETYPE_DISK, lpLocalName: null, lpRemoteName: remote }</code> and the flag <code>CONNECT_TEMPORARY</code>. The UTF-16 password buffer is overwritten with zeros after the call. Error codes map as follows:
+<ul>
+<li>1326, 5 and 86 → <code>Refused</code></li>
+<li>1219 → <code>Conflict</code></li>
+<li>53, 67 and 1203 → <code>Unreachable</code></li>
+<li>anything else → <code>Other</code></li>
+</ul>
+<code>disconnect</code> calls <code>WNetCancelConnection2W(remote, 0, TRUE)</code>.</li>
+<li><code>ensure</code> works in this order:
+<ol>
+<li>The remote is <code>\\host\share</code>, the first two segments of the root.</li>
+<li>If the server has no login, return Ok.</li>
+<li>If the remote is already connected with the current secret id, return Ok.</li>
+<li>Otherwise get the password through <code>SecretStore</code>, which is how front ends share logins, connect in <code>spawn_blocking</code>, and remember the remote.</li>
+</ol></li>
+<li><code>share.rs</code>: listing, stat and open of a root call <code>ensure</code> first. When one of them fails with access denied and the server has a login, it calls <code>invalidate</code> and <code>ensure</code> again, then retries once. A <code>Refused</code> sets the library's error to "The stored login for \\host was refused. An administrator can set it again under Settings › File shares." <code>Conflict</code> and <code>Unreachable</code> get their own plain sentences.</li>
+<li>The settings PUT runs in this order:
+<ol>
+<li><code>forget_server</code>.</li>
+<li>Connect to one approved root's remote on that server with the new login.</li>
+<li>If that fails, answer <code>422 login_refused</code>, <code>409 login_conflict</code> or <code>503 server_unreachable</code>, and store nothing.</li>
+<li>If it succeeds, store the login, then wake that server's libraries.</li>
+</ol>
+The DELETE calls <code>forget_server</code>.</li>
+</ul>
+<p><b>Tests</b> (with <code>FakeConnector</code>, which records calls and returns scripted failures):</p>
+<ul class="band">
+<li><code>no_login_means_no_connect</code></li>
+<li><code>first_read_connects_once_per_remote</code></li>
+<li><code>refused_login_is_not_stored</code></li>
+<li><code>conflict_answers_409_with_server_named</code></li>
+<li><code>access_denied_reconnects_once_then_reports</code></li>
+<li><code>new_login_after_password_change_heals_without_restart</code></li>
+<li><code>delete_disconnects_every_remote_of_server</code></li>
+<li><code>password_reaches_connector_only</code></li>
+</ul>
+<p>A Windows-only test, <code>wnet_unreachable_host_maps_to_unreachable</code>, uses a host name under <code>.invalid</code>. Commit with the message "File shares: sign in with the stored login".</p>
+</div>
+
+<div class="task">
+<h3>Task 5: the Logins part of the settings page</h3>
+<p><b>Files:</b> <code>web/sharing.js</code> and <code>web/sharing.test.mjs</code> (or the existing test of this page).</p>
+<ul class="band">
+<li>Under the approved folders, add a "Logins" table with the columns Server, User name, Set and actions (Change, Remove). The rows are banded. On Windows servers only, show this line: "Without a login, ShareCraft reads as <code>runs_as</code>."</li>
+<li>The form has these fields:
+<ul>
+<li>a server choice, listing the servers of approved UNC roots;</li>
+<li>a user name;</li>
+<li>a password, with <code>type=password</code> and <code>autocomplete=new-password</code>;</li>
+<li>a Save button.</li>
+</ul>
+The helper text reads: "ShareCraft signs in to this server with this login, for every approved folder on it. The password is stored in the secret store and never shown again."</li>
+<li>Error sentences for <code>login_refused</code>, <code>login_conflict</code>, <code>server_unreachable</code>, <code>no_root_on_server</code>, <code>logins_windows_only</code> and <code>secret_store_unavailable</code>.</li>
+<li>Remove asks for confirmation ("Remove the login for \\host? Folders on it will be read as &lt;runs_as&gt;.").</li>
+<li>The password field is cleared after every answer.</li>
+<li>Tests:
+<ul>
+<li>rendering with zero and two logins;</li>
+<li>the server choice lists only UNC roots' servers;</li>
+<li>the password is never put back into the form;</li>
+<li>each error code maps to its sentence.</li>
+</ul></li>
+</ul>
+<p>Commit with the message "File shares: Logins on the settings page".</p>
+</div>
+
+<div class="task">
+<h3>Task 6: whole-branch review and one fix wave</h3>
+<p>The most capable model reviews the whole branch against this plan and the Global constraints. It looks in particular for:</p>
+<ul>
+<li>secrets reaching logs, answers or test output;</li>
+<li>any read of a secret that bypasses <code>SecretStore</code>;</li>
+<li>the order of operations in put and forget.</li>
+</ul>
+<p>One fix wave follows the review.</p>
+</div>
+
+<div class="task">
+<h3>Task 7: real check (controller)</h3>
+<ol>
+<li>Start <code>cargo xtask fake-secret-provider</code> and a check server configured with it. Store a login and confirm the value is in the provider and not in <code>secrets.ciphertext</code>. Stop the provider and confirm the plain error and retry. Purge a site and confirm the sweep removes its values.</li>
+<li>On a share that refuses this PC's account without its own login:
+<ul>
+<li>Approve the folder; it fails with access denied.</li>
+<li>Set a wrong password; the answer is <code>login_refused</code> and nothing is stored.</li>
+<li>Set the right login; the listing fills.</li>
+<li>Download a file; its SHA-256 matches.</li>
+<li>Change the password on the server; the library shows the refusal.</li>
+<li>Set the new password; the library heals.</li>
+<li>Remove the login.</li>
+</ul>
+<b>This needs a share from the owner</b>, for example a folder on melli that only a separate local melli account can open. The owner types the password into the page; Claude never sees it. Without such a share this step is recorded as not done.</li>
+<li>Check the pages at 375 px and in dark mode.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 8: the records</h3>
+<ul class="band">
+<li>BUILDING section 36: replace "No credential is stored" with how logins work. Add a section on the secret store that covers:
+<ul>
+<li>the contract;</li>
+<li>the two environment settings;</li>
+<li>the cache;</li>
+<li>the sweep;</li>
+<li>that old secrets stay local;</li>
+<li>that a vault adapter is a separate service.</li>
+</ul></li>
+<li>Scope: D75 (secrets through an outside provider contract), D76 (one share login per server, signed in with the Windows API), D77 (Linux keeps its mounts). Amend D73's "No credential is stored". Bump the version.</li>
+<li>Sequencing: a progress note, and what comes next. That is the vault adapter service, Phase 2 if the owner asks, or S3 slice 3.</li>
+</ul>
+</div>
+
+<h2>Not checked, and risks</h2>
+<ul class="band">
+<li>A server running as a Windows service under LocalSystem: <code>WNetAddConnection2W</code> connections belong to the logon session, so the service's own session holds them. This is expected to work but is not checked unless the owner runs ShareCraft as a service.</li>
+<li>No real cloud vault is used. The adapter service (for example Azure Key Vault behind this contract) is a later piece of work.</li>
+<li>The 60-second cache means a changed login reaches other front ends within a minute, not at once.</li>
+<li>Kerberos-only file servers that refuse NTLM user and password sign-in are out of scope.</li>
+</ul>
+</main>
+</body>
+</html>
