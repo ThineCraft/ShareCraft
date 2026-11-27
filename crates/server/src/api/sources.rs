@@ -39,7 +39,9 @@ use crate::s3_sign::Credentials;
 use crate::s3_write;
 use crate::secrets::Secret;
 use crate::share::{FileIdentity, FsBudget, canonical_share_path};
-use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
+use crate::source_sync::{
+    SyncError, abandon_uploads_into, caps, token_context, token_of, webhook_context,
+};
 use crate::source_write::{self, Probe};
 use crate::tree::{self, TreeOp};
 
@@ -210,10 +212,7 @@ async fn store_secret(
         .secret_store()
         .put(state.db(), plain, context)
         .await
-        .map_err(|e| {
-            eprintln!("sharecraft-server: a secret could not be stored: {e}");
-            ApiError::Unavailable
-        })
+        .map_err(|e| ApiError::secret(&e))
 }
 
 /// Deletes the secret `id`; a failure is logged (the row holds only ciphertext).
@@ -1044,9 +1043,14 @@ pub(crate) async fn change(
         let current = if new_token {
             None
         } else {
+            // `token_of` answers `Failed` only when the secret store could not be reached
+            // (worth trying again), and `NotConnected` when the token cannot be opened.
             token_of(&state, &config)
                 .await
-                .map_err(|_| ApiError::TokenRejected)?
+                .map_err(|error| match error {
+                    SyncError::Failed(_) => ApiError::SecretStoreUnavailable,
+                    _ => ApiError::TokenRejected,
+                })?
         };
         let probing = token.as_ref().or(current.as_ref());
         probe(

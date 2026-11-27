@@ -1,4 +1,4 @@
-﻿import test from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
@@ -62,6 +62,8 @@ test('each error code maps to its sentence', () => {
   assert.match(loginErrorText('server_unreachable', 'filehost'), /\\\\filehost/);
   assert.match(loginErrorText('secret_store_unavailable'), /secret store/);
   assert.match(loginErrorText('invalid_request'), /user name/);
+  // The server counts the password in bytes, so the sentence does not promise 256 characters.
+  assert.doesNotMatch(loginErrorText('invalid_request'), /password of 1 to 256 characters/);
 });
 
 test('an unknown code has no login sentence', () => {

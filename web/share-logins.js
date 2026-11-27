@@ -1,4 +1,4 @@
-﻿// The Logins part of the File shares settings: the pure helpers (which servers can have a
+// The Logins part of the File shares settings: the pure helpers (which servers can have a
 // login, the rows, the sentences). The page itself is in sharing.js. A password never passes
 // through here: the server never answers one.
 
@@ -53,7 +53,7 @@ export function loginErrorText(code, server = '') {
     case 'secret_store_unavailable':
       return 'The secret store could not be reached. Nothing was saved. Try again in a moment.';
     case 'invalid_request':
-      return 'Enter a user name of 1 to 256 characters without a /, and a password of 1 to 256 characters.';
+      return 'Enter a user name of 1 to 256 characters without a /, and a password that is not empty and not too long: 256 plain letters and digits at most, fewer if it has accented letters or symbols.';
     default:
       return '';
   }
