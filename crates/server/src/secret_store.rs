@@ -126,8 +126,10 @@ impl SecretStore {
             unavailable()
         })?;
         if let Err(e) = provider.put(&provider_name(id), plain).await {
-            if let Err(e) = db.delete_secret(id).await {
-                eprintln!("sharecraft-server: a secret row could not be removed: {e}");
+            // The provider may have stored the value before its answer was lost: mark the row
+            // forgotten, so the sweep deletes the value there (a 404 counts as gone) and the row.
+            if let Err(e) = db.forget_secret(id).await {
+                eprintln!("sharecraft-server: a secret row could not be marked: {e}");
             }
             return Err(e);
         }

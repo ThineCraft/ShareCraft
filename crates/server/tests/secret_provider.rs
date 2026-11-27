@@ -327,7 +327,7 @@ async fn second_store_reads_after_cache_expiry() {
 }
 
 #[tokio::test]
-async fn provider_down_is_unavailable_and_put_leaves_no_row() {
+async fn failed_put_is_unavailable_and_leaves_only_a_forgotten_row() {
     let fake = FakeProvider::start().await;
     let db = TestDb::create().await;
     let (store, _dir) = front_end(Some(fake.provider()));
@@ -337,7 +337,9 @@ async fn provider_down_is_unavailable_and_put_leaves_no_row() {
         matches!(&result, Err(SecretError::Unavailable(s)) if s == "The secret store could not be reached."),
         "{result:?}"
     );
-    assert_eq!(count_secrets(&db).await, 0);
+    // Only a forgotten row is left: the value may have been stored before the answer was lost.
+    assert_eq!(count_secrets(&db).await, 1);
+    assert_eq!(db.db.forgotten_secrets(10).await.unwrap().len(), 1);
     assert!(fake.names().is_empty());
 
     // A provider nobody listens on is the same.
@@ -350,6 +352,11 @@ async fn provider_down_is_unavailable_and_put_leaves_no_row() {
     ));
     let result = lonely.put(&db.db, VALUE, b"ctx").await;
     assert!(matches!(result, Err(SecretError::Unavailable(_))));
+    assert_eq!(db.db.forgotten_secrets(10).await.unwrap().len(), 2);
+
+    // The provider back, the sweep removes both rows (404 counts as gone).
+    fake.set_down(false);
+    assert_eq!(store.sweep_forgotten(&db.db).await, 2);
     assert_eq!(count_secrets(&db).await, 0);
 
     // A read while it is down is Unavailable, not "gone".
