@@ -29,6 +29,8 @@ impl Env {
     async fn new() -> Self {
         let server = spawn_server().await;
         let admin = server.admin("Share admin").await;
+        // Signing in is faked: no test reaches a real file server.
+        common::fake_connector::FakeConnector::new().install(&server.app_state().await);
         server
             .records_db()
             .set_setting(admin.id, SHARE_ROOTS, json!([NAS_ROOT]))

@@ -3029,6 +3029,7 @@ dependencies = [
  "tower-http 0.7.1",
  "uuid",
  "web-client",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

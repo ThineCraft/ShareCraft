@@ -806,6 +806,21 @@ impl Db {
         .await?)
     }
 
+    /// Every connected share's library with its lexical location, for waking the shares of
+    /// one file server.
+    pub async fn share_sources(&self) -> Result<Vec<(NodeId, String)>, DbError> {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "select library_id, location from library_sources \
+             where kind = 'share' and location is not null order by library_id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(library, location)| (NodeId(library), location))
+            .collect())
+    }
+
     /// The lexical locations of the other connected shares while this turn is held.
     pub async fn share_locations_locked(
         &self,

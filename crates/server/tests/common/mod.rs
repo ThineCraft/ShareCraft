@@ -37,6 +37,7 @@ use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
+pub mod fake_connector;
 pub mod fake_github;
 pub mod fake_s3;
 pub mod fake_share;

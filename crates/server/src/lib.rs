@@ -1,4 +1,5 @@
-#![forbid(unsafe_code)]
+// Denied, not forbidden: only share_login's Windows sign-in module allows unsafe code.
+#![deny(unsafe_code)]
 //! The ShareCraft session server: one room per open document, reached over WebSocket, and a
 //! JSON API for signing in.
 //!
@@ -42,6 +43,7 @@ pub mod secret_provider;
 pub mod secret_store;
 pub mod secrets;
 pub mod share;
+pub mod share_login;
 pub mod sites;
 pub mod source;
 pub mod source_sync;
@@ -152,6 +154,8 @@ struct Shared {
     github: Arc<github::GithubClient>,
     /// File-share reads and their operating-system seam.
     shares: Arc<share::Shares>,
+    /// The connections made with stored file-server logins.
+    share_logins: Arc<share_login::ShareLogins>,
     /// The S3 client: clients per endpoint and the usage meter.
     s3: Arc<s3::S3>,
     /// The sync worker's wakes, turns and back-off.
@@ -212,6 +216,7 @@ impl AppState {
                 secret_store: Arc::new(secret_store),
                 github: Arc::new(github),
                 shares: Arc::new(share::Shares::default()),
+                share_logins: Arc::new(share_login::ShareLogins::default()),
                 s3: Arc::new(s3),
                 sources: source_sync::Sources::default(),
                 writes: source_write::SourceWrites::default(),
@@ -249,6 +254,12 @@ impl AppState {
     #[must_use]
     pub fn shares(&self) -> &share::Shares {
         &self.shared.shares
+    }
+
+    /// The connections made with stored file-server logins.
+    #[must_use]
+    pub fn share_logins(&self) -> &share_login::ShareLogins {
+        &self.shared.share_logins
     }
 
     /// The S3 client: clients per endpoint and the usage meter.

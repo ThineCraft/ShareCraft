@@ -22,7 +22,10 @@ use super::{ApiError, JsonBody};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::icap::Client;
+use crate::secrets::Secret;
 use crate::share::canonical_share_path;
+use crate::share_login::{LoginFailure, remote_of};
+use records::{SecretId, SourceState};
 
 /// The longest the test of new scanner settings waits for the scanner.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -243,6 +246,16 @@ pub(crate) async fn change_shares(
         state.secret_store().forget(state.db(), secret).await;
     }
     if roots_changed {
+        // A server whose login went with its last root is signed out of.
+        match state.db().share_logins().await {
+            Ok(logins) => {
+                let kept: Vec<String> = logins.into_iter().map(|login| login.server).collect();
+                state.share_logins().forget_servers_except(&kept);
+            }
+            Err(e) => eprintln!("sharecraft-server: cannot read the stored share logins: {e}"),
+        }
+    }
+    if roots_changed {
         // A share stopped because its folder was not approved is not retried on its own; the
         // roots changed, so each is made due and woken. Nothing about it fails this request.
         match state.db().requeue_stopped_shares().await {
@@ -290,15 +303,134 @@ fn valid_login_password(text: &str) -> bool {
     (1..=256).contains(&text.len()) && !text.contains('\0')
 }
 
-/// What the stored login of `server` must pass before it is stored. Task 4 signs in here.
-#[allow(clippy::unused_async)]
+/// Why a login was not stored: an API failure, or the sign-in with it to `server` failed. The
+/// answer names the server, never the user name or password.
+pub(crate) enum LoginError {
+    Api(ApiError),
+    /// 422 `login_refused`: the file server refused the user name and password.
+    Refused(String),
+    /// 409 `login_conflict`: this server already holds a connection to the file server with
+    /// other credentials.
+    Conflict(String),
+    /// 503 `server_unreachable`: the file server could not be reached.
+    Unreachable(String),
+}
+
+impl From<ApiError> for LoginError {
+    fn from(error: ApiError) -> Self {
+        LoginError::Api(error)
+    }
+}
+
+impl axum::response::IntoResponse for LoginError {
+    fn into_response(self) -> axum::response::Response {
+        use axum::http::StatusCode;
+        let (status, code, server, message) = match self {
+            LoginError::Api(error) => return error.into_response(),
+            LoginError::Refused(server) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "login_refused",
+                format!(r"\\{server}"),
+                format!(
+                    r"The file server \\{server} refused that user name and password, so the login was not stored."
+                ),
+            ),
+            LoginError::Conflict(server) => (
+                StatusCode::CONFLICT,
+                "login_conflict",
+                format!(r"\\{server}"),
+                format!(
+                    r"This server already holds a connection to \\{server} with other credentials, for example a mapped drive, so the login was not stored. Remove that connection, then try again."
+                ),
+            ),
+            LoginError::Unreachable(server) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_unreachable",
+                format!(r"\\{server}"),
+                format!(
+                    r"The file server \\{server} could not be reached, so the login was not stored."
+                ),
+            ),
+        };
+        (
+            status,
+            Json(json!({ "error": code, "server": server, "message": message })),
+        )
+            .into_response()
+    }
+}
+
+/// What the stored login of `server` must pass before it is stored: this process signs out of
+/// the server, then signs in with the new login to the share of one of its approved roots.
+/// Answers that share (`\\host\share`), which stays signed in to. Not under the
+/// share-connection turn: signing in waits on the network.
 async fn before_storing_login(
-    _state: &AppState,
-    _server: &str,
-    _username: &str,
-    _password: &str,
-) -> Result<(), ApiError> {
-    Ok(())
+    state: &AppState,
+    server: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, LoginError> {
+    let remote = state
+        .db()
+        .share_settings()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .roots
+        .iter()
+        .filter(|root| root.server().as_deref() == Some(server))
+        .find_map(remote_of)
+        .ok_or(ApiError::NoRootOnServer)?;
+    state.share_logins().forget_server(server);
+    let answer = crate::share_login::connect(
+        state.share_logins().connector(),
+        remote.clone(),
+        username.to_owned(),
+        Secret::new(password),
+        state.shares().operation_timeout(),
+    )
+    .await;
+    match answer {
+        Ok(()) => Ok(remote),
+        Err(LoginFailure::Refused) => Err(LoginError::Refused(server.to_owned())),
+        Err(LoginFailure::Conflict) => Err(LoginError::Conflict(server.to_owned())),
+        Err(failure) => {
+            if let LoginFailure::Other(code) = failure {
+                eprintln!("sharecraft-server: signing in to {server} failed with error {code}");
+            }
+            Err(LoginError::Unreachable(server.to_owned()))
+        }
+    }
+}
+
+/// Makes every connected share on `server` due at once and wakes it: one stopped because its
+/// stored login was refused, or waiting to retry, is tried again with the new login.
+async fn wake_server(state: &AppState, server: &str) {
+    let sources = match state.db().share_sources().await {
+        Ok(sources) => sources,
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot wake the shares of a file server: {e}");
+            return;
+        }
+    };
+    for (library, location) in sources {
+        let on_server = SharePath::parse(&location)
+            .ok()
+            .and_then(|path| path.server())
+            .is_some_and(|host| host == server);
+        if !on_server {
+            continue;
+        }
+        let stopped = matches!(
+            state.db().source_of(library).await,
+            Ok(Some((_, status)))
+                if matches!(status.state, SourceState::NotConnected | SourceState::Failed)
+        );
+        if stopped && let Err(e) = state.db().requeue_source(library, None).await {
+            eprintln!("sharecraft-server: cannot wake a share: {e}");
+        }
+        state.sources().forget_failures(library);
+        state.sources().wake(library);
+    }
 }
 
 /// The answer for a secret that could not be stored.
@@ -318,19 +450,60 @@ pub(crate) async fn set_share_login(
     signed: Signed,
     axum::extract::Path(server): axum::extract::Path<String>,
     JsonBody(change): JsonBody<ShareLoginChange>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, LoginError> {
     if !signed.session.user.is_admin {
-        return Err(ApiError::Forbidden);
+        return Err(ApiError::Forbidden.into());
     }
     let (Some(username), Some(password)) = (change.username, change.password) else {
-        return Err(ApiError::InvalidRequest);
+        return Err(ApiError::InvalidRequest.into());
     };
     if !valid_server(&server)
         || !valid_login_username(&username)
         || !valid_login_password(&password)
     {
-        return Err(ApiError::InvalidRequest);
+        return Err(ApiError::InvalidRequest.into());
     }
+    if !has_root_on(&state, &server).await? {
+        return Err(ApiError::NoRootOnServer.into());
+    }
+    if !cfg!(windows) {
+        return Err(ApiError::LoginsWindowsOnly.into());
+    }
+    // Signed in with the new login before anything is stored, and outside the turn.
+    let remote = before_storing_login(&state, &server, &username, &password).await?;
+    let stored = store_login(&state, &signed, &server, &username, &password).await;
+    let secret = match stored {
+        Ok(secret) => secret,
+        Err(e) => {
+            state.share_logins().forget_server(&server);
+            return Err(e.into());
+        }
+    };
+    state.share_logins().remember(&remote, secret);
+    wake_server(&state, &server).await;
+    Ok(Json(shares_out(&state).await?))
+}
+
+/// Whether an approved root is on `server`.
+async fn has_root_on(state: &AppState, server: &str) -> Result<bool, ApiError> {
+    Ok(state
+        .db()
+        .share_settings()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .roots
+        .iter()
+        .any(|root| root.server().as_deref() == Some(server)))
+}
+
+/// Stores the login of `server`, forgetting the one it replaces, and answers its secret.
+async fn store_login(
+    state: &AppState,
+    signed: &Signed,
+    server: &str,
+    username: &str,
+    password: &str,
+) -> Result<SecretId, ApiError> {
     // Under the share-connection turn, so a change of roots cannot slip in between the check
     // that the server has a root and the storing of its login.
     let turn = state
@@ -339,21 +512,9 @@ pub(crate) async fn set_share_login(
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::Unavailable)?;
-    let has_root = state
-        .db()
-        .share_settings()
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?
-        .roots
-        .iter()
-        .any(|root| root.server().as_deref() == Some(server.as_str()));
-    if !has_root {
+    if !has_root_on(state, server).await? {
         return Err(ApiError::NoRootOnServer);
     }
-    if !cfg!(windows) {
-        return Err(ApiError::LoginsWindowsOnly);
-    }
-    before_storing_login(&state, &server, &username, &password).await?;
     let context = format!("share-login:{server}");
     let secret = state
         .secret_store()
@@ -362,7 +523,7 @@ pub(crate) async fn set_share_login(
         .map_err(|e| secret_failure(&e))?;
     let replaced = match state
         .db()
-        .set_share_login(signed.session.user.id, &server, &username, secret)
+        .set_share_login(signed.session.user.id, server, username, secret)
         .await
     {
         Ok(replaced) => replaced,
@@ -375,7 +536,7 @@ pub(crate) async fn set_share_login(
     if let Some(old) = replaced {
         state.secret_store().forget(state.db(), old).await;
     }
-    Ok(Json(shares_out(&state).await?))
+    Ok(secret)
 }
 
 /// `DELETE /api/settings/shares/logins/{server}`: removes the stored login of `server`, for
@@ -403,6 +564,7 @@ pub(crate) async fn remove_share_login(
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
     drop(turn);
+    state.share_logins().forget_server(&server);
     if let Some(secret) = removed {
         state.secret_store().forget(state.db(), secret).await;
     }
