@@ -230,9 +230,15 @@ async fn materialise_share(
     }
     let fs = state.shares().fs();
     let mut first = timed_stat(Arc::clone(&fs), root_path.clone(), file_path.clone(), None).await;
-    // A refusal with a stored login may be a stale connection: sign in again once, stat once
-    // more, then report.
+    // A refusal with a stored login may be a stale connection, but only when the share's root
+    // is refused too: one file the account may not read says nothing about the connection,
+    // which other reads of the share go on using. Then sign in again once, stat once more,
+    // then report.
     if matches!(first, Err(FsError::Denied))
+        && matches!(
+            timed_stat(Arc::clone(&fs), root_path.clone(), root_path.clone(), None).await,
+            Err(FsError::Denied)
+        )
         && crate::share::signed_in_again(state, &location)
             .await
             .unwrap_or(false)

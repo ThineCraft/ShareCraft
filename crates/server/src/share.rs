@@ -772,7 +772,7 @@ pub(crate) async fn signed_in_again(state: &AppState, root: &SharePath) -> Resul
     if !has_login {
         return Ok(false);
     }
-    state.share_logins().invalidate(&remote);
+    state.share_logins().invalidate(state, &remote).await;
     signed_in(state, root).await?;
     Ok(true)
 }

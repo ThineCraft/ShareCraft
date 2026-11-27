@@ -31,7 +31,6 @@ const PASSWORD: &str = "Tr1cky-pass-word";
 /// The password after a change on the file server.
 const CHANGED_PASSWORD: &str = "the-new-pass-word";
 /// A new password the file server refuses.
-#[cfg_attr(not(windows), allow(dead_code))]
 const REFUSED_PASSWORD: &str = "new-pass-word";
 const ROOT: &str = r"\\nas\docs";
 const OTHER_ROOT: &str = r"\\nas\other";
@@ -153,8 +152,7 @@ impl Env {
     }
 }
 
-/// The `error` of an answer; only the Windows-only PUT checks read it.
-#[cfg(windows)]
+/// The `error` of an answer.
 fn error_of(text: &str) -> String {
     serde_json::from_str::<Value>(text).unwrap()["error"]
         .as_str()
@@ -210,7 +208,6 @@ async fn refused_login_is_not_stored() {
     // Not retried in a loop: one connect, no reconnect.
     assert_eq!(env.connector.connects().len(), 1);
 
-    #[cfg(windows)]
     {
         let db = env.server.records_db();
         let before = db.share_login("nas").await.unwrap().unwrap();
@@ -242,7 +239,6 @@ async fn refused_login_is_not_stored() {
     }
 }
 
-#[cfg(windows)]
 #[tokio::test]
 async fn conflict_answers_409_with_server_named() {
     let env = Env::new().await;
@@ -295,7 +291,11 @@ async fn access_denied_reconnects_once_then_reports() {
         env.connector.remotes(),
         vec![ROOT.to_owned(), ROOT.to_owned()]
     );
-    assert_eq!(env.connector.disconnects(), vec![ROOT.to_owned()]);
+    // Not forced: other reads of the share keep their open files.
+    assert_eq!(
+        env.connector.disconnect_calls(),
+        vec![(ROOT.to_owned(), false)]
+    );
 
     // Without a stored login a refusal is reported at once, with no sign-in.
     let plain = Env::new().await;
@@ -314,7 +314,7 @@ async fn new_login_after_password_change_heals_without_restart() {
 
     // The password changes on the file server: the connection is lost and the stored login
     // is refused from then on.
-    env.state.share_logins().invalidate(ROOT);
+    env.state.share_logins().invalidate(&env.state, ROOT).await;
     env.connector.always(Some(LoginFailure::Refused));
     let db = env.server.records_db();
     db.requeue_source(env.library, None).await.unwrap();
@@ -329,11 +329,10 @@ async fn new_login_after_password_change_heals_without_restart() {
     let last = env.connector.connects().pop().unwrap();
     assert!(last.password.expose() == CHANGED_PASSWORD);
 
-    #[cfg(windows)]
     {
         // From the settings page: the library is woken and syncs again.
         env.connector.always(Some(LoginFailure::Refused));
-        env.state.share_logins().invalidate(ROOT);
+        env.state.share_logins().invalidate(&env.state, ROOT).await;
         db.requeue_source(env.library, None).await.unwrap();
         assert!(env.sync().await.is_err());
         assert_eq!(env.status().await.state, SourceState::NotConnected);
@@ -370,9 +369,13 @@ async fn delete_disconnects_every_remote_of_server() {
         .call(Method::DELETE, "/api/settings/shares/logins/nas", None)
         .await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    let mut gone = env.connector.disconnects();
+    let mut gone = env.connector.disconnect_calls();
     gone.sort();
-    assert_eq!(gone, vec![ROOT.to_owned(), OTHER_ROOT.to_owned()]);
+    // Forced: the login was removed, so nothing may go on reading with it.
+    assert_eq!(
+        gone,
+        vec![(ROOT.to_owned(), true), (OTHER_ROOT.to_owned(), true)]
+    );
 
     // Removing the last root of a server removes its login and disconnects it too.
     let (status, text) = env
@@ -403,12 +406,13 @@ async fn password_reaches_connector_only() {
     assert!(connects[0].password.expose() == PASSWORD);
     assert_eq!(format!("{:?}", connects[0].password), "[hidden]");
 
-    env.state.share_logins().invalidate(ROOT);
+    env.state.share_logins().invalidate(&env.state, ROOT).await;
+    // Refused last: a refused login is not tried again until it changes.
     for failure in [
-        LoginFailure::Refused,
         LoginFailure::Conflict,
         LoginFailure::Unreachable,
         LoginFailure::Other(1),
+        LoginFailure::Refused,
     ] {
         env.connector.always(Some(failure));
         env.server
@@ -435,7 +439,6 @@ async fn password_reaches_connector_only() {
         }
     }
 
-    #[cfg(windows)]
     {
         env.connector.always(Some(LoginFailure::Refused));
         let (_, text) = env
@@ -484,7 +487,6 @@ async fn secret_store_failure_is_a_plain_error_and_a_retry() {
     );
 }
 
-#[cfg(windows)]
 #[tokio::test]
 async fn store_failure_after_good_sign_in_disconnects_the_remote() {
     // The secret store cannot be reached, so the new login cannot be stored after the file
@@ -601,6 +603,184 @@ async fn removed_login_signs_out_at_the_next_read() {
     let mut gone = env.connector.disconnects();
     gone.sort();
     assert_eq!(gone, vec![ROOT.to_owned(), OTHER_ROOT.to_owned()]);
+    assert_eq!(env.connector.connects().len(), 2);
+}
+
+#[tokio::test]
+async fn refused_login_is_not_tried_again_until_it_changes() {
+    let env = Env::new().await;
+    env.seed("nas", "ann", PASSWORD).await;
+    env.connector.always(Some(LoginFailure::Refused));
+    assert_eq!(env.ensure(ROOT).await, Err(LoginFailure::Refused));
+    assert_eq!(env.connector.connects().len(), 1);
+    // Every further read of the server, of any of its shares, and every sync answers refused
+    // without asking the file server: each try could count toward locking the account.
+    for _ in 0..3 {
+        assert_eq!(env.ensure(ROOT).await, Err(LoginFailure::Refused));
+        assert_eq!(env.ensure(OTHER_ROOT).await, Err(LoginFailure::Refused));
+        env.server
+            .records_db()
+            .requeue_source(env.library, None)
+            .await
+            .unwrap();
+        assert!(env.sync().await.is_err());
+    }
+    assert_eq!(env.connector.connects().len(), 1);
+
+    // A new login is tried at once.
+    env.connector.always(None);
+    env.seed("nas", "ann", CHANGED_PASSWORD).await;
+    env.ensure(ROOT).await.unwrap();
+    assert_eq!(env.connector.connects().len(), 2);
+}
+
+#[tokio::test]
+async fn forgetting_a_server_lets_its_refused_login_be_tried_again() {
+    let env = Env::new().await;
+    env.seed("nas", "ann", PASSWORD).await;
+    env.connector.always(Some(LoginFailure::Refused));
+    assert_eq!(env.ensure(ROOT).await, Err(LoginFailure::Refused));
+    assert_eq!(env.ensure(ROOT).await, Err(LoginFailure::Refused));
+    assert_eq!(env.connector.connects().len(), 1);
+    // Signing out of the server (as removing or setting its login does) forgets the refusal.
+    env.state
+        .share_logins()
+        .forget_server(&env.state, "nas")
+        .await;
+    env.connector.always(None);
+    env.ensure(ROOT).await.unwrap();
+    assert_eq!(env.connector.connects().len(), 2);
+}
+
+#[tokio::test]
+async fn slow_sign_out_does_not_hold_up_other_servers() {
+    let env = Env::new().await;
+    env.seed("nas", "ann", PASSWORD).await;
+    env.seed("files", "fay", PASSWORD).await;
+    env.ensure(ROOT).await.unwrap();
+    env.state
+        .shares()
+        .set_operation_timeout(Duration::from_millis(150));
+    // Signing out hangs, as it does when the file server has gone.
+    env.connector.disconnect_delay(Duration::from_secs(2));
+    let started = tokio::time::Instant::now();
+    // The login of nas is replaced: its next read signs out of the old connection first.
+    env.seed("nas", "bob", CHANGED_PASSWORD).await;
+    let state = env.state.clone();
+    let stale = tokio::spawn(async move {
+        state
+            .share_logins()
+            .ensure(&state, &SharePath::parse(ROOT).unwrap())
+            .await
+    });
+    let deadline = started + Duration::from_secs(5);
+    while env.connector.disconnects().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "never signed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Another server's read waits no longer than the bounded sign-out.
+    env.ensure(ELSEWHERE_ROOT).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the other server waited {:?}",
+        started.elapsed()
+    );
+    // The read of nas itself is not held up beyond the bound either.
+    let _ = stale.await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the read of nas waited {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_read_while_a_login_is_set_waits_and_uses_the_new_one() {
+    let env = Env::new().await;
+    env.seed("nas", "ann", PASSWORD).await;
+    env.ensure(ROOT).await.unwrap();
+    // Signing in takes a while, so a read of another share of the server comes in while the
+    // settings page signs in with the new login.
+    env.connector.delay(Duration::from_millis(300));
+    let (put, read) = tokio::join!(
+        env.call(
+            Method::PUT,
+            "/api/settings/shares/logins/nas",
+            Some(json!({"username": "bob", "password": CHANGED_PASSWORD})),
+        ),
+        async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while env.connector.connects().len() < 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the PUT never signed in"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            env.ensure(OTHER_ROOT).await
+        }
+    );
+    // Neither met the other's connection: the read waited, then signed in with the new login.
+    assert_eq!(put.0, StatusCode::OK, "{}", put.1);
+    assert_eq!(read, Ok(()));
+    let connects = env.connector.connects();
+    assert_eq!(connects.len(), 3);
+    assert!(connects[1..].iter().all(|c| c.username == "bob"));
+    assert_eq!(
+        env.connector.live(),
+        vec![ROOT.to_owned(), OTHER_ROOT.to_owned()]
+    );
+}
+/// The node of the share item at `path`, after a sync.
+#[cfg(windows)]
+async fn node_of(env: &Env, path: &str) -> NodeId {
+    env.server
+        .records_db()
+        .source_items(env.library)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.repository_path == path)
+        .unwrap_or_else(|| panic!("no source item at {path}"))
+        .node
+}
+
+/// The share's own paths are Windows paths, so reading one file needs Windows.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_denied_file_under_a_readable_root_keeps_the_connection() {
+    let env = Env::new().await;
+    env.fake.put("second.txt", b"second");
+    env.seed("nas", "ann", PASSWORD).await;
+    env.sync().await.unwrap();
+    assert_eq!(env.connector.connects().len(), 1);
+
+    // One file the account may not read, under a root it may: the connection is not the
+    // fault, so it is kept (other reads of the share go on using it).
+    let node = node_of(&env, "report.txt").await;
+    env.fake.deny(r"\\nas\docs\report.txt");
+    let answer = server::external::materialise(&env.state, node).await;
+    assert!(
+        matches!(answer, Err(server::external::ExternalError::Denied)),
+        "not denied"
+    );
+    assert!(env.connector.disconnects().is_empty());
+    assert_eq!(env.connector.connects().len(), 1);
+
+    // The root refused too: the connection may have gone stale, so it is signed in again once.
+    let node = node_of(&env, "second.txt").await;
+    env.fake.deny(r"\\nas\docs\second.txt");
+    env.fake.deny(ROOT);
+    let answer = server::external::materialise(&env.state, node).await;
+    assert!(
+        matches!(answer, Err(server::external::ExternalError::Denied)),
+        "not denied"
+    );
+    // Not forced: other reads of the share keep their open files.
+    assert_eq!(
+        env.connector.disconnect_calls(),
+        vec![(ROOT.to_owned(), false)]
+    );
     assert_eq!(env.connector.connects().len(), 2);
 }
 

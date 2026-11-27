@@ -24,7 +24,7 @@ use crate::auth::Signed;
 use crate::icap::Client;
 use crate::secrets::Secret;
 use crate::share::canonical_share_path;
-use crate::share_login::{LoginFailure, remote_of};
+use crate::share_login::{LoginFailure, Turn, remote_of};
 use records::{SecretId, SourceState};
 
 /// The longest the test of new scanner settings waits for the scanner.
@@ -250,7 +250,10 @@ pub(crate) async fn change_shares(
         match state.db().share_logins().await {
             Ok(logins) => {
                 let kept: Vec<String> = logins.into_iter().map(|login| login.server).collect();
-                state.share_logins().forget_servers_except(&kept);
+                state
+                    .share_logins()
+                    .forget_servers_except(&state, &kept)
+                    .await;
             }
             Err(e) => eprintln!("sharecraft-server: cannot read the stored share logins: {e}"),
         }
@@ -362,10 +365,12 @@ impl axum::response::IntoResponse for LoginError {
 
 /// What the stored login of `server` must pass before it is stored: this process signs out of
 /// the server, then signs in with the new login to the share of one of its approved roots.
-/// Answers that share (`\\host\share`), which stays signed in to. Not under the
-/// share-connection turn: signing in waits on the network.
+/// Answers that share (`\\host\share`), which stays signed in to. Under the turn of the
+/// share logins (no read signs in meanwhile), not under the share-connection turn: signing in
+/// waits on the network.
 async fn before_storing_login(
     state: &AppState,
+    turn: &Turn<'_>,
     server: &str,
     username: &str,
     password: &str,
@@ -380,13 +385,17 @@ async fn before_storing_login(
         .filter(|root| root.server().as_deref() == Some(server))
         .find_map(remote_of)
         .ok_or(ApiError::NoRootOnServer)?;
-    state.share_logins().forget_server(server);
+    let wait = state.shares().operation_timeout();
+    state
+        .share_logins()
+        .sign_out_of_server(turn, server, wait)
+        .await;
     let answer = crate::share_login::connect(
         state.share_logins().connector(),
         remote.clone(),
         username.to_owned(),
         Secret::new(password),
-        state.shares().operation_timeout(),
+        wait,
     )
     .await;
     match answer {
@@ -433,16 +442,6 @@ async fn wake_server(state: &AppState, server: &str) {
     }
 }
 
-/// The answer for a secret that could not be stored.
-fn secret_failure(error: &crate::secrets::SecretError) -> ApiError {
-    // The error text is a plain sentence that never carries a value.
-    eprintln!("sharecraft-server: a share login could not be stored: {error}");
-    match error {
-        crate::secrets::SecretError::Unavailable(_) => ApiError::SecretStoreUnavailable,
-        _ => ApiError::Unavailable,
-    }
-}
-
 /// `PUT /api/settings/shares/logins/{server}`: stores the one login used for every approved
 /// folder on `server`, for administrators.
 pub(crate) async fn set_share_login(
@@ -463,26 +462,32 @@ pub(crate) async fn set_share_login(
     {
         return Err(ApiError::InvalidRequest.into());
     }
+    if !state.share_logins().supported() {
+        return Err(ApiError::LoginsWindowsOnly.into());
+    }
     if !has_root_on(&state, &server).await? {
         return Err(ApiError::NoRootOnServer.into());
     }
-    if !cfg!(windows) {
-        return Err(ApiError::LoginsWindowsOnly.into());
-    }
-    // Signed in with the new login before anything is stored, and outside the turn.
-    let remote = before_storing_login(&state, &server, &username, &password).await?;
+    let logins = state.share_logins();
+    // Signing out, signing in with the new login and recording it happen in the logins' turn,
+    // so no read signs in with the old login in between (which would make this sign-in
+    // conflict). Signed in before anything is stored, and outside the share-connection turn.
+    let turn = logins.turn().await;
+    let remote = before_storing_login(&state, &turn, &server, &username, &password).await?;
     let stored = store_login(&state, &signed, &server, &username, &password).await;
     let secret = match stored {
         Ok(secret) => secret,
         Err(e) => {
             // The new login was not stored: the connection made with it is not recorded
             // anywhere, so it is undone here or later sign-ins would meet it (error 1219).
-            state.share_logins().forget_server(&server);
-            state.share_logins().connector().disconnect(&remote);
+            let wait = state.shares().operation_timeout();
+            logins.sign_out_of_server(&turn, &server, wait).await;
+            crate::share_login::sign_out(logins.connector(), vec![remote], true, wait).await;
             return Err(e.into());
         }
     };
-    state.share_logins().remember(&remote, secret);
+    logins.remember(&turn, &remote, secret);
+    drop(turn);
     wake_server(&state, &server).await;
     Ok(Json(shares_out(&state).await?))
 }
@@ -523,7 +528,7 @@ async fn store_login(
         .secret_store()
         .put(state.db(), password.as_bytes(), context.as_bytes())
         .await
-        .map_err(|e| secret_failure(&e))?;
+        .map_err(|e| ApiError::secret(&e))?;
     let replaced = match state
         .db()
         .set_share_login(signed.session.user.id, server, username, secret)
@@ -567,7 +572,7 @@ pub(crate) async fn remove_share_login(
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
     drop(turn);
-    state.share_logins().forget_server(&server);
+    state.share_logins().forget_server(&state, &server).await;
     if let Some(secret) = removed {
         state.secret_store().forget(state.db(), secret).await;
     }

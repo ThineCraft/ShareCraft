@@ -28,12 +28,14 @@ pub struct FakeConnector {
 #[derive(Default)]
 struct Inner {
     connects: Mutex<Vec<Connect>>,
-    disconnects: Mutex<Vec<String>>,
+    /// Each disconnect: the remote, and whether open files were to be closed.
+    disconnects: Mutex<Vec<(String, bool)>>,
     script: Mutex<VecDeque<Result<(), LoginFailure>>>,
     always: Mutex<Option<LoginFailure>>,
     /// Each live connection and the user name and password it was made with.
     live: Mutex<HashMap<String, (String, Secret)>>,
     delay: Mutex<Duration>,
+    disconnect_delay: Mutex<Duration>,
 }
 
 fn host_of(remote: &str) -> String {
@@ -69,6 +71,15 @@ impl FakeConnector {
         *self.inner.delay.lock().unwrap_or_else(|e| e.into_inner()) = delay;
     }
 
+    /// Every later disconnect takes `delay` before it returns (a file server gone dead).
+    pub fn disconnect_delay(&self, delay: Duration) {
+        *self
+            .inner
+            .disconnect_delay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = delay;
+    }
+
     pub fn connects(&self) -> Vec<Connect> {
         self.inner
             .connects
@@ -82,7 +93,16 @@ impl FakeConnector {
         self.connects().into_iter().map(|c| c.remote).collect()
     }
 
+    /// The remotes disconnected from, in order.
     pub fn disconnects(&self) -> Vec<String> {
+        self.disconnect_calls()
+            .into_iter()
+            .map(|(remote, _)| remote)
+            .collect()
+    }
+
+    /// Each disconnect: the remote, and whether open files were to be closed (`force`).
+    pub fn disconnect_calls(&self) -> Vec<(String, bool)> {
         self.inner
             .disconnects
             .lock()
@@ -104,11 +124,12 @@ impl FakeConnector {
         live
     }
 
-    /// Sets this fake as the connector of `state`.
+    /// Sets this fake as the connector of `state`, and lets `state` store logins on every
+    /// system (they are faked).
     pub fn install(&self, state: &server::AppState) {
-        state
-            .share_logins()
-            .set_connector_for_tests(Arc::new(self.clone()));
+        let logins = state.share_logins();
+        logins.set_connector_for_tests(Arc::new(self.clone()));
+        logins.set_supported_for_tests(true);
     }
 }
 
@@ -151,12 +172,20 @@ impl ShareConnector for FakeConnector {
         Ok(())
     }
 
-    fn disconnect(&self, remote: &str) {
+    fn disconnect(&self, remote: &str, force: bool) {
         self.inner
             .disconnects
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(remote.to_owned());
+            .push((remote.to_owned(), force));
+        let delay = *self
+            .inner
+            .disconnect_delay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         self.inner
             .live
             .lock()

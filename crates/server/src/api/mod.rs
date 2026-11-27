@@ -616,6 +616,18 @@ impl ApiError {
         ApiError::Unavailable
     }
 
+    /// The answer for a secret that could not be stored or read: `503 secret_store_unavailable`
+    /// when the secret store (the key file or the outside provider) could not be reached, worth
+    /// trying again; `503 unavailable` otherwise. Logs why; the error text is a plain sentence
+    /// that never carries a value.
+    pub(crate) fn secret(error: &crate::secrets::SecretError) -> ApiError {
+        eprintln!("sharecraft-server: a secret could not be stored or read: {error}");
+        match error {
+            crate::secrets::SecretError::Unavailable(_) => ApiError::SecretStoreUnavailable,
+            _ => ApiError::Unavailable,
+        }
+    }
+
     /// The code the answer's `error` names.
     pub(crate) fn code(self) -> &'static str {
         self.status_and_code().1

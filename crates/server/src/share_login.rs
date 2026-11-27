@@ -7,7 +7,9 @@
 //! front ends share one login, and goes nowhere but the operating system's sign-in call.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use records::{SecretId, SharePath};
 
@@ -38,8 +40,11 @@ pub trait ShareConnector: Send + Sync {
     /// # Errors
     /// Why the sign-in failed.
     fn connect(&self, remote: &str, username: &str, password: &Secret) -> Result<(), LoginFailure>;
-    /// Drops this process's connection to `remote`, if any.
-    fn disconnect(&self, remote: &str);
+    /// Drops this process's connection to `remote`, if any. With `force`, files still open
+    /// through it are closed too; without, a connection with open files is left to close when
+    /// they do. It may block (a file server that has gone), so it is called on a blocking
+    /// thread.
+    fn disconnect(&self, remote: &str, force: bool);
 }
 
 /// Maps a Windows network error code to a [`LoginFailure`].
@@ -123,11 +128,12 @@ mod wnet {
             }
         }
 
-        fn disconnect(&self, remote: &str) {
+        fn disconnect(&self, remote: &str, force: bool) {
             let remote = wide(remote);
             // SAFETY: `remote` is a NUL-terminated UTF-16 buffer that lives until the call
-            // returns; the call only reads it. A failure (not connected) needs nothing done.
-            let _ = unsafe { WNetCancelConnection2W(remote.as_ptr(), 0, 1) };
+            // returns; the call only reads it. A failure (not connected, or files still open
+            // without `force`) needs nothing done.
+            let _ = unsafe { WNetCancelConnection2W(remote.as_ptr(), 0, i32::from(force)) };
         }
     }
 }
@@ -145,7 +151,7 @@ impl ShareConnector for NoConnector {
         Err(LoginFailure::Other(0))
     }
 
-    fn disconnect(&self, _remote: &str) {}
+    fn disconnect(&self, _remote: &str, _force: bool) {}
 }
 
 /// The share of `root` as `\\host\share`, lower-cased; `None` for a drive or POSIX path.
@@ -173,8 +179,20 @@ pub struct ShareLogins {
     connector: RwLock<Arc<dyn ShareConnector>>,
     /// Each connected remote and the secret of the login it was made with.
     connected: Mutex<HashMap<String, SecretId>>,
-    /// One sign-in at a time, so two reads of one share do not both sign in.
+    /// Each server (lower-case) whose stored login the file server refused, and the secret of
+    /// that login. While the login is unchanged it is not tried again: every try could count
+    /// toward locking the account.
+    refused: Mutex<HashMap<String, SecretId>>,
+    /// One sign-in or sign-out at a time, so two reads of one share do not both sign in and
+    /// a sign-out never races a sign-in.
     turn: tokio::sync::Mutex<()>,
+    /// Whether stored logins can be used here (Windows only).
+    supported: AtomicBool,
+}
+
+/// Holding [`ShareLogins`]' turn: no other sign-in or sign-out runs meanwhile.
+pub(crate) struct Turn<'a> {
+    _guard: tokio::sync::MutexGuard<'a, ()>,
 }
 
 impl Default for ShareLogins {
@@ -186,7 +204,9 @@ impl Default for ShareLogins {
         Self {
             connector: RwLock::new(connector),
             connected: Mutex::new(HashMap::new()),
+            refused: Mutex::new(HashMap::new()),
             turn: tokio::sync::Mutex::new(()),
+            supported: AtomicBool::new(cfg!(windows)),
         }
     }
 }
@@ -212,47 +232,102 @@ impl ShareLogins {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = connector;
     }
 
+    /// Whether stored logins can be used here: only a server running on Windows signs in to a
+    /// file server.
+    #[must_use]
+    pub fn supported(&self) -> bool {
+        self.supported.load(Ordering::SeqCst)
+    }
+
+    /// Says whether stored logins can be used here. Used by tests, so that the paths of storing
+    /// a login (with a fake connector) run on every system.
+    #[doc(hidden)]
+    pub fn set_supported_for_tests(&self, supported: bool) {
+        self.supported.store(supported, Ordering::SeqCst);
+    }
+
     fn connected(&self) -> std::sync::MutexGuard<'_, HashMap<String, SecretId>> {
         self.connected
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn refused(&self) -> std::sync::MutexGuard<'_, HashMap<String, SecretId>> {
+        self.refused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Waits for the turn: no other sign-in or sign-out runs until it is dropped.
+    pub(crate) async fn turn(&self) -> Turn<'_> {
+        Turn {
+            _guard: self.turn.lock().await,
+        }
+    }
+
+    /// Whether the login whose password is `secret` was refused for `server`, and is still the
+    /// one stored. A refusal of another (older) login is forgotten.
+    fn still_refused(&self, server: &str, secret: SecretId) -> bool {
+        let mut refused = self.refused();
+        match refused.get(server) {
+            Some(held) if *held == secret => true,
+            Some(_) => {
+                refused.remove(server);
+                false
+            }
+            None => false,
+        }
+    }
+
     /// Makes sure this process is signed in to the share of `root` with the current stored
     /// login of its server. A root on a server with no stored login (or not on a file server
-    /// at all) needs nothing.
+    /// at all) needs nothing. A login the file server refused is not tried again until it is
+    /// set again: it answers `Refused` at once.
     ///
     /// # Errors
-    /// Why signing in failed; nothing is remembered then.
+    /// Why signing in failed; nothing is remembered then but a refusal.
     pub async fn ensure(&self, state: &AppState, root: &SharePath) -> Result<(), LoginFailure> {
         let (Some(server), Some(remote)) = (root.server(), remote_of(root)) else {
             return Ok(());
         };
-        let login = state.db().share_login(&server).await.map_err(|e| {
-            eprintln!("sharecraft-server: a stored share login could not be read: {e}");
-            LoginFailure::Other(0)
-        })?;
-        let Some(login) = login else {
+        let wait = state.shares().operation_timeout();
+        // Most reads find the connection made already, without waiting for the turn.
+        match login_of(state, &server).await? {
+            Some(login) => {
+                if self.still_refused(&server, login.password_secret) {
+                    return Err(LoginFailure::Refused);
+                }
+                if self.connected().get(&remote) == Some(&login.password_secret) {
+                    return Ok(());
+                }
+            }
+            None if !self.holds_server(&server) => {
+                self.refused().remove(&server);
+                return Ok(());
+            }
+            None => {}
+        }
+        let turn = self.turn().await;
+        // Read again in the turn: a login set while this read waited (the settings page signs
+        // in with a new login in the turn) is the one used, not the one it replaced.
+        let Some(login) = login_of(state, &server).await? else {
             // The login was removed (perhaps by another front end, or by a removal that raced
             // a sign-in): nothing may go on using it.
-            if self.holds_server(&server) {
-                let _turn = self.turn.lock().await;
-                self.forget_server(&server);
-            }
+            self.sign_out_of_server(&turn, &server, wait).await;
             return Ok(());
         };
-        if self.connected().get(&remote) == Some(&login.password_secret) {
-            return Ok(());
+        let secret = login.password_secret;
+        // Another read may have signed in, or been refused, while this one waited.
+        if self.still_refused(&server, secret) {
+            return Err(LoginFailure::Refused);
         }
-        let _turn = self.turn.lock().await;
-        // Another read may have signed in while this one waited.
-        if self.connected().get(&remote) == Some(&login.password_secret) {
+        if self.connected().get(&remote) == Some(&secret) {
             return Ok(());
         }
         let context = format!("share-login:{server}");
         let password = match state
             .secret_store()
-            .get(state.db(), login.password_secret, context.as_bytes())
+            .get(state.db(), secret, context.as_bytes())
             .await
         {
             Ok(Some(bytes)) => Secret::new(String::from_utf8(bytes).map_err(|_| {
@@ -274,29 +349,39 @@ impl ShareLogins {
         let stale = self
             .connected()
             .iter()
-            .any(|(held, secret)| on_server(held, &server) && *secret != login.password_secret);
+            .any(|(held, held_secret)| on_server(held, &server) && *held_secret != secret);
         if stale {
-            self.forget_server(&server);
+            self.sign_out_of_server(&turn, &server, wait).await;
         }
         let connector = self.connector();
-        connect(
-            connector,
-            remote.clone(),
-            login.username,
-            password,
-            state.shares().operation_timeout(),
-        )
-        .await?;
-        self.connected().insert(remote, login.password_secret);
-        Ok(())
+        let answer = connect(connector, remote.clone(), login.username, password, wait).await;
+        match answer {
+            Ok(()) => {
+                self.connected().insert(remote, secret);
+                Ok(())
+            }
+            Err(LoginFailure::Refused) => {
+                self.refused().insert(server, secret);
+                Err(LoginFailure::Refused)
+            }
+            Err(failure) => Err(failure),
+        }
     }
 
     /// Forgets the connection to `remote` and drops it, so the next [`ShareLogins::ensure`]
-    /// signs in again.
-    pub fn invalidate(&self, remote: &str) {
+    /// signs in again. Files still open through it (other reads of the share) are not closed:
+    /// the connection then goes when they do.
+    pub async fn invalidate(&self, state: &AppState, remote: &str) {
         let remote = remote.to_lowercase();
+        let _turn = self.turn().await;
         self.connected().remove(&remote);
-        self.connector().disconnect(&remote);
+        sign_out(
+            self.connector(),
+            vec![remote],
+            false,
+            state.shares().operation_timeout(),
+        )
+        .await;
     }
 
     /// Whether a connection to a share of `server` is recorded.
@@ -306,8 +391,19 @@ impl ShareLogins {
             .any(|remote| on_server(remote, server))
     }
 
-    /// Drops every connection this process made to a share of `server`.
-    pub fn forget_server(&self, server: &str) {
+    /// Drops every connection this process made to a share of `server`, closing files still
+    /// open through them (its login was replaced or removed), and forgets that its login was
+    /// refused.
+    pub async fn forget_server(&self, state: &AppState, server: &str) {
+        let turn = self.turn().await;
+        self.sign_out_of_server(&turn, server, state.shares().operation_timeout())
+            .await;
+    }
+
+    /// [`ShareLogins::forget_server`], for the holder of the turn. Waits no longer than `wait`
+    /// for the sign-outs.
+    pub(crate) async fn sign_out_of_server(&self, _turn: &Turn<'_>, server: &str, wait: Duration) {
+        self.refused().remove(&server.to_lowercase());
         let remotes: Vec<String> = {
             let mut connected = self.connected();
             let remotes = connected
@@ -318,15 +414,12 @@ impl ShareLogins {
             connected.retain(|remote, _| !on_server(remote, server));
             remotes
         };
-        let connector = self.connector();
-        for remote in remotes {
-            connector.disconnect(&remote);
-        }
+        sign_out(self.connector(), remotes, true, wait).await;
     }
 
     /// Drops the connections to every server not in `keep`.
-    pub(crate) fn forget_servers_except(&self, keep: &[String]) {
-        let servers: Vec<String> = self
+    pub(crate) async fn forget_servers_except(&self, state: &AppState, keep: &[String]) {
+        let mut servers: Vec<String> = self
             .connected()
             .keys()
             .filter_map(|remote| {
@@ -337,14 +430,67 @@ impl ShareLogins {
             })
             .filter(|server| !keep.iter().any(|kept| kept.eq_ignore_ascii_case(server)))
             .collect();
+        servers.sort();
+        servers.dedup();
+        self.refused()
+            .retain(|server, _| keep.iter().any(|kept| kept.eq_ignore_ascii_case(server)));
+        if servers.is_empty() {
+            return;
+        }
+        let turn = self.turn().await;
         for server in servers {
-            self.forget_server(&server);
+            self.sign_out_of_server(&turn, &server, state.shares().operation_timeout())
+                .await;
         }
     }
 
-    /// Records that `remote` was signed in to with the login whose password is `secret`.
-    pub(crate) fn remember(&self, remote: &str, secret: SecretId) {
+    /// Records that `remote` was signed in to with the login whose password is `secret`, for
+    /// the holder of the turn.
+    pub(crate) fn remember(&self, _turn: &Turn<'_>, remote: &str, secret: SecretId) {
         self.connected().insert(remote.to_lowercase(), secret);
+    }
+}
+
+/// The stored login of `server`.
+///
+/// # Errors
+/// `Other(0)` when the database could not be read.
+async fn login_of(
+    state: &AppState,
+    server: &str,
+) -> Result<Option<records::ShareLogin>, LoginFailure> {
+    state.db().share_login(server).await.map_err(|e| {
+        eprintln!("sharecraft-server: a stored share login could not be read: {e}");
+        LoginFailure::Other(0)
+    })
+}
+/// Signs out of each of `remotes` on blocking threads, all at once, and waits for them no
+/// longer than `wait`: a file server that has gone can hold a sign-out for a long time, and
+/// none may hold up the runtime or the turn beyond that. A sign-out still running then is left
+/// to finish on its own.
+pub(crate) async fn sign_out(
+    connector: Arc<dyn ShareConnector>,
+    remotes: Vec<String>,
+    force: bool,
+    wait: Duration,
+) {
+    if remotes.is_empty() {
+        return;
+    }
+    let tasks: Vec<_> = remotes
+        .into_iter()
+        .map(|remote| {
+            let connector = Arc::clone(&connector);
+            tokio::task::spawn_blocking(move || connector.disconnect(&remote, force))
+        })
+        .collect();
+    let all = async {
+        for task in tasks {
+            let _ = task.await;
+        }
+    };
+    if tokio::time::timeout(wait, all).await.is_err() {
+        eprintln!("sharecraft-server: signing out of a file share did not finish in time");
     }
 }
 
@@ -368,7 +514,7 @@ pub(crate) async fn connect(
     remote: String,
     username: String,
     password: Secret,
-    wait: std::time::Duration,
+    wait: Duration,
 ) -> Result<(), LoginFailure> {
     let outcome = Arc::new(Mutex::new(Outcome::default()));
     let seen = Arc::clone(&outcome);
@@ -376,13 +522,16 @@ pub(crate) async fn connect(
     let target = remote.clone();
     let task = tokio::task::spawn_blocking(move || {
         let answer = connector.connect(&remote, &username, &password);
-        let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if answer.is_ok() {
-            if seen.abandoned {
-                connector.disconnect(&remote);
-            } else {
+        let undo_now = {
+            let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if answer.is_ok() && !seen.abandoned {
                 seen.connected = true;
             }
+            answer.is_ok() && seen.abandoned
+        };
+        // Not under the lock: the waiter takes it on the runtime, and a sign-out can block.
+        if undo_now {
+            connector.disconnect(&remote, true);
         }
         answer
     });
@@ -397,9 +546,12 @@ pub(crate) async fn connect(
                 seen.abandoned = true;
                 seen.connected
             };
-            // Finished just as the wait ran out: undone here instead.
+            // Finished just as the wait ran out: undone here instead, on a blocking thread
+            // nobody waits for.
             if connected {
-                undo.disconnect(&target);
+                drop(tokio::task::spawn_blocking(move || {
+                    undo.disconnect(&target, true);
+                }));
             }
             Err(LoginFailure::Unreachable)
         }

@@ -1,7 +1,9 @@
 //! The stored login of a file server: one per server with an approved UNC root.
 //!
 //! A UNC root can only be used on Windows, so a login is stored only there; on other systems
-//! the same request is answered `logins_windows_only` once every other rule has been checked.
+//! the same request is answered `logins_windows_only` once the request itself has been checked.
+//! Signing in is faked, and the fake lets every system store logins, so these tests run
+//! everywhere; `unsupported_system_answers_logins_windows_only` switches that off.
 
 #![allow(
     clippy::unwrap_used,
@@ -201,7 +203,7 @@ async fn answer_never_contains_password() {
     let (status, text) = env
         .put("nas", json!({"username": "ann", "password": PASSWORD}))
         .await;
-    if cfg!(windows) {
+    {
         assert_eq!(status, StatusCode::OK, "{text}");
         let answer: Value = serde_json::from_str(&text).unwrap();
         let logins = answer["logins"].as_array().unwrap();
@@ -210,9 +212,6 @@ async fn answer_never_contains_password() {
         assert_eq!(logins[0]["username"], "ann");
         assert!(logins[0]["set_at"].is_string());
         assert!(logins[0].get("password").is_none());
-    } else {
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
-        assert_eq!(error_of(&text), "logins_windows_only");
     }
     assert!(!text.contains(PASSWORD));
 
@@ -228,7 +227,7 @@ async fn answer_never_contains_password() {
             assert!(!event.detail.to_string().contains(PASSWORD));
         }
     }
-    if cfg!(windows) {
+    {
         let events = db.events_of_kind("share_login_set").await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -277,7 +276,6 @@ async fn removing_a_login_forgets_its_secret() {
     assert_eq!(status, StatusCode::OK);
 }
 
-#[cfg(windows)]
 #[tokio::test]
 async fn replacing_a_login_forgets_the_old_secret() {
     let env = Env::new().await;
@@ -362,5 +360,38 @@ async fn a_root_change_that_keeps_the_server_keeps_its_login() {
     assert_eq!(
         env.server.records_db().share_logins().await.unwrap().len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn unsupported_system_answers_logins_windows_only() {
+    let env = Env::new().await;
+    env.server
+        .app_state()
+        .await
+        .share_logins()
+        .set_supported_for_tests(false);
+    // Answered before the server's roots are looked at: a server with an approved root and
+    // one without get the same answer.
+    for server in ["nas", "elsewhere"] {
+        let (status, text) = env
+            .put(server, json!({"username": "ann", "password": PASSWORD}))
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{server}: {text}");
+        assert_eq!(error_of(&text), "logins_windows_only", "{server}");
+    }
+    // A request that is not valid is still answered as one.
+    let (status, text) = env
+        .put("nas", json!({"username": "", "password": PASSWORD}))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_of(&text), "invalid_request");
+    assert!(
+        env.server
+            .records_db()
+            .share_logins()
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
