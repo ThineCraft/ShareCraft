@@ -5,6 +5,7 @@
 import {
   api,
   confirmDialog,
+  formatDate,
   fillSelect,
   h,
   megabytesText,
@@ -22,6 +23,7 @@ import {
 import { mountAdminShell } from './admin-shell.js';
 import { navigationBody, navigationEditor, placePicker } from './navigation.js';
 import { validSharePath } from './source-panel.js';
+import { LOGIN_HELP, loginErrorText, loginRows, loginServers, removeLoginQuestion, runsAsLoginLine } from './share-logins.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -426,6 +428,7 @@ function showShareSettings(answer) {
   $('shares-roots').hidden = roots.length === 0;
   $('shares-none').hidden = roots.length > 0;
   $('shares-runs-as-name').textContent = answer.runs_as ? `: ${answer.runs_as}` : '';
+  showLogins(answer);
   const used = Number(answer.cache?.bytes);
   $('shares-cache-use').textContent = Number.isFinite(used) ? `The cache holds ${megabytesText(used)} MB now.` : '';
   $('shares-cache').value = megabytesText(answer.cache_max_bytes);
@@ -477,6 +480,90 @@ $('shares-add').addEventListener('submit', async (event) => {
   $('shares-path-error').focus();
 });
 
+// ---- file share logins ----
+
+$('logins-note').textContent = LOGIN_HELP;
+
+/** Shows the stored logins (never a password), the server choice and the runs-as line. */
+function showLogins(answer) {
+  const servers = loginServers(answer.roots);
+  const rows = loginRows(answer.logins, (iso) => formatDate(iso));
+  // Logins are for Windows servers: the line shows whenever a UNC root exists or a login is stored.
+  const windows = servers.length > 0 || rows.length > 0;
+  $('logins-runs-as').hidden = !(windows && answer.runs_as);
+  $('logins-runs-as').textContent = answer.runs_as ? runsAsLoginLine(answer.runs_as) : '';
+  $('logins-rows').replaceChildren(
+    ...rows.map((row) =>
+      h(
+        'tr',
+        {},
+        h('td', {}, row.unc),
+        h('td', {}, row.username),
+        h('td', {}, row.set),
+        h(
+          'td',
+          {},
+          h('button', { type: 'button', class: 'plain', 'data-server': row.server, 'data-action': 'change', 'aria-label': `Change the login for ${row.unc}` }, 'Change'),
+          ' ',
+          h('button', { type: 'button', class: 'plain', 'data-server': row.server, 'data-action': 'remove', 'aria-label': `Remove the login for ${row.unc}` }, 'Remove'),
+        ),
+      ),
+    ),
+  );
+  $('logins-table').hidden = rows.length === 0;
+  $('logins-none').hidden = rows.length > 0;
+  const choice = $('logins-server');
+  const current = servers.includes(choice.value) ? choice.value : (servers[0] ?? '');
+  choice.replaceChildren(...servers.map((server) => h('option', { value: server }, `\\\\${server}`)));
+  choice.value = current;
+  $('logins-form').hidden = servers.length === 0;
+  $('logins-password').value = ''; // a password is never put back
+}
+
+/** Sends a login change and shows the answer; the password field is cleared either way. */
+async function sendLogin(method, server, body, done) {
+  noteIn('logins-msg', '');
+  const result = await api(method, `/settings/shares/logins/${encodeURIComponent(server)}`, body);
+  $('logins-password').value = '';
+  if (!result.ok) {
+    noteIn('logins-msg', loginErrorText(result.error, server) || messageFor(result.error));
+    $('logins-msg').focus();
+    return result;
+  }
+  showShareSettings(result.data);
+  noteIn('logins-msg', done, true);
+  return result;
+}
+
+$('logins-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const server = $('logins-server').value;
+  const username = $('logins-username').value.trim();
+  const password = $('logins-password').value;
+  if (!server || !username || !password) {
+    noteIn('logins-msg', loginErrorText('invalid_request'));
+    return (username ? $('logins-password') : $('logins-username')).focus();
+  }
+  const result = await sendLogin('PUT', server, { username, password }, `Saved the login for \\\\${server}.`);
+  if (result.ok) $('logins-username').value = '';
+});
+
+$('logins-rows').addEventListener('click', async (event) => {
+  const button = event.target.closest('button[data-server]');
+  if (!button || !sharesAnswer) return;
+  const server = button.dataset.server;
+  if (button.dataset.action === 'change') {
+    const login = sharesAnswer.logins?.find((entry) => entry.server === server);
+    $('logins-server').value = server;
+    $('logins-username').value = login?.username ?? '';
+    $('logins-password').value = '';
+    return $('logins-password').focus();
+  }
+  const sure = await confirmDialog(removeLoginQuestion(server, sharesAnswer.runs_as ?? 'the account the server runs under'), 'Remove login');
+  if (!sure) return button.focus();
+  const result = await sendLogin('DELETE', server, undefined, `Removed the login for \\\\${server}.`);
+  if (result.ok) $('logins-msg').focus(); // the button is gone: the confirmation takes the focus
+});
 $('shares-roots').addEventListener('click', async (event) => {
   const button = event.target.closest('button[data-index]');
   if (!button || !sharesAnswer) return;

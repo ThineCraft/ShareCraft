@@ -168,6 +168,41 @@
   <h3 id="shares-roots-heading">Approved folders</h3>
   <ul id="shares-roots" class="list" aria-labelledby="shares-roots-heading"></ul>
   <p id="shares-none" class="meta" hidden>No folder is approved yet. Libraries cannot connect to a file share until one is added.</p>
+  <h3 id="logins-heading">Logins</h3>
+  <p class="meta" id="logins-runs-as" hidden></p>
+  <div class="scroll">
+   <table class="banded" id="logins-table" hidden>
+    <caption class="visually-hidden">Logins for file servers</caption>
+    <thead>
+     <tr>
+      <th scope="col">Server</th>
+      <th scope="col">User name</th>
+      <th scope="col">Set</th>
+      <th scope="col"><span class="visually-hidden">Actions</span></th>
+     </tr>
+    </thead>
+    <tbody id="logins-rows"></tbody>
+   </table>
+  </div>
+  <p id="logins-none" class="meta" hidden>No login is stored yet.</p>
+  <form id="logins-form" class="stack" aria-labelledby="logins-form-heading" autocomplete="off">
+   <h4 id="logins-form-heading">Set a login</h4>
+   <div class="field">
+    <label for="logins-server">Server</label>
+    <select id="logins-server" aria-describedby="logins-note"></select>
+   </div>
+   <div class="field">
+    <label for="logins-username">User name</label>
+    <input type="text" id="logins-username" autocomplete="off" spellcheck="false" maxlength="256">
+   </div>
+   <div class="field">
+    <label for="logins-password">Password</label>
+    <input type="password" id="logins-password" autocomplete="new-password" maxlength="256" aria-describedby="logins-note">
+    <small id="logins-note" class="meta"></small>
+   </div>
+   <div><button type="submit" id="logins-save">Save</button></div>
+  </form>
+  <p id="logins-msg" role="alert" class="msg" tabindex="-1"></p>
   <form id="shares-add" class="stack" aria-labelledby="shares-add-heading">
    <h3 id="shares-add-heading">Approve a folder</h3>
    <div class="field">
