@@ -126,6 +126,10 @@ pub(crate) fn router() -> Router<AppState> {
             "/settings/shares",
             get(settings::shares).put(settings::change_shares),
         )
+        .route(
+            "/settings/shares/logins/{server}",
+            put(settings::set_share_login).delete(settings::remove_share_login),
+        )
         .route("/settings/s3", get(settings::s3).put(settings::change_s3))
         .route("/s3/endpoints", get(settings::s3_names))
         .route(
@@ -412,6 +416,14 @@ pub(crate) enum ApiError {
     InvalidSharePath(&'static str),
     /// 422: a safe path is outside every administrator-approved root.
     ShareNotApproved,
+    /// 422: a stored login is for a server none of whose folders is approved.
+    NoRootOnServer,
+    /// 422: stored logins are used only by a server running on Windows.
+    LoginsWindowsOnly,
+    /// 503: the secret store (the key file or the outside provider) could not be used.
+    SecretStoreUnavailable,
+    /// 422: the secret store answers but no longer holds a stored value; it must be entered again.
+    SecretLost,
     /// 422: the approved folder cannot be listed.
     ShareUnreachable(&'static str),
     /// 422: the S3 endpoint named is not one an administrator approved (or a built-in
@@ -606,6 +618,19 @@ impl ApiError {
         ApiError::Unavailable
     }
 
+    /// The answer for a secret that could not be stored or read: `503 secret_store_unavailable`
+    /// when the secret store (the key file or the outside provider) could not be reached, worth
+    /// trying again; `503 unavailable` otherwise. Logs why; the error text is a plain sentence
+    /// that never carries a value.
+    pub(crate) fn secret(error: &crate::secrets::SecretError) -> ApiError {
+        eprintln!("sharecraft-server: a secret could not be stored or read: {error}");
+        match error {
+            crate::secrets::SecretError::Unavailable(_) => ApiError::SecretStoreUnavailable,
+            crate::secrets::SecretError::Lost => ApiError::SecretLost,
+            _ => ApiError::Unavailable,
+        }
+    }
+
     /// The code the answer's `error` names.
     pub(crate) fn code(self) -> &'static str {
         self.status_and_code().1
@@ -643,6 +668,14 @@ impl ApiError {
                 (StatusCode::UNPROCESSABLE_ENTITY, "invalid_share_path")
             }
             ApiError::ShareNotApproved => (StatusCode::UNPROCESSABLE_ENTITY, "share_not_approved"),
+            ApiError::NoRootOnServer => (StatusCode::UNPROCESSABLE_ENTITY, "no_root_on_server"),
+            ApiError::LoginsWindowsOnly => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "logins_windows_only")
+            }
+            ApiError::SecretStoreUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "secret_store_unavailable")
+            }
+            ApiError::SecretLost => (StatusCode::UNPROCESSABLE_ENTITY, "secret_lost"),
             ApiError::ShareUnreachable(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "share_unreachable")
             }
@@ -1069,6 +1102,22 @@ impl IntoResponse for ApiError {
                 "error": code,
                 "message": "The repository holds more than this server mirrors for one library.",
             }),
+            ApiError::NoRootOnServer => json!({
+                "error": code,
+                "message": "No approved folder is on that file server. Approve one first.",
+            }),
+            ApiError::LoginsWindowsOnly => json!({
+                "error": code,
+                "message": "Stored logins are used only when ShareCraft runs on Windows.",
+            }),
+            ApiError::SecretStoreUnavailable => json!({
+                "error": code,
+                "message": "The secret store could not be reached.",
+            }),
+            ApiError::SecretLost => json!({
+                "error": code,
+                "message": crate::secrets::SecretError::Lost.to_string(),
+            }),
             _ => json!({ "error": code }),
         };
         (status, Json(body)).into_response()
@@ -1329,6 +1378,7 @@ mod tests {
             github_api: crate::config::DEFAULT_GITHUB_API.to_owned(),
             source_create_batch_size: crate::config::DEFAULT_SOURCE_CREATE_BATCH_SIZE,
             s3_plain_loopback: false,
+            secret_provider: None,
         };
         let store = RevisionStore::open(&crate::library_path(dir)).unwrap();
         let blobs = revisions::BlobStore::open(&crate::blobs_path(dir)).unwrap();

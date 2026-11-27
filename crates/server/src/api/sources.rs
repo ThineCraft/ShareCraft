@@ -18,10 +18,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
 use records::{
-    AccessError, Budget, LibraryKind, NewEvent, NewSource, Perms, S3Endpoint, S3Place, SealedRow,
-    SecretId, SharePath, SourceChange, SourceConfig, SourceKind, SourceMode, SourceStatus, Tri,
-    Usage, User, Versioning, WriteState, approved_root, clean_prefix, s3_location, usable_here,
-    valid_bucket, valid_root,
+    AccessError, Budget, LibraryKind, NewEvent, NewSource, Perms, S3Endpoint, S3Place, SecretId,
+    SharePath, SourceChange, SourceConfig, SourceKind, SourceMode, SourceStatus, Tri, Usage, User,
+    Versioning, WriteState, approved_root, clean_prefix, s3_location, usable_here, valid_bucket,
+    valid_root,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -37,9 +37,11 @@ use crate::libraries;
 use crate::s3::{S3Error, S3Target};
 use crate::s3_sign::Credentials;
 use crate::s3_write;
-use crate::secrets::Secret;
+use crate::secrets::{Secret, SecretError};
 use crate::share::{FileIdentity, FsBudget, canonical_share_path};
-use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
+use crate::source_sync::{
+    SyncError, abandon_uploads_into, caps, token_context, token_of, webhook_context,
+};
 use crate::source_write::{self, Probe};
 use crate::tree::{self, TreeOp};
 
@@ -206,26 +208,16 @@ async fn store_secret(
     plain: &[u8],
     context: &[u8],
 ) -> Result<SecretId, ApiError> {
-    let sealed = state.secrets().seal(plain, context).map_err(|e| {
-        eprintln!("sharecraft-server: a secret could not be sealed: {e}");
-        ApiError::Unavailable
-    })?;
     state
-        .db()
-        .put_secret(&SealedRow {
-            key_id: sealed.key_id,
-            nonce: sealed.nonce,
-            ciphertext: sealed.ciphertext,
-        })
+        .secret_store()
+        .put(state.db(), plain, context)
         .await
-        .map_err(|e| ApiError::unavailable(&e))
+        .map_err(|e| ApiError::secret(&e))
 }
 
 /// Deletes the secret `id`; a failure is logged (the row holds only ciphertext).
 async fn forget_secret(state: &AppState, id: SecretId) {
-    if let Err(e) = state.db().delete_secret(id).await {
-        eprintln!("sharecraft-server: a sealed secret could not be deleted: {e}");
-    }
+    state.secret_store().forget(state.db(), id).await;
 }
 
 /// The origin pages are served from, for the webhook's address (see `links::create`).
@@ -1051,9 +1043,19 @@ pub(crate) async fn change(
         let current = if new_token {
             None
         } else {
+            // `token_of` answers `Failed` only when the secret store could not be reached
+            // (worth trying again), and `NotConnected` when the token cannot be opened.
             token_of(&state, &config)
                 .await
-                .map_err(|_| ApiError::TokenRejected)?
+                .map_err(|error| match error {
+                    SyncError::Failed(_) => ApiError::SecretStoreUnavailable,
+                    SyncError::NotConnected(sentence)
+                        if sentence == SecretError::Lost.to_string() =>
+                    {
+                        ApiError::SecretLost
+                    }
+                    _ => ApiError::TokenRejected,
+                })?
         };
         let probing = token.as_ref().or(current.as_ref());
         probe(

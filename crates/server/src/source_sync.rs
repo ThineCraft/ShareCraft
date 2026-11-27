@@ -58,7 +58,7 @@ use crate::blobs::Held;
 use crate::file_room::SaveReply;
 use crate::github::{GithubError, Head, RepoRef, TarLimits, for_each_in_tarball, git_blob_id};
 use crate::s3_source::S3Source;
-use crate::secrets::{Sealed, Secret};
+use crate::secrets::{Secret, SecretError};
 use crate::share::ShareSource;
 use crate::source::{ContentMode, EntryKind, Listing, Look, SourceCaps, StorageSource, TreeEntry};
 use crate::tree::{self, TreeOp, unique_node_name};
@@ -1181,7 +1181,12 @@ pub fn start_worker(state: AppState) -> Worker {
     let task = tokio::spawn(async move {
         let mut running = JoinSet::new();
         let mut evicted: Option<tokio::time::Instant> = None;
+        let mut swept: Option<tokio::time::Instant> = None;
+        // The sweep runs on its own task (owned here, so dropping the worker stops it): a
+        // provider that hangs must not hold up the syncs. A tick is skipped while one runs.
+        let mut sweeping = JoinSet::new();
         loop {
+            while sweeping.try_join_next().is_some() {}
             while let Some(finished) = running.try_join_next() {
                 if let Err(e) = finished {
                     eprintln!("sharecraft-server: a sync did not finish: {e}");
@@ -1192,6 +1197,17 @@ pub fn start_worker(state: AppState) -> Worker {
             if evicted.is_none_or(|at| at.elapsed() >= POLL.saturating_sub(AGAIN_SOON)) {
                 crate::external::evict(&state).await;
                 evicted = Some(tokio::time::Instant::now());
+            }
+            // Secrets forgotten while their values live at the secret provider are deleted
+            // there, and a delete that failed is tried again.
+            if sweeping.is_empty()
+                && swept.is_none_or(|at| at.elapsed() >= POLL.saturating_sub(AGAIN_SOON))
+            {
+                let state = state.clone();
+                sweeping.spawn(async move {
+                    state.secret_store().sweep_forgotten(state.db()).await;
+                });
+                swept = Some(tokio::time::Instant::now());
             }
             let wait = if state.sources().has_pending() {
                 AGAIN_SOON
@@ -2052,21 +2068,19 @@ pub(crate) async fn token_of(
             "The stored token could not be opened; set the token again.".to_owned(),
         )
     };
-    let row = state
-        .db()
-        .get_secret(id)
+    let plain = match state
+        .secret_store()
+        .get(state.db(), id, &token_context(config.library))
         .await
-        .map_err(db_failed)?
-        .ok_or_else(gone)?;
-    let sealed = Sealed {
-        key_id: row.key_id,
-        nonce: row.nonce,
-        ciphertext: row.ciphertext,
+    {
+        Ok(Some(plain)) => plain,
+        Ok(None) => return Err(gone()),
+        // Worth trying again later: the sync is not marked disconnected.
+        Err(SecretError::Unavailable(sentence)) => return Err(failed(&sentence)),
+        // The provider lost the value: the library says so, and the token is entered again.
+        Err(lost @ SecretError::Lost) => return Err(SyncError::NotConnected(lost.to_string())),
+        Err(_) => return Err(gone()),
     };
-    let plain = state
-        .secrets()
-        .unseal(&sealed, &token_context(config.library))
-        .map_err(|_| gone())?;
     String::from_utf8(plain)
         .map(|text| Some(Secret::new(text)))
         .map_err(|_| gone())

@@ -25,7 +25,7 @@ use common::{
 use fake_icap::{Behaviour, FakeIcap, eicar};
 use records::{
     ANYONE_LINKS, Budget, NewSource, Principal, S3_ENDPOINTS, S3Place, SCANNER_URL, ScanState,
-    SealedRow, SourceKind, SourceMode, Tri, Versioning, s3_location,
+    SourceKind, SourceMode, Tri, Versioning, s3_location,
 };
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_RANGE, RANGE};
@@ -143,16 +143,9 @@ impl Env {
             .set_retry_wait_for_tests(Duration::from_millis(5));
         set_endpoints(&server, endpoint_at(&fake.origin())).await;
         let db = server.records_db();
-        let sealed = state
-            .secrets()
-            .seal(SECRET.as_bytes(), &token_context(library))
-            .unwrap();
-        let token = db
-            .put_secret(&SealedRow {
-                key_id: sealed.key_id,
-                nonce: sealed.nonce,
-                ciphertext: sealed.ciphertext,
-            })
+        let token = state
+            .secret_store()
+            .put(&db, SECRET.as_bytes(), &token_context(library))
             .await
             .unwrap();
         let place = S3Place {

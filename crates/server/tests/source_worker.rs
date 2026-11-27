@@ -23,7 +23,7 @@ use common::{
     TIMEOUT, TestServer, TestUser, spawn_server_config, spawn_server_config_without_workers,
     start_fake_github,
 };
-use records::{SealedRow, SourceChange, SourceState, SourceStatus};
+use records::{SourceChange, SourceState, SourceStatus};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -1418,16 +1418,9 @@ async fn webhook_works_through_the_trusted_proxy_in_production_mode() {
     .await
     .unwrap();
     let secret = "a3f1".repeat(16);
-    let sealed = state
-        .secrets()
-        .seal(secret.as_bytes(), &webhook_context(library))
-        .unwrap();
-    let id = db
-        .put_secret(&SealedRow {
-            key_id: sealed.key_id,
-            nonce: sealed.nonce,
-            ciphertext: sealed.ciphertext,
-        })
+    let id = state
+        .secret_store()
+        .put(&db, secret.as_bytes(), &webhook_context(library))
         .await
         .unwrap();
     db.change_source(

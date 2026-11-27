@@ -48,9 +48,17 @@ struct Env {
 
 impl Env {
     async fn new() -> Env {
+        Env::with(|_| {}).await
+    }
+
+    async fn with(change: impl FnOnce(&mut server::Config)) -> Env {
         let fake = start_fake_github(OWNER, REPO).await;
         let origin = fake.origin();
-        let server = spawn_server_config(|c| c.github_api = origin).await;
+        let server = spawn_server_config(|c| {
+            c.github_api = origin;
+            change(c);
+        })
+        .await;
         let admin = server.admin("Ada Admin").await;
         let library = common::Site::library(&server).await;
         let site = server
@@ -1656,4 +1664,63 @@ async fn a_taken_name_costs_no_github_request() {
     assert_eq!(status, StatusCode::CONFLICT, "{answer}");
     assert_eq!(answer["error"], "name_taken");
     assert_eq!(env.fake.count("repo"), 0);
+}
+
+/// An outside secret store that cannot be reached is answered as `503 secret_store_unavailable`
+/// (worth trying again), not as a generic failure or a rejected token.
+#[tokio::test]
+async fn secret_store_outage_is_answered_as_one() {
+    // Nothing listens on the discard port of the loopback address.
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = dir.path().join("provider.token");
+    std::fs::write(&token_file, "provider-bearer-token\n").unwrap();
+    let settings = server::secret_provider::SecretProviderSettings::from_values(
+        Some("http://127.0.0.1:9"),
+        Some(token_file.to_str().unwrap()),
+    )
+    .unwrap()
+    .expect("settings");
+    let env = Env::with(move |c| c.secret_provider = Some(settings)).await;
+    env.fake.commit("main", &files(&[("main.md", "m")]));
+    env.fake.commit("next", &files(&[("next.md", "n")]));
+
+    // Connecting with a token that cannot be stored.
+    let (status, answer) = env
+        .connect(
+            &env.admin,
+            json!({ "name": "Docs", "repository": format!("{OWNER}/{REPO}"), "token": TOKEN }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert_eq!(answer["error"], "secret_store_unavailable");
+
+    // Changing a library whose stored token cannot be read.
+    let library = common::Site::library(&env.server).await;
+    let db = env.server.records_db();
+    let token = db.put_external_secret().await.unwrap();
+    db.connect_source(&NewSource {
+        library,
+        kind: SourceKind::Github,
+        owner: OWNER.to_owned(),
+        repo: REPO.to_owned(),
+        branch: "main".to_owned(),
+        folder: String::new(),
+        location: None,
+        mode: SourceMode::ReadOnly,
+        token: Some(token),
+        poll_seconds: 60,
+        connected_by: env.admin.id,
+    })
+    .await
+    .unwrap();
+    let (status, answer) = env
+        .call(
+            &env.admin,
+            Method::PATCH,
+            &format!("/api/libraries/{}/source", library.0),
+            Some(json!({ "branch": "next" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert_eq!(answer["error"], "secret_store_unavailable");
 }

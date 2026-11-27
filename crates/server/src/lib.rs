@@ -1,4 +1,5 @@
-#![forbid(unsafe_code)]
+// Denied, not forbidden: only share_login's Windows sign-in module allows unsafe code.
+#![deny(unsafe_code)]
 //! The ShareCraft session server: one room per open document, reached over WebSocket, and a
 //! JSON API for signing in.
 //!
@@ -38,8 +39,11 @@ pub mod s3_source;
 pub mod s3_write;
 pub mod s3_xml;
 mod scan;
+pub mod secret_provider;
+pub mod secret_store;
 pub mod secrets;
 pub mod share;
+pub mod share_login;
 pub mod sites;
 pub mod source;
 pub mod source_sync;
@@ -144,12 +148,14 @@ struct Shared {
     /// Take-backs of refused tree changes that could not be written to Git yet; written before
     /// the reconcile that brings the tree back in step.
     tree_undos: std::sync::Mutex<Vec<tree::PendingUndo>>,
-    /// Seals and opens the secrets connected libraries use.
-    secrets: Arc<secrets::SecretBox>,
+    /// Where the secrets connected libraries use are put, read and forgotten.
+    secret_store: Arc<secret_store::SecretStore>,
     /// The client for the configured GitHub API address.
     github: Arc<github::GithubClient>,
     /// File-share reads and their operating-system seam.
     shares: Arc<share::Shares>,
+    /// The connections made with stored file-server logins.
+    share_logins: Arc<share_login::ShareLogins>,
     /// The S3 client: clients per endpoint and the usage meter.
     s3: Arc<s3::S3>,
     /// The sync worker's wakes, turns and back-off.
@@ -179,6 +185,12 @@ impl AppState {
         let github = github::GithubClient::new(&config.github_api)
             .map_err(|e| std::io::Error::other(format!("cannot set up the GitHub client: {e}")))?;
         let s3 = s3::S3::new(config.s3_plain_loopback);
+        let mut secret_store = secret_store::SecretStore::local(secrets);
+        if let Some(settings) = &config.secret_provider {
+            let provider =
+                secret_provider::SecretProvider::new(settings).map_err(std::io::Error::other)?;
+            secret_store = secret_store.with_provider(provider);
+        }
         Ok(Self {
             shared: Arc::new(Shared {
                 config,
@@ -201,9 +213,10 @@ impl AppState {
                 tree_lock: tokio::sync::Mutex::new(()),
                 tree_out_of_step: AtomicBool::new(false),
                 tree_undos: std::sync::Mutex::new(Vec::new()),
-                secrets: Arc::new(secrets),
+                secret_store: Arc::new(secret_store),
                 github: Arc::new(github),
                 shares: Arc::new(share::Shares::default()),
+                share_logins: Arc::new(share_login::ShareLogins::default()),
                 s3: Arc::new(s3),
                 sources: source_sync::Sources::default(),
                 writes: source_write::SourceWrites::default(),
@@ -225,10 +238,10 @@ impl AppState {
         &self.shared.writes
     }
 
-    /// Seals and opens the secrets of connected libraries.
+    /// Where the secrets of connected libraries are put, read and forgotten.
     #[must_use]
-    pub fn secrets(&self) -> &secrets::SecretBox {
-        &self.shared.secrets
+    pub fn secret_store(&self) -> &secret_store::SecretStore {
+        &self.shared.secret_store
     }
 
     /// The client for the configured GitHub API address.
@@ -241,6 +254,12 @@ impl AppState {
     #[must_use]
     pub fn shares(&self) -> &share::Shares {
         &self.shared.shares
+    }
+
+    /// The connections made with stored file-server logins.
+    #[must_use]
+    pub fn share_logins(&self) -> &share_login::ShareLogins {
+        &self.shared.share_logins
     }
 
     /// The S3 client: clients per endpoint and the usage meter.

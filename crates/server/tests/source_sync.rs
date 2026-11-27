@@ -20,8 +20,7 @@ use collab_core::ids::{DocId, NodeId};
 use common::fake_github::{AUTHOR_NAME, FakeGithub};
 use common::{FileClient, TIMEOUT, TestServer, TestUser, spawn_server_config, start_fake_github};
 use records::{
-    LinkKind, NewSource, NodeKind, Principal, SealedRow, SourceKind, SourceMode, SourceState,
-    SourceStatus,
+    LinkKind, NewSource, NodeKind, Principal, SourceKind, SourceMode, SourceState, SourceStatus,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -62,16 +61,13 @@ impl Env {
         let token = match token {
             Some(token) => {
                 fake.require_token(token);
-                let sealed = state
-                    .secrets()
-                    .seal(token.as_bytes(), &token_context(library))
-                    .unwrap();
-                let row = SealedRow {
-                    key_id: sealed.key_id,
-                    nonce: sealed.nonce,
-                    ciphertext: sealed.ciphertext,
-                };
-                Some(db.put_secret(&row).await.unwrap())
+                Some(
+                    state
+                        .secret_store()
+                        .put(&db, token.as_bytes(), &token_context(library))
+                        .await
+                        .unwrap(),
+                )
             }
             None => None,
         };

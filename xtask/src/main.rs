@@ -11,6 +11,9 @@
 //! - `editors <list|build|compress|verify>` builds an editor from its fork and installs it into
 //!   `editors/<id>`, with Brotli and gzip copies of its files; `compress` adds the copies to an
 //!   editor already installed;
+//! - `fake-secret-provider --port <n> --token-file <path>` serves the outside secret provider
+//!   contract from memory on 127.0.0.1 only, for development: the token file is made, with a
+//!   random token, when it does not exist;
 //! - `fake-icap [--port 1344] [--preview 1024|none] [--slow] [--fail]` runs a small ICAP
 //!   server for development: content holding the EICAR test string is infected, anything else
 //!   clean;
@@ -21,6 +24,7 @@ mod editors;
 // Also included by the server's tests, which use the parts the command does not.
 #[allow(dead_code)]
 mod fake_icap;
+mod fake_secret_provider;
 mod package;
 mod tls_proxy;
 
@@ -53,10 +57,13 @@ fn main() -> ExitCode {
         Some("scale") => scale(),
         Some("editors") => editors::dispatch(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("fake-icap") => fake_icap::run(&std::env::args().skip(2).collect::<Vec<_>>()),
+        Some("fake-secret-provider") => {
+            fake_secret_provider::run(&std::env::args().skip(2).collect::<Vec<_>>())
+        }
         Some("package") => package::run_package(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("tls-proxy") => tls_proxy::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => Err(
-            "usage: cargo xtask <web|check|licences|wasm|pages|test|scale|editors|fake-icap|package|tls-proxy>"
+            "usage: cargo xtask <web|check|licences|wasm|pages|test|scale|editors|fake-icap|fake-secret-provider|package|tls-proxy>"
                 .to_owned(),
         ),
     };

@@ -37,7 +37,7 @@ use common::fake_share::FakeShare;
 use common::{FileClient, TestServer, TestUser, spawn_server_config, start_fake_github};
 use protocol::{FileServerMsg, SeatState};
 use records::{
-    NewPendingWrite, NewSource, NodeKind, Principal, S3_ENDPOINTS, S3Place, SHARE_ROOTS, SealedRow,
+    NewPendingWrite, NewSource, NodeKind, Principal, S3_ENDPOINTS, S3Place, SHARE_ROOTS,
     SourceKind, SourceMode, Tri, Versioning, s3_location,
 };
 use reqwest::header::CONTENT_RANGE;
@@ -346,6 +346,14 @@ const ROUTES: &[(&str, Decision)] = &[
     ),
     ("GET /api/settings/shares", Read),
     ("PUT /api/settings/shares", Allowed("organisation settings")),
+    (
+        "PUT /api/settings/shares/logins/{server}",
+        Allowed("organisation settings"),
+    ),
+    (
+        "DELETE /api/settings/shares/logins/{server}",
+        Allowed("organisation settings"),
+    ),
     ("GET /api/settings/s3", Read),
     ("GET /api/s3/endpoints", Read),
     ("PUT /api/settings/s3", Allowed("organisation settings")),
@@ -571,7 +579,7 @@ fn matching(body: &str, open: usize) -> usize {
     panic!("unbalanced parentheses in the router source")
 }
 
-/// The HTTP methods a route's method router names (`get(…).post(…)`), in order.
+/// The HTTP methods a route's method router names (`get(Ã¢â‚¬Â¦).post(Ã¢â‚¬Â¦)`), in order.
 fn methods(text: &str) -> Vec<&'static str> {
     let mut found = Vec::new();
     for (word, method) in [
@@ -650,7 +658,7 @@ fn a_route_list_guard() {
         unclassified.is_empty() && gone.is_empty(),
         "routes not classified in ROUTES: {unclassified:?}; recorded but not registered: {gone:?}"
     );
-    assert_eq!(routes.len(), 163, "the number of registered routes changed");
+    assert_eq!(routes.len(), 165, "the number of registered routes changed");
     let mut mounts_sorted = mounts.clone();
     mounts_sorted.sort();
     let mut expected: Vec<String> = MOUNTS.iter().map(|m| (*m).to_owned()).collect();
@@ -1311,17 +1319,10 @@ impl Env {
         .execute(db.test_pool())
         .await
         .unwrap();
-        let sealed = self
+        let token = self
             .state
-            .secrets()
-            .seal(S3_SECRET.as_bytes(), &token_context(library))
-            .unwrap();
-        let token = db
-            .put_secret(&SealedRow {
-                key_id: sealed.key_id,
-                nonce: sealed.nonce,
-                ciphertext: sealed.ciphertext,
-            })
+            .secret_store()
+            .put(&db, S3_SECRET.as_bytes(), &token_context(library))
             .await
             .unwrap();
         let place = S3Place {

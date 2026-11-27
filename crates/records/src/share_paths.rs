@@ -5,9 +5,14 @@
 
 use std::path::PathBuf;
 
-use serde_json::Value;
+use collab_core::ids::UserId;
+use serde_json::{Value, json};
+use sqlx::PgConnection;
+use time::OffsetDateTime;
+use uuid::Uuid;
 
-use crate::sources::{DEFAULT_SOURCE_MAX_FILES, SOURCE_MAX_FILES};
+use crate::events::{NewEvent, record};
+use crate::sources::{DEFAULT_SOURCE_MAX_FILES, SOURCE_MAX_FILES, SecretId};
 use crate::{Db, DbError};
 
 /// Why a path cannot be used as a file-share path.
@@ -124,6 +129,15 @@ impl SharePath {
                 result.push_str(&folders.join("/"));
                 result
             }
+        }
+    }
+
+    /// The file server of a UNC path, lower-cased; None for a drive or POSIX path.
+    #[must_use]
+    pub fn server(&self) -> Option<String> {
+        match &self.0 {
+            PathKind::Unc { server, .. } => Some(server.to_lowercase()),
+            PathKind::Drive { .. } | PathKind::Posix { .. } => None,
         }
     }
 
@@ -370,6 +384,182 @@ impl Db {
             }
         }
         Ok(settings)
+    }
+}
+
+/// The stored login of one file server. The password is in the secret store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShareLogin {
+    /// The lower-case host name.
+    pub server: String,
+    pub username: String,
+    pub password_secret: SecretId,
+    pub set_at: OffsetDateTime,
+}
+
+type LoginRow = (String, String, Uuid, OffsetDateTime);
+
+fn login_of((server, username, secret, set_at): LoginRow) -> ShareLogin {
+    ShareLogin {
+        server,
+        username,
+        password_secret: SecretId(secret),
+        set_at,
+    }
+}
+
+/// The servers of the UNC roots in a stored `share_roots` value, lower-cased.
+pub(crate) fn servers_of_roots(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|text| SharePath::parse(text).ok())
+        .filter_map(|path| path.server())
+        .collect()
+}
+
+/// Removes the login of `server`, recording `share_login_removed` when there was one; the
+/// secret it named, which the caller forgets once the change has committed.
+pub(crate) async fn remove_login(
+    conn: &mut PgConnection,
+    actor: Option<UserId>,
+    server: &str,
+) -> Result<Option<SecretId>, sqlx::Error> {
+    let removed: Option<(String, Uuid)> = sqlx::query_as(
+        "delete from share_logins where server = $1 returning username, password_secret",
+    )
+    .bind(server)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((username, secret)) = removed else {
+        return Ok(None);
+    };
+    record(
+        conn,
+        login_event("share_login_removed", actor, server, &username),
+    )
+    .await?;
+    Ok(Some(SecretId(secret)))
+}
+
+/// Removes the login of each server in `except`'s complement: every server not in `kept`.
+/// The secrets they named, for the caller to forget once the change has committed.
+pub(crate) async fn remove_logins_except(
+    conn: &mut PgConnection,
+    actor: UserId,
+    kept: &[String],
+) -> Result<Vec<SecretId>, sqlx::Error> {
+    let gone: Vec<String> = sqlx::query_scalar(
+        "select server from share_logins where server <> all($1) order by server",
+    )
+    .bind(kept)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut secrets = Vec::new();
+    for server in gone {
+        if let Some(secret) = remove_login(conn, Some(actor), &server).await? {
+            secrets.push(secret);
+        }
+    }
+    Ok(secrets)
+}
+
+fn login_event(
+    kind: &'static str,
+    actor: Option<UserId>,
+    server: &str,
+    username: &str,
+) -> NewEvent {
+    NewEvent {
+        kind,
+        actor,
+        subject: None,
+        document: None,
+        node: None,
+        detail: json!({ "server": server, "username": username }),
+    }
+}
+
+impl Db {
+    /// Every stored share login, by server.
+    pub async fn share_logins(&self) -> Result<Vec<ShareLogin>, DbError> {
+        let rows: Vec<LoginRow> = sqlx::query_as(
+            "select server, username, password_secret, set_at from share_logins order by server",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(login_of).collect())
+    }
+
+    /// The stored login of `server` (lower case), if any.
+    pub async fn share_login(&self, server: &str) -> Result<Option<ShareLogin>, DbError> {
+        let row: Option<LoginRow> = sqlx::query_as(
+            "select server, username, password_secret, set_at from share_logins \
+             where server = $1",
+        )
+        .bind(server)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(login_of))
+    }
+
+    /// Stores the login of `server` (lower case), replacing any; the secret it replaced, for
+    /// the caller to forget. Records `share_login_set` with the server and user name only.
+    pub async fn set_share_login(
+        &self,
+        by: UserId,
+        server: &str,
+        username: &str,
+        secret: SecretId,
+    ) -> Result<Option<SecretId>, DbError> {
+        let mut tx = self.pool().begin().await?;
+        let old: Option<Uuid> = sqlx::query_scalar(
+            "select password_secret from share_logins where server = $1 for update",
+        )
+        .bind(server)
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            "insert into share_logins (server, username, password_secret, set_by, set_at) \
+             values ($1, $2, $3, $4, now()) on conflict (server) do update set \
+             username = excluded.username, password_secret = excluded.password_secret, \
+             set_by = excluded.set_by, set_at = excluded.set_at",
+        )
+        .bind(server)
+        .bind(username)
+        .bind(secret.0)
+        .bind(by.0)
+        .execute(&mut *tx)
+        .await?;
+        record(
+            &mut tx,
+            login_event("share_login_set", Some(by), server, username),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(old.map(SecretId))
+    }
+
+    /// Removes the login of `server`; the secret it named, for the caller to forget.
+    pub async fn remove_share_login(&self, server: &str) -> Result<Option<SecretId>, DbError> {
+        let mut tx = self.pool().begin().await?;
+        let secret = remove_login(&mut tx, None, server).await?;
+        tx.commit().await?;
+        Ok(secret)
+    }
+
+    /// As [`Db::remove_share_login`], recording `by` as who removed it.
+    pub async fn remove_share_login_as(
+        &self,
+        by: UserId,
+        server: &str,
+    ) -> Result<Option<SecretId>, DbError> {
+        let mut tx = self.pool().begin().await?;
+        let secret = remove_login(&mut tx, Some(by), server).await?;
+        tx.commit().await?;
+        Ok(secret)
     }
 }
 

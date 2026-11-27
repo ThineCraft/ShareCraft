@@ -8,6 +8,7 @@ use std::time::Duration;
 use records::Editor;
 
 use crate::deployment::Deployment;
+use crate::secret_provider::SecretProviderSettings;
 
 /// Address used when `SHARECRAFT_ADDR` is not set.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8787";
@@ -94,6 +95,9 @@ pub struct Config {
     /// Lets an S3 endpoint be plain `http://127.0.0.1:<port>`. False unless a test sets it;
     /// no environment variable reads it.
     pub s3_plain_loopback: bool,
+    /// The outside secret provider, when `SHARECRAFT_SECRET_PROVIDER` and
+    /// `SHARECRAFT_SECRET_PROVIDER_TOKEN_FILE` set one up; secrets are sealed here when `None`.
+    pub secret_provider: Option<SecretProviderSettings>,
 }
 
 /// A database URL. It usually holds a password, so `Debug` never shows it.
@@ -183,6 +187,9 @@ pub enum ConfigError {
          yet: {0}. Leave SHARECRAFT_LIVE_EDITORS unset in production mode"
     )]
     LiveNotReadyForProduction(&'static str),
+    /// The secret provider settings cannot be used; the sentence says why.
+    #[error("{0}")]
+    SecretProvider(String),
 }
 
 /// Work editing together still needs before production mode may switch it on, in plain words.
@@ -283,6 +290,8 @@ impl Config {
         )?;
         config.github_api = github_api;
         config.live_editors = live_editors;
+        config.secret_provider =
+            SecretProviderSettings::from_env().map_err(ConfigError::SecretProvider)?;
         Ok(config)
     }
 
@@ -367,6 +376,7 @@ impl Config {
             github_api: DEFAULT_GITHUB_API.to_owned(),
             source_create_batch_size: DEFAULT_SOURCE_CREATE_BATCH_SIZE,
             s3_plain_loopback: false,
+            secret_provider: None,
         })
     }
 }

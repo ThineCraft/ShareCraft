@@ -903,10 +903,19 @@ pub(crate) async fn purge_site_rows(
         .flat_map(|(token, webhook)| [token, webhook])
         .flatten()
         .collect();
-    sqlx::query("delete from secrets where id = any($1)")
+    // Sealed rows go with the site. A value an outside provider keeps is only marked: the
+    // sweep deletes it at the provider, and then its row.
+    sqlx::query("delete from secrets where id = any($1) and provider = 'local'")
         .bind(&sealed)
         .execute(&mut *conn)
         .await?;
+    sqlx::query(
+        "update secrets set forgotten_at = now() \
+         where id = any($1) and provider = 'external' and forgotten_at is null",
+    )
+    .bind(&sealed)
+    .execute(&mut *conn)
+    .await?;
     sqlx::query("delete from upload_sessions where site_id = $1")
         .bind(site.0)
         .execute(&mut *conn)

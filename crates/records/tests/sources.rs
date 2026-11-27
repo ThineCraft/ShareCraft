@@ -940,10 +940,13 @@ async fn populated_schema_migrates_from_live_log_to_github_sources() {
         Some("blob-one")
     );
     assert_eq!(row.get::<i64, _>("size"), 7);
-    assert_eq!(
-        test.db.get_secret(token).await.unwrap(),
-        Some(sealed(b"migration cipher"))
-    );
+    // Read as the schema of this version holds it: the provider column arrives in 0029.
+    let cipher: Vec<u8> = sqlx::query_scalar("select ciphertext from secrets where id = $1")
+        .bind(token.0)
+        .fetch_one(test.db.test_pool())
+        .await
+        .unwrap();
+    assert_eq!(cipher, sealed(b"migration cipher").ciphertext);
 
     // The file-share columns arrive in 0022 (after G4's 0020 and 0021).
     test.db.migrate_to(22).await.unwrap();

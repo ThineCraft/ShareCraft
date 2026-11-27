@@ -37,6 +37,7 @@ use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
+pub mod fake_connector;
 pub mod fake_github;
 pub mod fake_s3;
 pub mod fake_share;
@@ -555,6 +556,7 @@ pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
         github_api: server::config::DEFAULT_GITHUB_API.to_owned(),
         source_create_batch_size: server::config::DEFAULT_SOURCE_CREATE_BATCH_SIZE,
         s3_plain_loopback: true,
+        secret_provider: None,
     }
 }
 

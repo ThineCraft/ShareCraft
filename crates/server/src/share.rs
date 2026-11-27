@@ -619,18 +619,26 @@ impl StorageSource for ShareSource {
             at_once: 4,
             max_depth: 100,
         };
+        signed_in(state, &root).await?;
         let progress = state.shares().begin_listing(config.library);
         let library = config.library;
         let stopped = || state.sources().is_stopping(library);
-        let listed = list_share_progress(
-            state.shares().fs(),
-            approved,
-            &root,
-            &limits,
-            Some(progress.counter()),
-            Some(&stopped),
-        )
-        .await;
+        let list = || {
+            list_share_progress(
+                state.shares().fs(),
+                approved,
+                &root,
+                &limits,
+                Some(progress.counter()),
+                Some(&stopped),
+            )
+        };
+        let mut listed = list().await;
+        // A refusal with a stored login may be a connection gone stale (the server restarted,
+        // the session timed out): sign in again once, then list once more, then report.
+        if matches!(listed, Err(ListError::Denied)) && signed_in_again(state, &root).await? {
+            listed = list().await;
+        }
         drop(progress);
         let mut listed = listed.map_err(|error| listing_failed(error, &settings))?;
 
@@ -729,6 +737,56 @@ impl StorageSource for ShareSource {
         _needed: &HashMap<String, u64>,
     ) -> Result<HashMap<String, Held>, SyncError> {
         Ok(HashMap::new())
+    }
+}
+
+/// Signs in to the share of `root` with its server's stored login, if it has one.
+///
+/// # Errors
+/// The library's plain error: a refused login stops it until an administrator sets the login
+/// again (so a wrong password is not tried over and over); anything else is tried again later.
+pub(crate) async fn signed_in(state: &AppState, root: &SharePath) -> Result<(), SyncError> {
+    state
+        .share_logins()
+        .ensure(state, root)
+        .await
+        .map_err(|failure| login_failed(failure, root))
+}
+
+/// After a refusal: when the server of `root` has a stored login, drops the connection to its
+/// share and signs in again, answering `true` (read once more). `false` when there is no
+/// stored login, so the refusal stands.
+///
+/// # Errors
+/// As [`signed_in`].
+pub(crate) async fn signed_in_again(state: &AppState, root: &SharePath) -> Result<bool, SyncError> {
+    let (Some(server), Some(remote)) = (root.server(), crate::share_login::remote_of(root)) else {
+        return Ok(false);
+    };
+    let has_login = state
+        .db()
+        .share_login(&server)
+        .await
+        .map_err(database_failed)?
+        .is_some();
+    if !has_login {
+        return Ok(false);
+    }
+    state.share_logins().invalidate(state, &remote).await;
+    signed_in(state, root).await?;
+    Ok(true)
+}
+
+fn login_failed(failure: crate::share_login::LoginFailure, root: &SharePath) -> SyncError {
+    use crate::share_login::LoginFailure;
+    let server = root.server().unwrap_or_default();
+    let message = crate::share_login::failure_sentence(failure, &server);
+    match failure {
+        LoginFailure::Refused | LoginFailure::SecretLost => SyncError::NotConnected(message),
+        LoginFailure::Conflict
+        | LoginFailure::Unreachable
+        | LoginFailure::SecretStoreUnavailable
+        | LoginFailure::Other(_) => SyncError::Failed(message),
     }
 }
 

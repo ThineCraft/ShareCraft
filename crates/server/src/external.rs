@@ -223,9 +223,29 @@ async fn materialise_share(
         return cached_while_offline(state, &item).await.map(Some);
     }
 
+    // Signed in first with the server's stored login, if it has one, for the stat and the open.
+    let location = SharePath::parse(&item.location).map_err(|_| ExternalError::NotApproved)?;
+    if let Err(failure) = state.share_logins().ensure(state, &location).await {
+        return login_refusal(state, &item, failure).await;
+    }
     let fs = state.shares().fs();
-    let first = match timed_stat(Arc::clone(&fs), root_path.clone(), file_path.clone(), None).await
+    let mut first = timed_stat(Arc::clone(&fs), root_path.clone(), file_path.clone(), None).await;
+    // A refusal with a stored login may be a stale connection, but only when the share's root
+    // is refused too: one file the account may not read says nothing about the connection,
+    // which other reads of the share go on using. Then sign in again once, stat once more,
+    // then report.
+    if matches!(first, Err(FsError::Denied))
+        && matches!(
+            timed_stat(Arc::clone(&fs), root_path.clone(), root_path.clone(), None).await,
+            Err(FsError::Denied)
+        )
+        && crate::share::signed_in_again(state, &location)
+            .await
+            .unwrap_or(false)
     {
+        first = timed_stat(Arc::clone(&fs), root_path.clone(), file_path.clone(), None).await;
+    }
+    let first = match first {
         Ok(stat) => stat,
         Err(FsError::Offline) => {
             state.shares().mark_offline(item.library, OFFLINE_FOR);
@@ -1158,6 +1178,27 @@ async fn stat_refusal(
             cached_while_offline(state, item).await.map(Some)
         }
         FsError::Failed => Err(ExternalError::Failed),
+    }
+}
+
+/// The answer when signing in to the share of `item` failed. Nothing about the file is
+/// remembered: the login, not the file, is at fault.
+async fn login_refusal(
+    state: &AppState,
+    item: &ExternalItem,
+    failure: crate::share_login::LoginFailure,
+) -> Result<Option<Ready>, ExternalError> {
+    use crate::share_login::LoginFailure;
+    match failure {
+        LoginFailure::Refused => Err(ExternalError::Denied),
+        LoginFailure::Unreachable => {
+            state.shares().mark_offline(item.library, OFFLINE_FOR);
+            cached_while_offline(state, item).await.map(Some)
+        }
+        LoginFailure::Conflict
+        | LoginFailure::SecretStoreUnavailable
+        | LoginFailure::SecretLost
+        | LoginFailure::Other(_) => Err(ExternalError::Failed),
     }
 }
 

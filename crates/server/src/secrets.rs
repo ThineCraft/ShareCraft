@@ -47,6 +47,13 @@ pub enum SecretError {
     /// The stored value is malformed.
     #[error("the stored secret is malformed")]
     Corrupt,
+    /// The place the secret lives could not be used. A plain sentence, never a value.
+    #[error("{0}")]
+    Unavailable(String),
+    /// The provider answers, but no longer holds the value a row says it keeps. Retrying cannot
+    /// help: the value has to be entered again.
+    #[error("The secret store no longer holds this value. Enter it again.")]
+    Lost,
 }
 
 /// A secret string. `Debug` and `Display` never show it.
