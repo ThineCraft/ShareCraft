@@ -27,7 +27,7 @@ use base64::engine::general_purpose::STANDARD;
 use common::{TestServer, spawn_server_config_without_workers};
 use hmac::{Hmac, KeyInit, Mac};
 use records::test_support::TestDb;
-use records::{NewSource, SecretId, SourceChange, SourceKind, SourceMode};
+use records::{NewSource, SecretId, SourceChange, SourceKind, SourceMode, SourceState};
 use reqwest::Method;
 use server::secret_provider::{SecretProvider, SecretProviderSettings, provider_name};
 use server::secret_store::SecretStore;
@@ -739,4 +739,55 @@ async fn no_value_in_debug_or_errors() {
         );
     }
     assert!(shown[1].contains("[hidden]"));
+}
+
+#[tokio::test]
+async fn provider_down_during_a_sync_is_a_retrying_failure_and_deletes_nothing() {
+    let fake = FakeProvider::start().await;
+    let settings = fake.settings();
+    let server = spawn_server_config_without_workers(|c| c.secret_provider = Some(settings)).await;
+    let admin = server.admin("Ada Admin").await;
+    let library = common::Site::library(&server).await;
+    let state = server.app_state().await;
+    let db = server.records_db();
+    let token = state
+        .secret_store()
+        .put(&db, b"ghp_token_at_the_provider", b"ctx")
+        .await
+        .unwrap();
+    connect(&db, library, admin.id, Some(token), None).await;
+
+    fake.set_down(true);
+    let result =
+        server::source_sync::sync_once(&state, library, time::OffsetDateTime::now_utc()).await;
+    let sentence = "The secret store could not be reached.";
+    assert_eq!(
+        result.unwrap_err(),
+        server::source_sync::SyncError::Failed(sentence.to_owned())
+    );
+    let (config, status) = db.source_of(library).await.unwrap().unwrap();
+    assert_eq!(status.state, SourceState::Failed, "{status:?}");
+    assert_eq!(status.last_error.as_deref(), Some(sentence));
+    // Still connected, with its token, and nothing was deleted or marked.
+    assert_eq!(config.token, Some(token));
+    assert!(db.forgotten_secrets(10).await.unwrap().is_empty());
+    assert_eq!(fake.names(), vec![provider_name(token)]);
+    assert_eq!(fake.requests("DELETE"), 0);
+    assert!(db.source_items(library).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sweep_stops_at_the_first_failed_delete() {
+    let fake = FakeProvider::start().await;
+    let db = TestDb::create().await;
+    let (store, _dir) = front_end(Some(fake.provider()));
+    for _ in 0..3 {
+        let id = store.put(&db.db, VALUE, b"ctx").await.unwrap();
+        store.forget(&db.db, id).await;
+    }
+    fake.set_delete_down(true);
+    assert_eq!(store.sweep_forgotten(&db.db).await, 0);
+    assert_eq!(fake.requests("DELETE"), 1, "one failure ends the sweep");
+    fake.set_delete_down(false);
+    assert_eq!(store.sweep_forgotten(&db.db).await, 3);
 }

@@ -227,16 +227,26 @@ impl SecretStore {
             }
             return 0;
         };
+        let waiting = forgotten.len();
         let mut deleted = 0;
+        let mut row_failures = 0usize;
         for id in forgotten {
             self.drop_cached(id);
+            // The provider is down or hanging: the rest would fail too, each after the full
+            // timeout. They stay marked for the next sweep.
             if provider.delete(&provider_name(id)).await.is_err() {
-                continue;
+                break;
             }
             match db.delete_secret(id).await {
                 Ok(()) => deleted += 1,
-                Err(e) => eprintln!("sharecraft-server: a secret row could not be removed: {e}"),
+                Err(_) => row_failures += 1,
             }
+        }
+        if deleted + row_failures < waiting {
+            eprintln!(
+                "sharecraft-server: {deleted} of {waiting} forgotten secret(s) were deleted at \
+                 the provider; the rest are tried again at the next sweep"
+            );
         }
         deleted
     }

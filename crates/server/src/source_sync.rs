@@ -1182,7 +1182,11 @@ pub fn start_worker(state: AppState) -> Worker {
         let mut running = JoinSet::new();
         let mut evicted: Option<tokio::time::Instant> = None;
         let mut swept: Option<tokio::time::Instant> = None;
+        // The sweep runs on its own task (owned here, so dropping the worker stops it): a
+        // provider that hangs must not hold up the syncs. A tick is skipped while one runs.
+        let mut sweeping = JoinSet::new();
         loop {
+            while sweeping.try_join_next().is_some() {}
             while let Some(finished) = running.try_join_next() {
                 if let Err(e) = finished {
                     eprintln!("sharecraft-server: a sync did not finish: {e}");
@@ -1196,8 +1200,13 @@ pub fn start_worker(state: AppState) -> Worker {
             }
             // Secrets forgotten while their values live at the secret provider are deleted
             // there, and a delete that failed is tried again.
-            if swept.is_none_or(|at| at.elapsed() >= POLL.saturating_sub(AGAIN_SOON)) {
-                state.secret_store().sweep_forgotten(state.db()).await;
+            if sweeping.is_empty()
+                && swept.is_none_or(|at| at.elapsed() >= POLL.saturating_sub(AGAIN_SOON))
+            {
+                let state = state.clone();
+                sweeping.spawn(async move {
+                    state.secret_store().sweep_forgotten(state.db()).await;
+                });
                 swept = Some(tokio::time::Instant::now());
             }
             let wait = if state.sources().has_pending() {
