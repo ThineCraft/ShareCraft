@@ -516,6 +516,23 @@ export function moveAcrossLibrariesText() {
   return 'Items in a library stored in S3 cannot be moved between libraries yet. Copy them instead, or choose a folder in this library.';
 }
 
+/**
+ * The revision an editor's bytes are read at. A file on a share has no stored version, so its
+ * session announces none: the revision the file's own details give (the share's tag) is used.
+ * A normal document that was never saved stays null and starts empty.
+ */
+export function contentRevision(sessionRevision, doc) {
+  if (sessionRevision) return sessionRevision;
+  return doc?.external && doc.revision ? doc.revision : null;
+}
+
+/** The sentence for a refusal that only connecting a file-share folder gives, or '' for any other code. */
+export function shareConnectErrorText(code) {
+  return code === 'share_location_in_use'
+    ? 'Another library already shows this folder, or a folder inside or around it.'
+    : '';
+}
+
 /** The sentence for an error code of writing to a bucket, or '' for any other code. */
 export function sourceWriteErrorText(code, data) {
   const message = serverMessage(data);

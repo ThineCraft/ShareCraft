@@ -48,6 +48,7 @@ import {
   FETCHING_TEXT,
   SHARE_RETRIES,
   SHARE_RETRY_MS,
+  contentRevision,
   discardQuestion,
   fetchingFromShare,
   mayResolve,
@@ -847,7 +848,7 @@ function onJoined(message) {
   updateStatus({ type: 'online' });
   if (first) {
     takeSeat(message.seat);
-    knownRevision = revision;
+    knownRevision = contentRevision(revision, doc);
     showDownload();
     render();
     loadEditor();

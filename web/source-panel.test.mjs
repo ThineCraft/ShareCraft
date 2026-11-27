@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
+  contentRevision,
+  shareConnectErrorText,
   sourceAccess,
   sourceControlsEnabled,
   relativeTime,
@@ -629,4 +631,19 @@ test('mayResolve is true only when the server said the person may Retry or Disca
   assert.equal(mayResolve({ saving: 'failed' }), false);
   assert.equal(mayResolve({ saving: 'failed', may_resolve: 'true' }), false);
   assert.equal(mayResolve(null), false);
+});
+
+test('contentRevision uses the share tag only for an external file with no session revision', () => {
+  const external = { external: { modified_at: 1 }, revision: 'tag-1' };
+  assert.equal(contentRevision(null, external), 'tag-1');
+  assert.equal(contentRevision(undefined, external), 'tag-1');
+  assert.equal(contentRevision(null, { revision: 'r9' }), null);
+  assert.equal(contentRevision(null, { external: { modified_at: 1 }, revision: null }), null);
+  assert.equal(contentRevision('sess', external), 'sess');
+  assert.equal(contentRevision('sess', { revision: 'r9' }), 'sess');
+});
+
+test('shareConnectErrorText words the folder-in-use refusal and leaves other codes empty', () => {
+  assert.match(shareConnectErrorText('share_location_in_use'), /Another library already shows this folder/);
+  assert.equal(shareConnectErrorText('name_taken'), '');
 });

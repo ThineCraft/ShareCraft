@@ -35,6 +35,7 @@ import { checklistModel, readWelcome, showChecklist, unsetParts, unsetText, writ
 import { settle, settleAll } from './skeleton.js';
 import {
   overwriteNote,
+  shareConnectErrorText,
   sourceWriteErrorText,
   validBucket,
   validPrefix,
@@ -492,7 +493,7 @@ function shareErrorText(result) {
       : 'This kind of library cannot be read from a file share. Choose a document or image library.';
   }
   if (typeof result.data?.message === 'string') return result.data.message;
-  return messageFor(result.error);
+  return shareConnectErrorText(result.error) || messageFor(result.error);
 }
 
 /** Makes a library that shows a folder of a file share (read-only in this release). */
