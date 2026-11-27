@@ -25,7 +25,7 @@ use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::secrets::Sealed;
+use crate::secrets::SecretError;
 use crate::source_sync::webhook_context;
 
 /// The largest delivery taken: 5 MiB (GitHub caps its payloads at 25 MiB, but a push of a
@@ -104,28 +104,25 @@ async fn handle(state: &AppState, id: &str, headers: &HeaderMap, body: &Bytes) -
     else {
         return bare(StatusCode::UNAUTHORIZED);
     };
-    let row = match state.db().get_secret(secret_id).await {
-        Ok(Some(row)) => row,
+    let key = match state
+        .secret_store()
+        .get(state.db(), secret_id, &webhook_context(library))
+        .await
+    {
+        Ok(Some(key)) => key,
         // Removed meanwhile: as if none were set.
         Ok(None) => return bare(StatusCode::NOT_FOUND),
-        Err(e) => {
-            eprintln!("sharecraft-server: database failure: {e}");
-            return bare(StatusCode::SERVICE_UNAVAILABLE);
-        }
-    };
-    let sealed = Sealed {
-        key_id: row.key_id,
-        nonce: row.nonce,
-        ciphertext: row.ciphertext,
-    };
-    let verified = {
-        let Ok(key) = state.secrets().unseal(&sealed, &webhook_context(library)) else {
+        // The store could not be used: GitHub should deliver again.
+        Err(SecretError::Unavailable(_)) => return bare(StatusCode::SERVICE_UNAVAILABLE),
+        Err(_) => {
             eprintln!(
                 "sharecraft-server: the webhook secret of library {} could not be opened",
                 library.0
             );
             return bare(StatusCode::NOT_FOUND);
-        };
+        }
+    };
+    let verified = {
         let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&key) else {
             return bare(StatusCode::NOT_FOUND);
         };

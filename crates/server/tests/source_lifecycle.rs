@@ -22,7 +22,7 @@ use collab_core::ids::NodeId;
 use common::fake_github::FakeGithub;
 use common::{TestServer, TestUser, spawn_server_config, start_fake_github};
 use fake_icap::{Behaviour, FakeIcap, eicar};
-use records::{NewSource, SealedRow, SecretId, SourceChange, SourceKind, SourceMode, SourceState};
+use records::{NewSource, SecretId, SourceChange, SourceKind, SourceMode, SourceState};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
@@ -112,30 +112,16 @@ impl Env {
         env.library = NodeId(body["id"].as_str().unwrap().parse().unwrap());
 
         let db = env.server.records_db();
-        let sealed = env
+        env.token = env
             .state
-            .secrets()
-            .seal(TOKEN.as_bytes(), &token_context(env.library))
-            .unwrap();
-        env.token = db
-            .put_secret(&SealedRow {
-                key_id: sealed.key_id,
-                nonce: sealed.nonce,
-                ciphertext: sealed.ciphertext,
-            })
+            .secret_store()
+            .put(&db, TOKEN.as_bytes(), &token_context(env.library))
             .await
             .unwrap();
-        let sealed = env
+        env.webhook = env
             .state
-            .secrets()
-            .seal(b"webhook secret", b"webhook")
-            .unwrap();
-        env.webhook = db
-            .put_secret(&SealedRow {
-                key_id: sealed.key_id,
-                nonce: sealed.nonce,
-                ciphertext: sealed.ciphertext,
-            })
+            .secret_store()
+            .put(&db, b"webhook secret", b"webhook")
             .await
             .unwrap();
         db.connect_source(&NewSource {

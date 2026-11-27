@@ -18,10 +18,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
 use records::{
-    AccessError, Budget, LibraryKind, NewEvent, NewSource, Perms, S3Endpoint, S3Place, SealedRow,
-    SecretId, SharePath, SourceChange, SourceConfig, SourceKind, SourceMode, SourceStatus, Tri,
-    Usage, User, Versioning, WriteState, approved_root, clean_prefix, s3_location, usable_here,
-    valid_bucket, valid_root,
+    AccessError, Budget, LibraryKind, NewEvent, NewSource, Perms, S3Endpoint, S3Place, SecretId,
+    SharePath, SourceChange, SourceConfig, SourceKind, SourceMode, SourceStatus, Tri, Usage, User,
+    Versioning, WriteState, approved_root, clean_prefix, s3_location, usable_here, valid_bucket,
+    valid_root,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -206,26 +206,19 @@ async fn store_secret(
     plain: &[u8],
     context: &[u8],
 ) -> Result<SecretId, ApiError> {
-    let sealed = state.secrets().seal(plain, context).map_err(|e| {
-        eprintln!("sharecraft-server: a secret could not be sealed: {e}");
-        ApiError::Unavailable
-    })?;
     state
-        .db()
-        .put_secret(&SealedRow {
-            key_id: sealed.key_id,
-            nonce: sealed.nonce,
-            ciphertext: sealed.ciphertext,
-        })
+        .secret_store()
+        .put(state.db(), plain, context)
         .await
-        .map_err(|e| ApiError::unavailable(&e))
+        .map_err(|e| {
+            eprintln!("sharecraft-server: a secret could not be stored: {e}");
+            ApiError::Unavailable
+        })
 }
 
 /// Deletes the secret `id`; a failure is logged (the row holds only ciphertext).
 async fn forget_secret(state: &AppState, id: SecretId) {
-    if let Err(e) = state.db().delete_secret(id).await {
-        eprintln!("sharecraft-server: a sealed secret could not be deleted: {e}");
-    }
+    state.secret_store().forget(state.db(), id).await;
 }
 
 /// The origin pages are served from, for the webhook's address (see `links::create`).

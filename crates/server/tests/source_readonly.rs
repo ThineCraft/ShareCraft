@@ -37,7 +37,7 @@ use common::fake_share::FakeShare;
 use common::{FileClient, TestServer, TestUser, spawn_server_config, start_fake_github};
 use protocol::{FileServerMsg, SeatState};
 use records::{
-    NewPendingWrite, NewSource, NodeKind, Principal, S3_ENDPOINTS, S3Place, SHARE_ROOTS, SealedRow,
+    NewPendingWrite, NewSource, NodeKind, Principal, S3_ENDPOINTS, S3Place, SHARE_ROOTS,
     SourceKind, SourceMode, Tri, Versioning, s3_location,
 };
 use reqwest::header::CONTENT_RANGE;
@@ -1311,17 +1311,10 @@ impl Env {
         .execute(db.test_pool())
         .await
         .unwrap();
-        let sealed = self
+        let token = self
             .state
-            .secrets()
-            .seal(S3_SECRET.as_bytes(), &token_context(library))
-            .unwrap();
-        let token = db
-            .put_secret(&SealedRow {
-                key_id: sealed.key_id,
-                nonce: sealed.nonce,
-                ciphertext: sealed.ciphertext,
-            })
+            .secret_store()
+            .put(&db, S3_SECRET.as_bytes(), &token_context(library))
             .await
             .unwrap();
         let place = S3Place {

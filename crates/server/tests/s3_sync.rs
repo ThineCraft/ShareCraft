@@ -17,7 +17,7 @@ use common::fake_s3::{FakeS3, Opts};
 use common::fake_share::FakeShare;
 use common::{TestServer, TestUser, spawn_server_config_without_workers, start_fake_github};
 use records::{
-    Budget, NewSource, S3_ENDPOINTS, S3Place, SHARE_ROOTS, SOURCE_MAX_FILES, SealedRow, SourceKind,
+    Budget, NewSource, S3_ENDPOINTS, S3Place, SHARE_ROOTS, SOURCE_MAX_FILES, SourceKind,
     SourceMode, SourceState, SourceStatus, Tri, Unavailable, Versioning, object_tag, s3_location,
 };
 use reqwest::{Method, StatusCode};
@@ -91,16 +91,9 @@ impl Env {
             .set_retry_wait_for_tests(Duration::from_millis(5));
         approve(&server, &fake).await;
         let db = server.records_db();
-        let sealed = state
-            .secrets()
-            .seal(SECRET.as_bytes(), &token_context(library))
-            .unwrap();
-        let token = db
-            .put_secret(&SealedRow {
-                key_id: sealed.key_id,
-                nonce: sealed.nonce,
-                ciphertext: sealed.ciphertext,
-            })
+        let token = state
+            .secret_store()
+            .put(&db, SECRET.as_bytes(), &token_context(library))
             .await
             .unwrap();
         let place = S3Place {

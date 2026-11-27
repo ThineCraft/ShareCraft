@@ -58,7 +58,7 @@ use crate::blobs::Held;
 use crate::file_room::SaveReply;
 use crate::github::{GithubError, Head, RepoRef, TarLimits, for_each_in_tarball, git_blob_id};
 use crate::s3_source::S3Source;
-use crate::secrets::{Sealed, Secret};
+use crate::secrets::{Secret, SecretError};
 use crate::share::ShareSource;
 use crate::source::{ContentMode, EntryKind, Listing, Look, SourceCaps, StorageSource, TreeEntry};
 use crate::tree::{self, TreeOp, unique_node_name};
@@ -2052,21 +2052,17 @@ pub(crate) async fn token_of(
             "The stored token could not be opened; set the token again.".to_owned(),
         )
     };
-    let row = state
-        .db()
-        .get_secret(id)
+    let plain = match state
+        .secret_store()
+        .get(state.db(), id, &token_context(config.library))
         .await
-        .map_err(db_failed)?
-        .ok_or_else(gone)?;
-    let sealed = Sealed {
-        key_id: row.key_id,
-        nonce: row.nonce,
-        ciphertext: row.ciphertext,
+    {
+        Ok(Some(plain)) => plain,
+        Ok(None) => return Err(gone()),
+        // Worth trying again later: the sync is not marked disconnected.
+        Err(SecretError::Unavailable(sentence)) => return Err(failed(&sentence)),
+        Err(_) => return Err(gone()),
     };
-    let plain = state
-        .secrets()
-        .unseal(&sealed, &token_context(config.library))
-        .map_err(|_| gone())?;
     String::from_utf8(plain)
         .map(|text| Some(Secret::new(text)))
         .map_err(|_| gone())

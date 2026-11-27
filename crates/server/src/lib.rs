@@ -38,6 +38,7 @@ pub mod s3_source;
 pub mod s3_write;
 pub mod s3_xml;
 mod scan;
+pub mod secret_store;
 pub mod secrets;
 pub mod share;
 pub mod sites;
@@ -144,8 +145,8 @@ struct Shared {
     /// Take-backs of refused tree changes that could not be written to Git yet; written before
     /// the reconcile that brings the tree back in step.
     tree_undos: std::sync::Mutex<Vec<tree::PendingUndo>>,
-    /// Seals and opens the secrets connected libraries use.
-    secrets: Arc<secrets::SecretBox>,
+    /// Where the secrets connected libraries use are put, read and forgotten.
+    secret_store: Arc<secret_store::SecretStore>,
     /// The client for the configured GitHub API address.
     github: Arc<github::GithubClient>,
     /// File-share reads and their operating-system seam.
@@ -201,7 +202,7 @@ impl AppState {
                 tree_lock: tokio::sync::Mutex::new(()),
                 tree_out_of_step: AtomicBool::new(false),
                 tree_undos: std::sync::Mutex::new(Vec::new()),
-                secrets: Arc::new(secrets),
+                secret_store: Arc::new(secret_store::SecretStore::local(secrets)),
                 github: Arc::new(github),
                 shares: Arc::new(share::Shares::default()),
                 s3: Arc::new(s3),
@@ -225,10 +226,10 @@ impl AppState {
         &self.shared.writes
     }
 
-    /// Seals and opens the secrets of connected libraries.
+    /// Where the secrets of connected libraries are put, read and forgotten.
     #[must_use]
-    pub fn secrets(&self) -> &secrets::SecretBox {
-        &self.shared.secrets
+    pub fn secret_store(&self) -> &secret_store::SecretStore {
+        &self.shared.secret_store
     }
 
     /// The client for the configured GitHub API address.

@@ -21,7 +21,6 @@ use records::{Principal, S3_ENDPOINTS, SourceKind, SourceState};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
-use server::secrets::Sealed;
 use server::source_sync::{sync_once, token_context};
 use time::OffsetDateTime;
 
@@ -712,22 +711,18 @@ async fn the_secret_is_stored_only_as_ciphertext() {
             .windows(SECRET.len())
             .any(|window| window == SECRET.as_bytes())
     );
-    let sealed = Sealed {
-        key_id: row.key_id,
-        nonce: row.nonce,
-        ciphertext: row.ciphertext,
-    };
-    let opened = env
-        .state
-        .secrets()
-        .unseal(&sealed, &token_context(library))
+    let store = env.state.secret_store();
+    let db = env.server.records_db();
+    let opened = store
+        .get(&db, token, &token_context(library))
+        .await
         .unwrap();
-    assert_eq!(opened, SECRET.as_bytes());
+    assert_eq!(opened.as_deref(), Some(SECRET.as_bytes()));
     // Another library's context does not open it.
     assert!(
-        env.state
-            .secrets()
-            .unseal(&sealed, &token_context(env.site))
+        store
+            .get(&db, token, &token_context(env.site))
+            .await
             .is_err()
     );
 }
