@@ -270,7 +270,9 @@ async fn each_bad_path_is_refused_with_its_reason() {
         (r"\\?\C:\approved".to_owned(), "device"),
     ];
     if cfg!(windows) {
-        cases.push((r"\\server\C$".to_owned(), "whole_drive"));
+        cases.push((r"\\server\C$".to_owned(), "administrative_share"));
+        cases.push((r"\\server\c$\Users".to_owned(), "administrative_share"));
+        cases.push((r"\\server\Projects$".to_owned(), "whole_drive"));
     } else {
         // The Linux counterpart of a whole drive is the whole file system, and a server
         // there cannot open a UNC or drive path, which it says instead of "not found".
@@ -849,6 +851,45 @@ async fn a_bad_root_is_refused_and_the_setting_is_unchanged() {
         [ROOT]
     );
     assert_eq!(settings.list_seconds, 600);
+}
+
+#[tokio::test]
+async fn an_administrative_share_cannot_be_approved_and_the_setting_is_unchanged() {
+    let env = Env::new().await;
+    let sentence = "Administrative shares such as \\\\server\\C$ open a whole drive or system area and ought not to be shared. Share only the folder you need, then approve that path.";
+    let (status, answer) = env
+        .call(
+            &env.admin,
+            Method::PUT,
+            "/api/settings/shares",
+            Some(json!({"roots":[r"\\server\C$\Users"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"], "invalid_share_path", "{answer}");
+    assert_eq!(answer["reason"], "administrative_share", "{answer}");
+    assert_eq!(answer["message"], sentence, "{answer}");
+    let settings = env.server.records_db().share_settings().await.unwrap();
+    assert_eq!(
+        settings
+            .roots
+            .iter()
+            .map(records::SharePath::display)
+            .collect::<Vec<_>>(),
+        [ROOT]
+    );
+}
+
+#[tokio::test]
+async fn connecting_below_an_administrative_share_is_refused() {
+    let env = Env::new().await;
+    let (status, answer) = env
+        .connect(json!({"name": "Admin share", "path": r"\\server\C$\Users"}))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"], "invalid_share_path", "{answer}");
+    assert_eq!(answer["reason"], "administrative_share", "{answer}");
+    assert_eq!(env.fake.lists(), 0);
 }
 
 #[tokio::test]

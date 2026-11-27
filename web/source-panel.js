@@ -297,6 +297,9 @@ export function unavailableMarkFor(item, kind) {
   return unavailableText(item.unavailable, kind);
 }
 
+const ADMIN_SHARE_SENTENCE =
+  'Administrative shares such as \\\\server\\C$ open a whole drive or system area and ought not to be shared. Share only the folder you need, then approve that path.';
+
 /** A first check of the folder path of a file share; the server decides. */
 export function validSharePath(text) {
   const refuse = (reason) => ({ ok: false, reason });
@@ -322,6 +325,7 @@ export function validSharePath(text) {
   // One trailing separator is fine; an empty name anywhere else is not.
   if (names.length > 1 && names.at(-1) === '') names = names.slice(0, -1);
   if (names.some((name) => name === '')) return refuse('Do not leave an empty folder name between separators.');
+  if (/^[\\/]{2}/.test(path) && /^([A-Za-z]|ADMIN|IPC|PRINT)\$$/i.test(names[1])) return refuse(ADMIN_SHARE_SENTENCE);
   if (names.some((name) => name === '.' || name === '..')) return refuse('Do not use . or .. in the path.');
   if (names.some((name) => /[<>"|?*:]/.test(name))) return refuse('A folder name cannot hold any of < > " | ? * :');
   return { ok: true, reason: '' };

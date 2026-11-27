@@ -24,6 +24,8 @@ pub enum PathRefusal {
     TrailingDotOrSpace,
     TooLong,
     WholeDrive,
+    /// An administrative share (C$, ADMIN$, IPC$, PRINT$) or anything below one.
+    AdministrativeShare,
     /// A UNC or drive path given to a server that is not running on Windows, which cannot
     /// open it. There, a Windows share is used through its mount point, such as `/mnt/share`.
     OtherSystem,
@@ -130,9 +132,10 @@ impl SharePath {
         PathBuf::from(self.display())
     }
 
-    /// Whether this is a UNC path whose share name ends in `$`.
+    /// Whether this is a UNC path on an administrative share: a drive letter and `$`, or
+    /// `ADMIN$`, `IPC$` or `PRINT$`, in any case. Other hidden shares are not administrative.
     pub fn is_admin_share(&self) -> bool {
-        matches!(&self.0, PathKind::Unc { share, .. } if share.ends_with('$'))
+        matches!(&self.0, PathKind::Unc { share, .. } if administrative_name(share))
     }
 
     /// Whether this path equals `root` or is below it by whole segments.
@@ -208,6 +211,9 @@ pub fn approved_root<'a>(path: &SharePath, roots: &'a [SharePath]) -> Option<&'a
 /// Refuses approvals which would grant an entire drive, a bare administrative share, or the
 /// whole file system (`/`).
 pub fn valid_root(root: &SharePath) -> Result<(), PathRefusal> {
+    if root.is_admin_share() {
+        return Err(PathRefusal::AdministrativeShare);
+    }
     match &root.0 {
         PathKind::Drive { folders, .. } | PathKind::Posix { folders } if folders.is_empty() => {
             Err(PathRefusal::WholeDrive)
@@ -365,6 +371,17 @@ impl Db {
         }
         Ok(settings)
     }
+}
+
+fn administrative_name(share: &str) -> bool {
+    let Some(name) = share.strip_suffix('$') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    matches!((chars.next(), chars.next()), (Some(letter), None) if letter.is_ascii_alphabetic())
+        || ["ADMIN", "IPC", "PRINT"]
+            .iter()
+            .any(|admin| name.eq_ignore_ascii_case(admin))
 }
 
 fn segments(text: &str) -> Result<Vec<String>, PathRefusal> {

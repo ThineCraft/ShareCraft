@@ -565,6 +565,16 @@ test('validSharePath refuses what could never be a share folder, with a reason e
   assert.equal(validSharePath('\\\\server\\share\\' + 'x'.repeat(1100)).ok, false);
 });
 
+test('validSharePath refuses administrative shares with the owner sentence, and only those', () => {
+  const sentence = 'Administrative shares such as \\\\server\\C$ open a whole drive or system area and ought not to be shared. Share only the folder you need, then approve that path.';
+  for (const path of ['\\\\server\\C$', '\\\\server\\c$\\Users', '//server/D$/x', '\\\\localhost\\ADMIN$', '\\\\s\\ipc$', '\\\\s\\Print$\\a']) {
+    assert.deepEqual(validSharePath(path), { ok: false, reason: sentence }, path);
+  }
+  for (const path of ['\\\\server\\Projects$\\Users', '\\\\server\\C$folder', '\\\\server\\share\\C$', 'C:\\Users', '/mnt/c$/x']) {
+    assert.equal(validSharePath(path).ok, true, path);
+  }
+});
+
 test('hiddenLines words each kind plainly and leaves zero counts out', () => {
   assert.deepEqual(hiddenLines({ links: 0, system: 0, offline: 0 }), []);
   assert.deepEqual(hiddenLines(null), []);

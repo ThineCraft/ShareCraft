@@ -1128,6 +1128,9 @@ fn share_path_message(reason: &str) -> &'static str {
         "stream" => "Alternate data streams cannot be used as file shares.",
         "too_long" => "The file-share path is too long.",
         "whole_drive" => "Approve a folder rather than a whole drive or administrative share.",
+        "administrative_share" => {
+            "Administrative shares such as \\\\server\\C$ open a whole drive or system area and ought not to be shared. Share only the folder you need, then approve that path."
+        }
         _ => "The file-share path contains a name that cannot be used.",
     }
 }

@@ -231,11 +231,50 @@ fn a_whole_drive_or_bare_admin_share_is_not_a_valid_root() {
         Err(PathRefusal::WholeDrive)
     );
     assert_eq!(
-        valid_root(&SharePath::parse(r"\\server\C$").unwrap()),
+        valid_root(&SharePath::parse(r"\\server\Projects$").unwrap()),
         Err(PathRefusal::WholeDrive)
     );
     assert!(valid_root(&SharePath::parse(r"\\server\share").unwrap()).is_ok());
-    assert!(valid_root(&SharePath::parse(r"\\server\C$\folder").unwrap()).is_ok());
+}
+
+#[test]
+fn administrative_shares_and_everything_below_them_are_refused() {
+    for text in [
+        r"\\server\C$",
+        r"\\server\c$",
+        r"\\server\z$\a",
+        r"\\server\ADMIN$",
+        r"\\server\admin$\x",
+        r"\\server\IPC$",
+        r"//server/C$/Users",
+        r"\\localhost\C$\Users",
+        r"\\server\print$",
+        r"\\server\PRINT$\drivers",
+    ] {
+        assert_eq!(
+            valid_root(&SharePath::parse(text).unwrap()),
+            Err(PathRefusal::AdministrativeShare),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn other_hidden_shares_are_not_administrative() {
+    for text in [
+        r"\\server\Projects$\Users",
+        r"\\server\C$folder",
+        r"\\server\C$folder\x",
+        r"\\server\CD$\x",
+        r"\\server\$\x",
+        r"\\server\share\C$",
+        r"C:\Users",
+        "/mnt/c$/x",
+    ] {
+        let path = SharePath::parse(text).unwrap();
+        assert!(!path.is_admin_share(), "{text}");
+        assert!(valid_root(&path).is_ok(), "{text}");
+    }
 }
 
 #[test]

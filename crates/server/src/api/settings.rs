@@ -38,6 +38,7 @@ pub(super) fn path_reason(reason: PathRefusal) -> &'static str {
         PathRefusal::Stream => "stream",
         PathRefusal::TooLong => "too_long",
         PathRefusal::WholeDrive => "whole_drive",
+        PathRefusal::AdministrativeShare => "administrative_share",
         PathRefusal::OtherSystem => "other_system",
         PathRefusal::EmptySegment
         | PathRefusal::BadCharacter
