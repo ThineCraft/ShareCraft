@@ -1904,7 +1904,13 @@ async fn effective_look_carries_the_page_and_keeps_it_from_the_hub() {
 
     // The page goes with the site: a plain member of a paper hub stays plain.
     set_look(&server, &root, &hub, json!({ "page": "paper" })).await;
-    set_look(&server, &root, &team, json!({ "theme": { "from": "builtin:forest" } })).await;
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:forest" } }),
+    )
+    .await;
     let (status, body) = call(
         &server,
         Some(&root),

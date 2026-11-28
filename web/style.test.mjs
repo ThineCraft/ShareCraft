@@ -210,6 +210,9 @@ test('a paper page has fixed colours, the same as look.js, and a grain that neve
   assert.equal(layer['pointer-events'], 'none');
   // In a preview panel or a card picture the same grain sits inside the element.
   assert.ok(RULES.some((rule) => rule.selector === '[data-page=paper]:not(html)::before'), 'a grain layer in a panel');
+  // The current link, across the top or in the left column, is underlined in champagne.
+  const current = RULES.find((rule) => rule.selector.startsWith('[data-page=paper]') && /\.navbar/.test(rule.selector) && /\.sitenav/.test(rule.selector) && /aria-current/.test(rule.selector));
+  assert.match(Object.fromEntries(current?.declarations ?? [])['box-shadow'] ?? '', /var\(--champagne\)/, 'champagne on the current link');
   // Printing leaves the grain out.
   const print = RULES.filter((rule) => rule.at.some((at) => /^@media print/.test(at)) && /data-page=paper/.test(rule.selector));
   assert.ok(print.some((rule) => Object.fromEntries(rule.declarations).display === 'none'), 'no grain in print');

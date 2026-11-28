@@ -34,7 +34,7 @@ html[data-page=paper] body{background:transparent}
 html[data-page=paper] body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background-image:repeating-linear-gradient(14deg,var(--grain-warm) 0 1px,transparent 1px 5px),repeating-linear-gradient(101deg,var(--grain-light) 0 1px,transparent 1px 7px)}
 [data-page=paper]:not(html){position:relative;isolation:isolate}
 [data-page=paper]:not(html)::before{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;border-radius:inherit;background-image:repeating-linear-gradient(14deg,var(--grain-warm) 0 1px,transparent 1px 5px),repeating-linear-gradient(101deg,var(--grain-light) 0 1px,transparent 1px 7px)}
-[data-page=paper] .sitenav a[aria-current]{box-shadow:inset 0 -2px var(--champagne)}
+[data-page=paper] :is(.navbar,.sitenav) a[aria-current]{box-shadow:inset 0 -2px var(--champagne)}
 @media print{html[data-page=paper] body::before,[data-page=paper]:not(html)::before{display:none}}
 input,textarea,button,select{font:inherit;color:inherit}
 /* the text roles: headings, controls and the navigation take the site's fonts; body text takes

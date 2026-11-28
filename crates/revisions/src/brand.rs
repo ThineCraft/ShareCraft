@@ -2275,9 +2275,20 @@ mod tests {
             assert_eq!(row["name"], built_in.name);
             assert_eq!(row["primary"], built_in.primary.to_string());
             assert_eq!(row["secondary"], built_in.secondary.to_string());
-            let dark = |c: Option<Colour>| c.map_or(serde_json::Value::Null, |c| c.to_string().into());
-            assert_eq!(row["primary_dark"], dark(built_in.primary_dark), "{}", built_in.id);
-            assert_eq!(row["secondary_dark"], dark(built_in.secondary_dark), "{}", built_in.id);
+            let dark =
+                |c: Option<Colour>| c.map_or(serde_json::Value::Null, |c| c.to_string().into());
+            assert_eq!(
+                row["primary_dark"],
+                dark(built_in.primary_dark),
+                "{}",
+                built_in.id
+            );
+            assert_eq!(
+                row["secondary_dark"],
+                dark(built_in.secondary_dark),
+                "{}",
+                built_in.id
+            );
             let resolved = check_theme(&built_in.theme()).unwrap();
             assert_eq!(
                 serde_json::to_value(resolved).unwrap(),
@@ -2310,7 +2321,12 @@ mod tests {
         assert_eq!(resolved.dark.accent, colour("#b4d5ed"));
         assert_eq!(resolved.dark.header_bg, colour("#182b3a"));
         for other in BUILT_IN_THEMES.iter().filter(|t| t.id != stationery.id) {
-            assert_eq!((other.primary_dark, other.secondary_dark), (None, None), "{}", other.id);
+            assert_eq!(
+                (other.primary_dark, other.secondary_dark),
+                (None, None),
+                "{}",
+                other.id
+            );
         }
         // The worked example in the plan.
         let sharecraft = check_theme(&SHARECRAFT.theme()).unwrap();
