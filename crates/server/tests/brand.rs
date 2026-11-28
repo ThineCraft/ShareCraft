@@ -228,8 +228,13 @@ async fn brand_centre_needs_manager_or_admin() {
     assert_eq!(seen["can_manage"], false);
     assert!(seen.get("managers").is_none(), "{seen}");
     let themes = seen["themes"].as_array().unwrap();
-    assert_eq!(themes.len(), 6);
+    assert_eq!(themes.len(), 7);
     assert_eq!(themes[0]["id"], "builtin:sharecraft");
+    // Fine Stationery, last of the built-ins, keeps its own dark colours.
+    assert_eq!(themes[6]["id"], "builtin:stationery");
+    assert_eq!(themes[6]["name"], "Fine Stationery");
+    assert_eq!(themes[6]["primary_dark"], "#b4d5ed");
+    assert_eq!(themes[6]["resolved"]["dark"]["accent"], "#b4d5ed");
     assert_eq!(themes[0]["resolved"]["dark"]["accent"], "#748ddd");
     assert_eq!(seen["images"], json!([]));
     assert_eq!(centre(&server, &root).await["can_manage"], true);
@@ -379,8 +384,8 @@ async fn themes_created_renamed_deleted() {
     assert_eq!(body["primary_dark"], Value::Null);
     assert!(body["resolved"]["dark"]["accent"].is_string());
     let seen = centre(&server, &root).await;
-    assert_eq!(seen["themes"].as_array().unwrap().len(), 7);
-    assert_eq!(seen["themes"][6]["name"], "Ocean");
+    assert_eq!(seen["themes"].as_array().unwrap().len(), 8);
+    assert_eq!(seen["themes"][7]["name"], "Ocean");
 
     // Names are unique ignoring case, on create and on rename.
     let (status, body) = new_theme(
@@ -937,7 +942,7 @@ async fn brand_inputs_never_run() {
         .unwrap();
     assert_eq!(response.headers()["content-type"], "application/json");
     let seen: Value = response.json().await.unwrap();
-    assert_eq!(seen["themes"][6]["name"], marked);
+    assert_eq!(seen["themes"][7]["name"], marked);
     assert_eq!(seen["images"][0]["name"], "<b>Bold</b>");
     // Control and invisible characters are refused.
     let (status, body) = new_theme(
@@ -1106,7 +1111,7 @@ async fn reconcile_rebuilds_brand_from_git() {
         .as_array()
         .unwrap()
         .iter()
-        .skip(6)
+        .skip(7)
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["Ocean", "Written elsewhere"]);

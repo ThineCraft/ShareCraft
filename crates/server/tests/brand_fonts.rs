@@ -1869,3 +1869,68 @@ async fn effective_look_gives_a_hub_members_own_theme_and_fonts() {
     assert_eq!(joined["own"]["fonts"], system_fonts());
     assert_ne!(joined["own"]["theme"], joined["theme"]);
 }
+
+#[tokio::test]
+async fn effective_look_carries_the_page_and_keeps_it_from_the_hub() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let vic = server.user("Vic").await;
+    let (hub, _, _) = site_with_assets(&server, &root, "Hub").await;
+    let (team, _, _) = site_with_assets(&server, &root, "Team").await;
+    grant(&server, &root, &team, &vic, "viewer").await;
+
+    // A plain page by default; paper when the look says so, and it is recorded.
+    assert_eq!(effective(&server, &vic, &team).await["page"], "plain");
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:stationery" }, "page": "paper" }),
+    )
+    .await;
+    assert_eq!(effective(&server, &vic, &team).await["page"], "paper");
+    let changed = events(&server, "site.look_changed").await;
+    assert_eq!(changed.last().unwrap()["after"]["page"], "paper");
+    // Nothing but plain or paper.
+    let (status, body) = put_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:stationery" }, "page": "linen" }),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}: {body}");
+    assert_eq!(effective(&server, &vic, &team).await["page"], "paper");
+
+    // The page goes with the site: a plain member of a paper hub stays plain.
+    set_look(&server, &root, &hub, json!({ "page": "paper" })).await;
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:forest" } }),
+    )
+    .await;
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::PUT,
+        &format!("/api/sites/{hub}/hub"),
+        Some(json!({ "navigation": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::PUT,
+        &format!("/api/sites/{team}/joined-hub"),
+        Some(json!({ "hub": hub })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let seen = effective(&server, &vic, &team).await;
+    assert_eq!(seen["theme_from"], "hub");
+    assert_eq!(seen["page"], "plain");
+    assert_eq!(effective(&server, &root, &hub).await["page"], "paper");
+}

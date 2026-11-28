@@ -25,6 +25,20 @@ font:var(--text-md)/var(--leading) var(--font-body);color:var(--text);background
 @media (pointer:coarse){:root{--control-sm:44px;--control:44px}}
 *{box-sizing:border-box}
 body{margin:0;padding:var(--space-5) var(--space-4) 40px;background:var(--bg)}
+/* A paper page (a look's Page: Paper): warm fixed colours, the same as PAPER in look.js, and a
+   faint grain of two hairline gradients. The grain is one layer that never scrolls, takes no
+   clicks and holds no image. On <html> it lies behind the whole page; in a preview panel or a
+   card picture it lies inside that element. */
+[data-page=paper]{--bg:light-dark(#f9f7f2,#10151b);--paper:light-dark(#fdfcf9,#1c232b);--sheet:light-dark(#fdfcf9,#1c232b);--text:light-dark(#252b30,#f0ede6);--muted:light-dark(#667079,#b9c4cd);--champagne:light-dark(#b29a70,#c7ad82);--grain-warm:light-dark(rgb(82 69 48/.0065),rgb(82 69 48/.001));--grain-light:light-dark(rgb(255 255 255/.13),rgb(255 255 255/.02))}
+/* Change the look sits on the site's own page, which may be paper: a plain preview or card picture
+   inside it takes back the plain colours (the same values as :root), so Plain looks plain. */
+[data-page=paper] :is(.look-preview,.page-art,.tc-mini):not([data-page=paper]){--bg:light-dark(#f5f7f8,#141c20);--paper:light-dark(#fff,#202a2e);--sheet:light-dark(#fff,#172023);--text:light-dark(#233239,#e7edf0);--muted:light-dark(#5d6d75,#afbdc4)}
+html[data-page=paper] body{background:transparent}
+html[data-page=paper] body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background-image:repeating-linear-gradient(14deg,var(--grain-warm) 0 1px,transparent 1px 5px),repeating-linear-gradient(101deg,var(--grain-light) 0 1px,transparent 1px 7px)}
+[data-page=paper]:not(html){position:relative;isolation:isolate}
+[data-page=paper]:not(html)::before{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;border-radius:inherit;background-image:repeating-linear-gradient(14deg,var(--grain-warm) 0 1px,transparent 1px 5px),repeating-linear-gradient(101deg,var(--grain-light) 0 1px,transparent 1px 7px)}
+[data-page=paper] :is(.navbar,.sitenav) a[aria-current]{box-shadow:inset 0 -2px var(--champagne)}
+@media print{html[data-page=paper] body::before,[data-page=paper]:not(html)::before{display:none}}
 input,textarea,button,select{font:inherit;color:inherit}
 /* the text roles: headings, controls and the navigation take the site's fonts; body text takes
    --font-body from the root. Code and other fixed-width text keep their own monospace stacks */

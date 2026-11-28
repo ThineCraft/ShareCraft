@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fine Stationery: a theme and a Paper page</title>
+<style>
+:root{--bg:#fff;--fg:#1d1d1f;--muted:#5f6368;--line:#d9dce1;--band:#f3f5f8;--head:#e8ecf2;--accent:#0b57d0;--card:#fafbfc;--code:#eef1f5}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e8eaed;--muted:#a0a6ad;--line:#33373d;--band:#1f2228;--head:#262a31;--accent:#8ab4f8;--card:#1b1e23;--code:#23272e}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:900px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.6rem;margin:0 0 4px}h2{font-size:1.25rem;margin:36px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
+h3{font-size:1.08rem;margin:18px 0 8px}
+p{margin:0 0 12px}p.sub{color:var(--muted);margin:0 0 16px}
+a{color:var(--accent)}
+.scroll{position:relative;overflow-x:auto;margin:0 0 16px}
+table{border-collapse:collapse;width:100%;min-width:520px}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{background:var(--head)}
+tbody tr:nth-child(even){background:var(--band)}
+ul,ol{padding-left:1.3em;margin:0 0 12px}li{margin-bottom:5px}
+ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:var(--band);border-radius:4px}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:var(--code);padding:1px 4px;border-radius:3px;overflow-wrap:anywhere}
+.note{border-left:4px solid var(--accent);background:var(--card);padding:10px 14px;margin:0 0 14px}
+.note p:last-child{margin:0}
+.sw{display:inline-block;width:.9em;height:.9em;border:1px solid var(--line);border-radius:2px;vertical-align:-.1em;margin-right:.3em}
+</style>
+</head>
+<body>
+<main>
+<h1>Fine Stationery: a theme and a Paper page</h1>
+<p class="sub">Design, 27 November 2026. Branch <code>fine-stationery</code> in <code>H:\Source\repos\ThineCraft\ShareCraft-stationery</code>, cut from main 2654a64. Source: the owner's proposal page <code>sharecraft-fine-stationery-proposal.html</code> (a Codex output, with light and dark palettes). Nothing below is built yet.</p>
+
+<div class="note">
+<p><b>What the owner asked for.</b> A look called "Fine Stationery": quiet, executive polish for a site, the library working exactly as it does now. The owner chose to take what fits ShareCraft's looks: <b>the fonts, the colours and the paper-texture background</b>. The deckled paper edge, the champagne-heavy decoration and the proposal's own layout are left out.</p>
+<p><b>Approach chosen (A).</b> A new built-in theme, "Fine Stationery", and a new look setting, <b>Page: Plain or Paper</b>, which any look may use. The fonts are the existing built-in Classic package. A site gets the full Fine Stationery look by choosing all three on Change the look.</p>
+</div>
+
+<h2>1. Why, and what success looks like</h2>
+<ul class="band">
+<li>A site owner can make a site feel like good letter paper rather than a filing cabinet: deep blue ink, serif headings, a warm, faintly textured page.</li>
+<li>Success: choose the Fine Stationery theme, Classic fonts and Paper; the site's pages show it in light and dark mode, at 375 px wide and on a desktop, with every text and control as readable as today.</li>
+<li>Anti-goals: no change to how the library behaves or is laid out; no raster image files; no text, control or scrolling list behind a filter; nothing that loosens the page's Content Security Policy; no page colour set from user input.</li>
+</ul>
+
+<h2>2. Approaches considered</h2>
+<div class="scroll"><table>
+<thead><tr><th>Approach</th><th>Trade-off</th><th>Outcome</th></tr></thead>
+<tbody>
+<tr><td><b>A. Theme plus a Page setting</b></td><td>Three choices for the full look; Paper works with every theme; follows the way the menu style was added.</td><td><b>Chosen by the owner.</b></td></tr>
+<tr><td>B. The theme carries the paper</td><td>One pick, but themes (including brand-centre ones) would gain a non-colour flag, touching contrast checks, copying and hubs.</td><td>Not chosen.</td></tr>
+<tr><td>C. A plus a one-click Fine Stationery card</td><td>Closest to "a look", more work.</td><td>Not chosen; can be added later on top of A.</td></tr>
+</tbody></table></div>
+
+<h2>3. The Fine Stationery theme</h2>
+<p>Added to <code>BUILT_IN_THEMES</code> in <code>crates/revisions/src/brand.rs</code> as <code>builtin:stationery</code>, named "Fine Stationery", after Graphite. It gives its dark colours explicitly, taken from the proposal's dark palette, instead of deriving them.</p>
+<div class="scroll"><table>
+<thead><tr><th>Colour</th><th>Light</th><th>Dark</th></tr></thead>
+<tbody>
+<tr><td>Primary (links, buttons)</td><td><span class="sw" style="background:#203c50"></span><code>#203c50</code>, white button text</td><td><span class="sw" style="background:#b4d5ed"></span><code>#b4d5ed</code>, dark ink button text</td></tr>
+<tr><td>Secondary (header band)</td><td><span class="sw" style="background:#172f40"></span><code>#172f40</code>, white header text</td><td><span class="sw" style="background:#182b3a"></span><code>#182b3a</code>, white header text</td></tr>
+</tbody></table></div>
+<p>Checked with <code>checkTheme</code> in <code>web/look.js</code>: every check passes. <code>BuiltInTheme</code> gains optional <code>primary_dark</code> and <code>secondary_dark</code> (the other six stay derived), and <code>theme()</code> copies them, so the theme a site holds carries them like any custom theme. The brand-centre list, the theme picker, look cards and BUILDING's theme table pick it up from the same list. The JavaScript list of themes comes from the server, so no second copy is needed; <code>look-vectors.json</code> gains the theme as a case.</p>
+
+<h2>4. The Page setting: Plain or Paper</h2>
+<h3>Stored and sent</h3>
+<ul class="band">
+<li>A new field <code>page</code> on <code>Look</code>: an enum <code>PageStyle { Plain, Paper }</code>, serialised in snake case, <code>#[serde(default, skip_serializing_if = "PageStyle::is_plain")]</code>. Stored looks without it are Plain, so nothing existing changes and old files stay the same byte for byte.</li>
+<li>Look input (<code>PUT /api/sites/{id}/look</code>, <code>crates/server/src/looks.rs</code>) takes an optional <code>page</code>; anything but <code>plain</code> or <code>paper</code> is refused as the menu style is.</li>
+<li>The effective look (<code>GET /api/sites/{id}/look</code>) answers <code>page: "plain" | "paper"</code>.</li>
+<li>History, rollback, copying a site's look, templates (save, import, apply) and applying a whole look to many sites carry it as they carry <code>menu</code>. Applying only a brand theme and fonts to many sites leaves it alone.</li>
+<li><b>Hubs (my call):</b> Page goes with the site, as navigation and the menu style do, not with the hub's theme and fonts. Paper is a choice about the page, and a hub member keeps its own. Easy to move into the hub-lent part later if the owner wants that.</li>
+</ul>
+<h3>Shown</h3>
+<ul class="band">
+<li><code>siteChrome</code> in <code>web/common.js</code> sets <code>data-page="paper"</code> on <code>&lt;html&gt;</code> through <code>setAttribute</code> for a Paper look, and removes it otherwise. The value is checked to be exactly <code>paper</code>. The editor frame never takes it, so the editor stays neutral, as it does for colours.</li>
+<li><code>web/style.css</code> holds every Paper colour as fixed <code>light-dark()</code> values under <code>html[data-page="paper"]</code>. No colour comes from the look. It overrides the page tokens (<code>--bg</code>, <code>--paper</code>, <code>--sheet</code>, <code>--text</code>, <code>--muted</code>, <code>--line</code>) and adds a quiet champagne detail on the current navigation item and table row hover.</li>
+<li>Grain: one <code>html[data-page="paper"] body::before</code> layer, <code>position: fixed</code>, <code>inset: 0</code>, <code>pointer-events: none</code>, behind the content, made of two faint <code>repeating-linear-gradient</code>s as in the proposal. It is 26% opacity in light mode and 4% in dark. There is no SVG filter and no image, so the Content Security Policy is unchanged. It is painted once and does not scroll with the library.</li>
+<li>Pages outside a site (Start, admin, brand centre) are unchanged.</li>
+</ul>
+<div class="scroll"><table>
+<thead><tr><th>Token</th><th>Plain today (light / dark)</th><th>Paper (light / dark)</th></tr></thead>
+<tbody>
+<tr><td><code>--bg</code> (page behind sheets)</td><td><code>#f5f7f8</code> / <code>#141c20</code></td><td><span class="sw" style="background:#f9f7f2"></span><code>#f9f7f2</code> / <span class="sw" style="background:#10151b"></span><code>#10151b</code></td></tr>
+<tr><td><code>--paper</code>, <code>--sheet</code></td><td><code>#fff</code> / <code>#202a2e</code>, <code>#172023</code></td><td><span class="sw" style="background:#fdfcf9"></span><code>#fdfcf9</code> / <span class="sw" style="background:#1c232b"></span><code>#1c232b</code></td></tr>
+<tr><td><code>--text</code></td><td><code>#233239</code> / <code>#e7edf0</code></td><td><code>#252b30</code> / <code>#f0ede6</code></td></tr>
+<tr><td><code>--muted</code></td><td><code>#5d6d75</code> / <code>#afbdc4</code></td><td><code>#667079</code> / <code>#b9c4cd</code></td></tr>
+<tr><td>Champagne detail</td><td>none</td><td><span class="sw" style="background:#b29a70"></span><code>#b29a70</code> / <span class="sw" style="background:#c7ad82"></span><code>#c7ad82</code></td></tr>
+</tbody></table></div>
+<p><b>Contrast.</b> Text on paper is 13.95 (light) and 13.56 (dark); muted text 4.92 (light) and 8.94 (dark). The Paper page colours sit inside the range the theme checks already test (light between <code>#f5f7f8</code> and <code>#fff</code> in luminance, dark no lighter than <code>#202a2e</code>), so every theme that passes today still passes on Paper. A unit test pins this. The light <code>--bg</code> value <code>#f9f7f2</code> is my call; the builder may adjust it within that range.</p>
+
+<h3>Chosen</h3>
+<ul class="band">
+<li>Change the look (<code>web/site-look.html</code>, <code>web/site-look.js</code>) gets a "Page" choice beside Navigation and Menu style: two radio cards, <b>Plain</b> ("ShareCraft's clean page") and <b>Paper</b> ("A warm page with a faint paper grain"), each with a small picture as the other cards have.</li>
+<li>The live preview panels (<code>preview-light</code>, <code>preview-dark</code>) and the Paper card picture show Paper exactly as a live page does, grain included (my call). So the Paper rules in <code>style.css</code> match <code>[data-page="paper"]</code> on any element, not only <code>&lt;html&gt;</code>: the tokens are set on that element, and the grain is a <code>::before</code> layer of it (of <code>body</code> when it is <code>&lt;html&gt;</code>, fixed; of the panel itself in the preview, absolute). The preview sets and clears the attribute on each panel as the draft changes.</li><li>The live preview panel shows Paper. The draft, <code>lookInput</code>, <code>comparable</code> and <code>describeLookChange</code> (<code>web/look.js</code>) carry <code>page</code>: history reads "Page: plain to paper".</li>
+<li>The look studio's changed marks (<code>look-studio.js</code>) mark the Page part when it changes.</li>
+</ul>
+
+<h2>5. Fonts</h2>
+<p>No new font package. Built-in Classic already gives serif titles and headings (<code>ui-serif, Georgia, 'Times New Roman', serif</code>) and the system fonts for body and controls, which is what the proposal uses.</p>
+
+<h2>6. Out of scope</h2>
+<ul class="band">
+<li>The deckled paper edge, the SVG grain filter, the proposal's app bar, hero gradient and table layout.</li>
+<li>A one-click Fine Stationery card (approach C).</li>
+<li>Paper on pages outside a site, and in the editor.</li>
+<li>Letting brand-centre themes carry paper.</li>
+</ul>
+
+<h2>7. Checks before it is done</h2>
+<ol class="band">
+<li>Rust unit tests: the theme passes <code>check_theme</code>; <code>page</code> defaults to Plain, round-trips, is left out of the file when Plain, and an unknown value is refused.</li>
+<li>Server tests (targeted, as in <code>brand_fonts.rs</code> for the menu): put, effective look, history, copy and template carry <code>page</code>. The full suite runs on GitHub Actions only when the owner pushes.</li>
+<li>JavaScript tests (<code>node --test</code>): draft, <code>lookInput</code>, <code>describeLookChange</code>, the <code>data-page</code> attribute, and the Paper-contrast test.</li>
+<li>In the browser on the dev server: a site with Fine Stationery, Classic and Paper, light and dark, at 375 px and 1280 px wide. Library, a document page and Change the look show no clipped text and no horizontal scroll. Screenshots go to the owner.</li>
+<li>BUILDING.html: the built-in theme table gains Fine Stationery, and the look section describes <code>page</code>.</li>
+</ol>
+
+<h2>8. Calls I made (for the owner to check)</h2>
+<div class="scroll"><table>
+<thead><tr><th>Call</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Header colour <code>#172f40</code> (light)</td><td>The proposal's header is a gradient from very dark navy to <code>#203c50</code>; a flat header needs one colour a step darker than the primary.</td></tr>
+<tr><td>Explicit dark colours for this theme only</td><td>Derived dark colours would not give the proposal's pale blue.</td></tr>
+<tr><td>Page goes with the site, not the hub</td><td>It sits with navigation and the menu style, which are per site.</td></tr>
+<tr><td>Light page behind sheets <code>#f9f7f2</code></td><td>Warm, and within the luminance range the checks cover (0.931, against 0.927 for <code>#f5f7f8</code>); muted text on it is 4.72.</td></tr>
+<tr><td>Preview and card picture show the grain too</td><td>The owner judges the look in the preview; it should match the live page.</td></tr><tr><td>Grain without an SVG filter</td><td>Keeps the Content Security Policy and markup unchanged; the gradients give most of the effect.</td></tr>
+</tbody></table></div>
+</main>
+</body>
+</html>

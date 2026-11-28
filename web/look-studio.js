@@ -133,7 +133,7 @@ export function chosenCard(draft, themes = []) {
 
 /** The fields of a draft each tab holds; together they are every field of a draft. */
 const PART_FIELDS = Object.freeze({
-  theme: ['from', 'theme'],
+  theme: ['from', 'theme', 'page'],
   fonts: ['fonts'],
   header: ['logo', 'thumbnail', 'icon', 'logo_alt', 'header'],
   navigation: ['navigation', 'menu'],

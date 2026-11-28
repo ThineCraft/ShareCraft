@@ -47,6 +47,7 @@ import {
   FOOTER_LINK_LIMIT,
   applyFonts,
   applyLook,
+  applyPage,
   deriveDark,
   draftImageUrl,
   hexOf,
@@ -400,6 +401,19 @@ $('menu-choice').replaceChildren(
   ...MENUS.map(([value, title, hint]) =>
     radioCard('menu-style', value, title, hint, pageArt({ 'data-menu': value }), (v) => {
       session.change((draft) => (draft.menu = v));
+      refresh();
+    }),
+  ),
+);
+const PAGES = [
+  ['plain', 'Plain', "ShareCraft's clean page"],
+  ['paper', 'Paper', 'A warm page with a faint paper grain'],
+];
+// The Paper card's picture carries data-page itself, so style.css draws it on paper.
+$('page-choice').replaceChildren(
+  ...PAGES.map(([value, title, hint]) =>
+    radioCard('page-style', value, title, hint, pageArt(value === 'paper' ? { 'data-page': 'paper' } : {}), (v) => {
+      session.change((draft) => (draft.page = v));
       refresh();
     }),
   ),
@@ -868,6 +882,7 @@ function fillHeader() {
   $('hide-title').checked = draft.header.hide_title;
   checkCard($('navigation-choice'), draft.navigation);
   checkCard($('menu-choice'), draft.menu);
+  checkCard($('page-choice'), draft.page);
   fillBleed();
 }
 
@@ -1045,6 +1060,7 @@ function drawPreview() {
     const panel = $(id);
     applyLook(panel, effective);
     applyFonts(panel, effective.fonts);
+    applyPage(panel, effective);
     const nav = h(
       'ul',
       { class: 'preview-nav' },

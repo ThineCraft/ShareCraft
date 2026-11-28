@@ -417,6 +417,30 @@
           "header_ink": "#ffffff"
         }
       }
+    },
+    {
+      "id": "builtin:stationery",
+      "name": "Fine Stationery",
+      "primary": "#203c50",
+      "secondary": "#172f40",
+      "primary_dark": "#b4d5ed",
+      "secondary_dark": "#182b3a",
+      "resolved": {
+        "light": {
+          "accent": "#203c50",
+          "accent_ink": "#203c50",
+          "on_accent": "#ffffff",
+          "header_bg": "#172f40",
+          "header_ink": "#ffffff"
+        },
+        "dark": {
+          "accent": "#b4d5ed",
+          "accent_ink": "#b4d5ed",
+          "on_accent": "#141c20",
+          "header_bg": "#182b3a",
+          "header_ink": "#ffffff"
+        }
+      }
     }
   ],
   "font_sniffing": [

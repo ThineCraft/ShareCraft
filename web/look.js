@@ -296,6 +296,35 @@ export function applyLook(root, effective) {
   return true;
 }
 
+// ---- The page: plain or paper ----
+
+/**
+ * The colours of a paper page, light and dark: style.css holds the same values under
+ * `[data-page=paper]` (style.test.mjs keeps the two the same). Every one is fixed: a look only
+ * chooses paper, never its colours. `bg` and `paper` sit inside the page colours the theme checks
+ * use, so every theme that passes reads on paper too.
+ */
+export const PAPER = Object.freeze({
+  light: Object.freeze({ bg: '#f9f7f2', paper: '#fdfcf9', text: '#252b30', muted: '#667079', champagne: '#b29a70' }),
+  dark: Object.freeze({ bg: '#10151b', paper: '#1c232b', text: '#f0ede6', muted: '#b9c4cd', champagne: '#c7ad82' }),
+});
+
+/**
+ * Marks `root` (`<html>`, or a preview panel) as a paper page when the effective look's `page`
+ * is exactly `paper`: the attribute `data-page="paper"`, set with `setAttribute`, which style.css
+ * draws. Anything else, or no look, takes the attribute away, so the page is plain. Answers
+ * whether the page is paper.
+ */
+export function applyPage(root, effective) {
+  if (typeof root?.setAttribute !== 'function') return false;
+  if (effective?.page === 'paper') {
+    root.setAttribute('data-page', 'paper');
+    return true;
+  }
+  root.removeAttribute?.('data-page');
+  return false;
+}
+
 // ---- Fonts ----
 //
 // A page never takes a font family from user text. A font file is loaded under a generated
@@ -513,6 +542,7 @@ export const DEFAULT_LOOK = Object.freeze({
   header: { layout: 'compact', background: 'none', image: null, align: 'left', hide_title: false, bleed: BLEED_DEFAULT, frame: null },
   navigation: 'horizontal',
   footer: { enabled: false, layout: 'simple', logo: null, name: '', background: 'none', groups: [] },
+  page: 'plain',
 });
 
 /** The theme colour each check is about, which "Use suggested" sets. */
@@ -589,6 +619,7 @@ export function draftFromLook(look) {
     fonts: draftFonts(base.fonts),
     icon: draftImage(base.icon),
     menu: base.menu === 'mega' ? 'mega' : 'cascading',
+    page: base.page === 'paper' ? 'paper' : 'plain',
   };
 }
 
@@ -695,6 +726,7 @@ export function previewEffective(draft, siteName) {
   put(out, 'icon_url', draft.icon ?? draft.thumbnail);
   out.fonts = packageFonts(draft.fonts?.package ?? null);
   out.navigation_menu = draft.menu === 'mega' ? 'mega' : 'cascading';
+  out.page = draft.page === 'paper' ? 'paper' : 'plain';
   return out;
 }
 
@@ -759,6 +791,8 @@ export function lookInput(draft, { themes = [] } = {}) {
   slot(out, 'icon', draft.icon);
   // The dropdown is the default; a mega menu is for navigation across the top only.
   if (draft.menu === 'mega' && draft.navigation === 'horizontal') out.menu = 'mega';
+  // A plain page is the default, so only paper is sent.
+  if (draft.page === 'paper') out.page = 'paper';
   // No fonts are the system fonts; the copy the look holds is kept as it is.
   if (draft.fonts) out.fonts = draft.fonts.keep ? { keep: true } : { from: draft.fonts.from };
   return out;
@@ -864,6 +898,7 @@ export function describeLookChange(before, after) {
   const parts = [];
   if (a.theme.name !== b.theme.name) parts.push(`Theme: ${a.theme.name} to ${b.theme.name}`);
   else if (!sameTheme(a.theme, b.theme)) parts.push('Theme colours changed');
+  if (a.page !== b.page) parts.push(`Page: ${a.page} to ${b.page}`);
   for (const text of [imageChange('Logo', a.logo, b.logo), imageChange('Thumbnail', a.thumbnail, b.thumbnail)]) {
     if (text) parts.push(text);
   }

@@ -192,3 +192,39 @@ test('mega menu columns are banded like the dropdowns, in light and dark', () =>
   const band = rules.find((rule) => rule.selector === ':root' && rule.declarations.some(([p]) => p === '--band'));
   assert.match(band.declarations.find(([p]) => p === '--band')[1], /var\(--text\)/);
 });
+
+test('a paper page has fixed colours, the same as look.js, and a grain that never prints', async () => {
+  const { PAPER } = await import('./look.js');
+  const paper = RULES.filter((rule) => rule.selector === '[data-page=paper]' && rule.at.length === 0);
+  assert.equal(paper.length, 1, 'one [data-page=paper] rule');
+  const set = Object.fromEntries(paper[0].declarations);
+  const pair = (key) => `light-dark(${PAPER.light[key]},${PAPER.dark[key]})`;
+  for (const [token, key] of [['--bg', 'bg'], ['--paper', 'paper'], ['--sheet', 'paper'], ['--text', 'text'], ['--muted', 'muted'], ['--champagne', 'champagne']]) {
+    assert.equal(set[token], pair(key), token);
+  }
+  // The grain on a page is one fixed layer behind everything that never takes a click.
+  const grain = RULES.find((rule) => rule.selector === 'html[data-page=paper] body::before' && rule.at.length === 0);
+  assert.ok(grain, 'a grain layer on the page');
+  const layer = Object.fromEntries(grain.declarations);
+  assert.equal(layer.position, 'fixed');
+  assert.equal(layer['pointer-events'], 'none');
+  // In a preview panel or a card picture the same grain sits inside the element.
+  assert.ok(RULES.some((rule) => rule.selector === '[data-page=paper]:not(html)::before'), 'a grain layer in a panel');
+  // The current link, across the top or in the left column, is underlined in champagne.
+  const current = RULES.find((rule) => rule.selector.startsWith('[data-page=paper]') && /\.navbar/.test(rule.selector) && /\.sitenav/.test(rule.selector) && /aria-current/.test(rule.selector));
+  assert.match(Object.fromEntries(current?.declarations ?? [])['box-shadow'] ?? '', /var\(--champagne\)/, 'champagne on the current link');
+  // Printing leaves the grain out.
+  const print = RULES.filter((rule) => rule.at.some((at) => /^@media print/.test(at)) && /data-page=paper/.test(rule.selector));
+  assert.ok(print.some((rule) => Object.fromEntries(rule.declarations).display === 'none'), 'no grain in print');
+  // No image, filter or address anywhere in the paper rules.
+  for (const rule of RULES.filter((r) => /data-page=paper/.test(r.selector))) {
+    for (const [property, value] of rule.declarations) assert.doesNotMatch(value, /url\(/, `${rule.selector} { ${property} }`);
+  }
+});
+test('inside a paper page, a plain preview or card picture shows the plain colours', () => {
+  // Change the look sits on the site's own page, which may be paper; a Plain draft must still look plain.
+  const plain = RULES.find((rule) => rule.at.length === 0 && /^\[data-page=paper\] :is\(/.test(rule.selector) && /\.look-preview/.test(rule.selector) && /\.page-art/.test(rule.selector) && /\.tc-mini/.test(rule.selector) && /:not\(\[data-page=paper\]\)/.test(rule.selector));
+  assert.ok(plain, 'a rule giving plain previews and pictures the plain colours');
+  const set = Object.fromEntries(plain.declarations);
+  for (const token of ['--bg', '--paper', '--sheet', '--text', '--muted']) assert.equal(set[token], ROOT[token], token);
+});

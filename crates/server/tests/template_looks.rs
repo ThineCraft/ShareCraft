@@ -407,6 +407,7 @@ async fn branded(server: &TestServer, root: &TestUser) -> Branded {
             "header": { "hide_title": true },
             "fonts": { "from": format!("org:{package_id}") },
             "menu": "mega",
+            "page": "paper",
         }),
     )
     .await;
@@ -678,6 +679,7 @@ async fn template_sites_pin_their_fonts() {
     assert_eq!(look.logo.as_ref().unwrap().sha256, sha(&b.logo));
     assert_eq!(look.icon.as_ref().unwrap().sha256, sha(&b.icon));
     assert_eq!(look.menu, revisions::brand::MenuStyle::Mega);
+    assert_eq!(look.page, revisions::brand::PageStyle::Paper);
     assert_eq!(
         look.fonts
             .as_ref()
@@ -702,6 +704,7 @@ async fn template_sites_pin_their_fonts() {
         format!("/api/brand/fonts/{}", sha(&b.font))
     );
     assert_eq!(shown["navigation_menu"], "mega");
+    assert_eq!(shown["page"], "paper");
 
     // The font and the logo leave the brand centre: the site keeps its snapshots pinned, and
     // a new site from the template drops and reports them.

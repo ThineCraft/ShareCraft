@@ -1505,7 +1505,7 @@ sites/&lt;xx&gt;/&lt;site id&gt;.json                          a site's settings
 <li><strong>Refusal.</strong> <code>422 low_contrast {"pairs": [{"check", "ratio", "suggestion"}]}</code>, with every failing pair in the order above and ratios rounded to 2 decimals. The page marks each failing pair with its ratio and a Use suggested button, and keeps Apply off while anything fails.</li>
 <li><strong>A stored theme that no longer passes</strong> (if the rules are tightened later) is shown with the ShareCraft theme's colours instead.</li>
 </ul>
-<div class="table-wrap"><table class="banded"><caption>Built-in themes (each passes every check; dark colours are derived)</caption>
+<div class="table-wrap"><table class="banded"><caption>Built-in themes (each passes every check; dark colours are derived unless the theme gives its own)</caption>
 <thead><tr><th>Id</th><th>Name</th><th>Primary</th><th>Secondary</th></tr></thead>
 <tbody>
 <tr><td><code>builtin:sharecraft</code></td><td>ShareCraft (the default)</td><td><code>#3156c9</code></td><td><code>#233239</code></td></tr>
@@ -1514,8 +1514,9 @@ sites/&lt;xx&gt;/&lt;site id&gt;.json                          a site's settings
 <tr><td><code>builtin:rust</code></td><td>Rust</td><td><code>#a3431c</code></td><td><code>#40261b</code></td></tr>
 <tr><td><code>builtin:forest</code></td><td>Forest</td><td><code>#2f6b3a</code></td><td><code>#1f3324</code></td></tr>
 <tr><td><code>builtin:graphite</code></td><td>Graphite</td><td><code>#4a5560</code></td><td><code>#1f262c</code></td></tr>
+<tr><td><code>builtin:stationery</code></td><td>Fine Stationery (added 27 November 2026; its own dark colours: primary <code>#b4d5ed</code>, secondary <code>#182b3a</code>)</td><td><code>#203c50</code></td><td><code>#172f40</code></td></tr>
 </tbody></table></div>
-<p><strong>Never themed:</strong> the status colours (<code>--ok</code>, <code>--warn-*</code>, <code>--stop-*</code>), text, muted text, lines, page and paper backgrounds, the account bar, permission warnings and the held and quarantine marks. Pages set only five colour variables (<code>--accent</code>, <code>--accent-ink</code>, <code>--on-accent</code>, <code>--header-bg</code>, <code>--header-ink</code>), through the CSS object model after checking each value again, so the page security policy is unchanged.</p>
+<p><strong>Never themed:</strong> the status colours (<code>--ok</code>, <code>--warn-*</code>, <code>--stop-*</code>), text, muted text, lines, page and paper backgrounds (a look's Page setting chooses between two fixed sets of them; see "The page: plain or paper" in section 30), the account bar, permission warnings and the held and quarantine marks. Pages set only five colour variables (<code>--accent</code>, <code>--accent-ink</code>, <code>--on-accent</code>, <code>--header-bg</code>, <code>--header-ink</code>), through the CSS object model after checking each value again, so the page security policy is unchanged.</p>
 
 <h3>Brand images are snapshots</h3>
 <p>Choosing an image records a snapshot of the file as it is then: <code>{sha256, media_type, bytes, width?, height?, name, from_doc}</code>. A later change to the file, or its deletion, leaves the brand as it was until the image is chosen again. Anyone signed in can see a brand image, even without access to the library it came from (D41). Choosing one needs <code>view</code> on the document.</p>
@@ -1771,6 +1772,14 @@ sites/&lt;xx&gt;/&lt;site id&gt;.json                          a site's settings
 <tr><td>4</td><td>ShareCraft's own icon, <code>web/favicon.svg</code> (served at <code>/favicon.svg</code>).</td></tr>
 </tbody></table></div>
 <p>Pages outside any site use the organisation's default icon, or ShareCraft's own. The icon is part of a site's own look, so a site in a hub keeps its own icon.</p>
+
+<h3>The page: plain or paper</h3>
+<p>Added on 27 November 2026 with the Fine Stationery theme (plan <a href="plans/2026-11-27-fine-stationery-look-plan.html">2026-11-27-fine-stationery-look-plan.html</a>). A look's <code>page</code> is <code>plain</code> (ShareCraft's own page colours; the default, left out of the file) or <code>paper</code>; anything else is refused. The effective look answers <code>page</code>. It goes with the site, as its navigation and menu style do: a site in a hub keeps its own page. History, rollback, copying a look and templates carry it; applying only a brand theme and fonts to many sites leaves it alone.</p>
+<ul>
+<li><strong>Drawn.</strong> A site page with a paper look gets <code>data-page="paper"</code> on <code>&lt;html&gt;</code>, set with <code>setAttribute</code> (<code>applyPage</code> in <code>look.js</code>). The editor frame never takes it. <code>style.css</code> then sets fixed page, paper, text, muted and champagne colours in light and dark mode (the same values as <code>PAPER</code> in <code>look.js</code>; <code>style.test.mjs</code> keeps them equal), and a faint grain: two hairline gradients on one fixed layer behind the page that takes no clicks, holds no image and is left out of print.</li>
+<li><strong>Readable with every theme.</strong> The paper page colours sit inside the page colours the theme checks use, so a theme that passes reads on paper too (a test pins it).</li>
+<li><strong>Chosen</strong> on Change the look, at the end of the Theme part (Plain or Paper cards). The preview panels and the Paper card show the grain as a live page does.</li>
+</ul>
 
 <h3>The mega menu</h3>
 <p>A look's <code>menu</code> is <code>cascading</code> (the dropdown lists from section 26; the default) or <code>mega</code>. Mega works with horizontal navigation only; with vertical navigation the look is refused (<code>422 invalid_look</code>, "a mega menu needs horizontal navigation").</p>

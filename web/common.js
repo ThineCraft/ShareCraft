@@ -1,7 +1,7 @@
 // Shared by every page: calling the API, turning its error codes into sentences, and the
 // sign-in redirect. Pages hold no merging or permission logic; the server decides.
 
-import { CHECK_LABELS, MIN_RATIO, applyFonts, applyLook, parseColour } from './look.js';
+import { CHECK_LABELS, MIN_RATIO, applyFonts, applyLook, applyPage, parseColour } from './look.js';
 import { megaColumns, megaStep } from './navigation.js';
 import { setupAccountMenu, setupWordmark, showVersion } from './account.js';
 import { existingSidebar, sidebar } from './workspace.js';
@@ -1893,6 +1893,8 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
   if (!frame) {
     applyLook(document.documentElement, shown.look);
     applyFonts(document.documentElement, shown.look?.fonts);
+    // A paper page: never in the editor frame, which stays neutral.
+    applyPage(document.documentElement, shown.look);
   }
   setTabIcon(shown.look?.icon_url);
   const vertical = !frame && shown.look?.navigation === 'vertical';

@@ -36,12 +36,17 @@ test('derive_dark_matches_shared_vectors', () => {
 });
 
 test('built_in_themes_pass_every_check', () => {
-  assert.equal(vectors.built_in_themes.length, 6);
+  assert.equal(vectors.built_in_themes.length, 7);
   for (const t of vectors.built_in_themes) {
-    const result = checkTheme({ primary: t.primary, secondary: t.secondary });
+    const theme = { primary: t.primary, secondary: t.secondary };
+    if (t.primary_dark) theme.primary_dark = t.primary_dark;
+    if (t.secondary_dark) theme.secondary_dark = t.secondary_dark;
+    const result = checkTheme(theme);
     assert.equal(result.ok, true, t.id);
     assert.deepEqual(result.resolved, t.resolved, t.id);
-    // The worse of the two dark page colours is the dark paper: 4.51 to 4.70 for these themes.
+    // A theme with its own dark colours is not derived, so it need not sit at the edge.
+    if (t.primary_dark) continue;
+    // The worse of the two dark page colours is the dark paper: 4.51 to 4.70 for derived themes.
     const dark = parseColour(result.resolved.dark.accent);
     const ratio = Math.min(contrast(dark, '#202a2e'), contrast(dark, '#141c20'));
     assert.ok(ratio >= 4.5 && ratio <= 4.7, `${t.id} dark accent: ${ratio}`);
@@ -889,4 +894,80 @@ test('header_frame_in_draft_history_and_rollback', async () => {
   assert.doesNotMatch(describeLookChange(before, middle), /image moved/);
   // Without its image the framing goes too.
   assert.equal(withoutSlots(draftFromLook(after), ['header.image']).header.frame, null);
+});
+// ---- Page: plain or paper ----
+
+import {
+  applyPage,
+  DARK_PAPER,
+  LIGHT_BACKGROUND,
+  LIGHT_PAPER,
+  luminance,
+  PAPER,
+} from './look.js';
+
+test('a draft keeps a paper page and nothing else', () => {
+  assert.equal(DEFAULT_LOOK.page, 'plain');
+  assert.equal(draftFromLook(null).page, 'plain');
+  assert.equal(draftFromLook({ ...structuredClone(STORED), page: 'paper' }).page, 'paper');
+  assert.equal(draftFromLook({ ...structuredClone(STORED), page: 'linen' }).page, 'plain');
+});
+
+test('Apply sends a paper page only, and the preview shows it', () => {
+  const paper = { ...draftFromLook(STORED), page: 'paper' };
+  assert.equal(lookInput(paper).page, 'paper');
+  assert.equal('page' in lookInput(draftFromLook(STORED)), false);
+  assert.equal(previewEffective(paper, 'Team').page, 'paper');
+  assert.equal(previewEffective(draftFromLook(null), 'Team').page, 'plain');
+});
+
+test('the history says when the page changes', () => {
+  assert.equal(describeLookChange(null, { ...structuredClone(DEFAULT_LOOK), page: 'paper' }), 'Page: plain to paper');
+  assert.equal(describeLookChange({ ...structuredClone(DEFAULT_LOOK), page: 'paper' }, null), 'Page: paper to plain');
+});
+
+/** An element that records only its data-page attribute. */
+function pageElement() {
+  const attrs = new Map();
+  return {
+    attrs,
+    setAttribute(name, value) {
+      attrs.set(name, String(value));
+    },
+    removeAttribute(name) {
+      attrs.delete(name);
+    },
+  };
+}
+
+test('applyPage marks a paper page and clears every other', () => {
+  const root = pageElement();
+  assert.equal(applyPage(root, { page: 'paper' }), true);
+  assert.equal(root.attrs.get('data-page'), 'paper');
+  for (const effective of [{ page: 'plain' }, null, { page: 'Paper' }, { page: 'paper"x' }, {}]) {
+    applyPage(root, { page: 'paper' });
+    assert.equal(applyPage(root, effective), false, JSON.stringify(effective));
+    assert.equal(root.attrs.has('data-page'), false, JSON.stringify(effective));
+  }
+  assert.equal(applyPage(null, { page: 'paper' }), false);
+});
+
+test('paper colours read, and sit inside the page colours the theme checks cover', () => {
+  const lum = (c) => luminance(parseColour(c));
+  for (const key of ['bg', 'paper']) {
+    const light = lum(PAPER.light[key]);
+    assert.ok(light >= lum(LIGHT_BACKGROUND) && light <= lum(LIGHT_PAPER), `light ${key}`);
+    assert.ok(lum(PAPER.dark[key]) <= lum(DARK_PAPER), `dark ${key}`);
+    for (const mode of ['light', 'dark']) {
+      for (const ink of ['text', 'muted']) {
+        const ratio = contrast(PAPER[mode][ink], PAPER[mode][key]);
+        assert.ok(ratio >= 4.5, `${mode} ${ink} on ${key}: ${ratio}`);
+      }
+    }
+  }
+  assert.deepEqual(PAPER, {
+    light: { bg: '#f9f7f2', paper: '#fdfcf9', text: '#252b30', muted: '#667079', champagne: '#b29a70' },
+    dark: { bg: '#10151b', paper: '#1c232b', text: '#f0ede6', muted: '#b9c4cd', champagne: '#c7ad82' },
+  });
+  assert.ok(Object.isFrozen(PAPER) && Object.isFrozen(PAPER.light) && Object.isFrozen(PAPER.dark));
 });
