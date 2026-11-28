@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fine Stationery: implementation plan</title>
+<style>
+:root{--bg:#fff;--fg:#1d1d1f;--muted:#5f6368;--line:#d9dce1;--band:#f3f5f8;--head:#e8ecf2;--accent:#0b57d0;--card:#fafbfc;--code:#eef1f5}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e8eaed;--muted:#a0a6ad;--line:#33373d;--band:#1f2228;--head:#262a31;--accent:#8ab4f8;--card:#1b1e23;--code:#23272e}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:900px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.6rem;margin:0 0 4px}h2{font-size:1.25rem;margin:36px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
+h3{font-size:1.08rem;margin:0 0 8px}
+p{margin:0 0 12px}p.sub{color:var(--muted);margin:0 0 16px}
+a{color:var(--accent)}
+.scroll{position:relative;overflow-x:auto;margin:0 0 16px}
+table{border-collapse:collapse;width:100%;min-width:520px}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{background:var(--head)}
+tbody tr:nth-child(even){background:var(--band)}
+ul,ol{padding-left:1.3em;margin:0 0 12px}li{margin-bottom:5px}
+ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:var(--band);border-radius:4px}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:var(--code);padding:1px 4px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:10px 12px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}
+pre code{background:none;padding:0;font-size:inherit;overflow-wrap:normal}
+.task{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:14px 16px 6px;margin:20px 0}
+.note{border-left:4px solid var(--accent);background:var(--card);padding:10px 14px;margin:0 0 14px}
+.note p:last-child{margin:0}
+</style>
+</head>
+<body>
+<main>
+<h1>Fine Stationery: implementation plan</h1>
+<p class="sub">27 November 2026. Branch <code>fine-stationery</code> in <code>H:\Source\repos\ThineCraft\ShareCraft-stationery</code>, from main 2654a64. Spec: <a href="2026-11-27-fine-stationery-look.html">2026-11-27-fine-stationery-look.html</a> (approved by the owner). Executors read both.</p>
+
+<div class="note">
+<p><b>For agentic workers:</b> use superpowers:subagent-driven-development or superpowers:executing-plans, task by task. Each step is a checkbox.</p>
+<p><b>Goal:</b> a built-in theme "Fine Stationery" and a look setting Page: Plain or Paper, chosen on Change the look.</p>
+<p><b>Architecture:</b> the theme is one more entry in <code>BUILT_IN_THEMES</code> with explicit dark colours. Page is a new <code>Look</code> field that follows the menu style through storage, input, effective look, templates and history. Paper colours and grain are fixed CSS under <code>[data-page="paper"]</code>, an attribute the page and the preview set through <code>setAttribute</code>.</p>
+<p><b>Tech stack:</b> Rust (crates <code>revisions</code>, <code>server</code>), plain ES modules in <code>web/</code>, <code>node --test</code>.</p>
+</div>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li>PowerShell only (never the Bash or Monitor tools). Never print or edit <code>.env</code> or database URLs. The worktree has no <code>.env</code>: copy it from <code>H:\Source\repos\ThineCraft\ShareCraft-release\.env</code> with <code>Copy-Item</code>, without reading it.</li>
+<li>Build target: <code>$env:CARGO_TARGET_DIR='J:\cargo-target\sharecraft-stationery'</code> (its own, so xtask acts on this worktree).</li>
+<li>Locally run targeted tests only; the full suite runs on GitHub Actions when the owner pushes.</li>
+<li>Commit on <code>fine-stationery</code> only. No merge, push or tool install without the owner's go-ahead. Every commit ends with <code>Co-Authored-By: Claude Opus 5.5 &lt;noreply@anthropic.com&gt;</code>.</li>
+<li>Theme: id <code>builtin:stationery</code>, name <code>Fine Stationery</code>, primary <code>#203c50</code>, secondary <code>#172f40</code>, primary_dark <code>#b4d5ed</code>, secondary_dark <code>#182b3a</code>.</li>
+<li>Paper colours, light / dark: bg <code>#f9f7f2</code> / <code>#10151b</code>; paper and sheet <code>#fdfcf9</code> / <code>#1c232b</code>; text <code>#252b30</code> / <code>#f0ede6</code>; muted <code>#667079</code> / <code>#b9c4cd</code>; champagne <code>#b29a70</code> / <code>#c7ad82</code>.</li>
+<li>No colour of a page ever comes from user input; no images, no SVG filter, no Content Security Policy change; the editor frame never takes Paper.</li>
+<li>Wording in the interface and BUILDING follows the house style: plain words, "Page", "Plain", "Paper".</li>
+</ul>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li>A look stored before this change (no <code>page</code>) reads as Plain and is written back byte for byte the same (Task 2 test).</li>
+<li>A site in a hub keeps its own Page; the hub's Paper is never applied to it (Task 2 test).</li>
+<li>Switching the draft from Paper back to Plain clears the attribute on both preview panels; a site page whose look cannot be read has no attribute (Task 3 test of <code>applyPage</code>).</li>
+<li>Printing a Paper page shows no grain (Task 4: <code>@media print</code> rule, checked by the style test).</li>
+<li>At 375 px the fixed grain layer causes no horizontal scroll and covers the whole page while scrolling (Task 5 browser check).</li>
+</ol>
+
+<h2>Files</h2>
+<div class="scroll"><table>
+<thead><tr><th>File</th><th>What changes</th><th>Task</th></tr></thead>
+<tbody>
+<tr><td><code>crates/revisions/src/brand.rs</code></td><td><code>BuiltInTheme</code> dark colours; the new theme; <code>PageStyle</code>; <code>Look.page</code>, <code>TemplateLook.page</code></td><td>1, 2</td></tr>
+<tr><td><code>crates/server/src/looks.rs</code></td><td><code>LookInput.page</code>; effective look answers <code>page</code></td><td>2</td></tr>
+<tr><td><code>crates/server/src/templates.rs</code></td><td>Carries <code>page</code> both ways (lines near 294 and 438)</td><td>2</td></tr>
+<tr><td><code>crates/server/tests/brand_fonts.rs</code>, <code>template_looks.rs</code>, <code>looks.rs</code></td><td>Server tests beside the menu-style ones</td><td>1, 2</td></tr>
+<tr><td><code>web/look.js</code>, <code>web/look.test.mjs</code>, <code>web/look-vectors.json</code></td><td>Draft, input, preview, history words, <code>applyPage</code>, <code>PAPER</code></td><td>1, 3</td></tr>
+<tr><td><code>web/look-studio.js</code>, <code>web/look-studio.test.mjs</code></td><td>Page belongs to the theme part</td><td>3</td></tr>
+<tr><td><code>web/style.css</code>, <code>web/style.test.mjs</code></td><td>Paper rules and grain</td><td>4</td></tr>
+<tr><td><code>web/common.js</code></td><td><code>siteChrome</code> calls <code>applyPage</code> (not in the frame)</td><td>4</td></tr>
+<tr><td><code>web/site-look.html</code>, <code>web/site-look.js</code></td><td>Page cards in the Theme part; preview panels</td><td>4</td></tr>
+<tr><td><code>BUILDING.html</code></td><td>Theme table row; <code>page</code> in the look section</td><td>5</td></tr>
+</tbody></table></div>
+
+<div class="task">
+<h3>Task 1: the Fine Stationery theme</h3>
+<p><b>Files:</b> <code>crates/revisions/src/brand.rs</code> (409-474 and tests), <code>web/look-vectors.json</code>, <code>web/look.test.mjs</code>.</p>
+<p><b>Produces:</b> <code>BuiltInTheme { id, name, primary, secondary, primary_dark: Option&lt;Colour&gt;, secondary_dark: Option&lt;Colour&gt; }</code>; <code>BUILT_IN_THEMES: [BuiltInTheme; 7]</code> with <code>builtin:stationery</code> last. <code>BuiltInTheme::theme()</code> copies the two dark fields.</p>
+<ul>
+<li>[ ] Write test <code>stationery_theme_passes_with_its_own_dark_colours</code> in brand.rs: find <code>builtin:stationery</code>; <code>theme().primary_dark == Some(Colour::rgb(0xb4,0xd5,0xed))</code>, <code>secondary_dark == Some(Colour::rgb(0x18,0x2b,0x3a))</code>; <code>check_theme(&amp;theme)</code> is ok, and its resolved dark accent is <code>#b4d5ed</code> and dark header <code>#182b3a</code>. Every other built-in still has both dark fields <code>None</code>.</li>
+<li>[ ] Run <code>cargo test -p revisions stationery_theme</code>: fails (no such theme).</li>
+<li>[ ] Add the fields (the six existing entries get <code>None</code>), the new entry with the constraint colours, and make <code>theme()</code> copy them. Fix the existing test near line 2220 that compares rows with <code>BUILT_IN_THEMES</code> if it assumes six.</li>
+<li>[ ] Add a case to <code>look-vectors.json</code> in the format of its existing theme cases with the four colours and the resolved palettes checkTheme gives (light accent <code>#203c50</code>, on_accent <code>#ffffff</code>, header <code>#172f40</code>/<code>#ffffff</code>; dark accent <code>#b4d5ed</code>, on_accent <code>#141c20</code>, header <code>#182b3a</code>/<code>#ffffff</code>). Both the Rust and the JS vector tests must pass on it.</li>
+<li>[ ] Run <code>cargo test -p revisions brand</code> and <code>node --test web/look.test.mjs</code>: pass.</li>
+<li>[ ] In <code>crates/server/tests/brand.rs</code> (the test asserting <code>themes[0]["id"] == "builtin:sharecraft"</code>), assert the list's seventh theme is <code>builtin:stationery</code> named <code>Fine Stationery</code> with <code>primary_dark</code> <code>#b4d5ed</code>. Run <code>cargo test -p server --test brand</code>: pass.</li>
+<li>[ ] Commit: "Fine Stationery: a built-in theme with its own dark colours".</li>
+</ul>
+</div>
+
+<div class="task">
+<h3>Task 2: Page on the stored look and through the server</h3>
+<p><b>Files:</b> <code>brand.rs</code> (near <code>MenuStyle</code> 1279-1296, <code>Look</code> 1375-1425, <code>TemplateLook</code> 1666-1768), <code>looks.rs</code> (113-124, 676, 1256-1264), <code>templates.rs</code> (294, 438), tests.</p>
+<p><b>Produces:</b> <code>pub enum PageStyle { #[default] Plain, Paper }</code>, <code>#[serde(rename_all = "lowercase")]</code>, with <code>is_plain(&amp;self) -&gt; bool</code>. <code>Look.page</code> and <code>TemplateLook.page</code>, each <code>#[serde(default, skip_serializing_if = "PageStyle::is_plain")]</code>. <code>LookInput.page: Option&lt;PageStyle&gt;</code>. Effective look key <code>"page"</code>: <code>"plain"</code> or <code>"paper"</code>, always the site's own look's, also when the theme comes from a hub.</p>
+<ul>
+<li>[ ] Extend the round-trip test near brand.rs 3758: with <code>look.page = PageStyle::Paper</code> the file contains <code>"page": "paper"</code>, reads back equal, writes the same bytes; replacing it with <code>"page": "linen"</code> fails to parse; <code>Look::default()</code>'s file has no <code>"page"</code>. Add to <code>template_look_holds_references_only</code> (or beside it) that a template look with <code>"page": "paper"</code> parses and its <code>stand_in().page</code> is Paper.</li>
+<li>[ ] Run <code>cargo test -p revisions brand</code>: fails to compile (no <code>PageStyle</code>).</li>
+<li>[ ] Add the enum and fields; set <code>page: PageStyle::Plain</code> in <code>Look::default()</code>; copy it in <code>stand_in</code>; <code>page: input.page.unwrap_or_default()</code> in looks.rs; <code>"page": look.page</code> in <code>effective</code>; carry it in both templates.rs conversions. Fix every other <code>Look { .. }</code> literal the compiler names.</li>
+<li>[ ] Run <code>cargo test -p revisions brand</code>: pass.</li>
+<li>[ ] Server tests, beside the menu ones in <code>brand_fonts.rs</code> (around 1195-1230): a fresh site's effective look has <code>page == "plain"</code>; <code>PUT</code> with <code>"page": "paper"</code> answers 200 and the effective look then has <code>"paper"</code>; <code>"page": "linen"</code> answers 400; the look history's last entry has <code>after.page == "paper"</code> (as <code>brand_policy.rs</code> 949 does for menu). In <code>template_looks.rs</code> beside 409/680/704: a template saved from a Paper site carries <code>page</code> and a site made from it shows <code>"paper"</code>. In <code>looks.rs</code> (the hub test near 2034): a site with Page Plain in a hub whose look is Paper answers <code>"page": "plain"</code>.</li>
+<li>[ ] Run <code>cargo test -p server --test brand_fonts --test template_looks</code> and <code>cargo test -p server looks::</code>: pass.</li>
+<li>[ ] Commit: "Looks: a Page setting, Plain or Paper".</li>
+</ul>
+</div>
+
+<div class="task">
+<h3>Task 3: Page in the look's JavaScript</h3>
+<p><b>Files:</b> <code>web/look.js</code>, <code>web/look.test.mjs</code>, <code>web/look-studio.js</code> (135-141), <code>web/look-studio.test.mjs</code>.</p>
+<p><b>Consumes:</b> the effective look's <code>page</code> (Task 2). <b>Produces:</b> draft field <code>page: 'plain' | 'paper'</code>; <code>applyPage(root, effective) -&gt; boolean</code>; <code>PAPER = {light: {bg, paper, text, muted, champagne}, dark: {…}}</code> frozen, with the constraint values.</p>
+<ul>
+<li>[ ] Tests in look.test.mjs:
+<pre><code>draftFromLook(null).page === 'plain'; draftFromLook({...look, page: 'paper'}).page === 'paper'; draftFromLook({...look, page: 'linen'}).page === 'plain'
+lookInput(draft with page 'paper').page === 'paper'; lookInput(draft with page 'plain') has no 'page' key
+previewEffective(draft with page 'paper').page === 'paper'
+describeLookChange(null, {...DEFAULT_LOOK, page: 'paper'}) === 'Page: plain to paper'
+applyPage(root, {page: 'paper'}) sets data-page="paper" and answers true;
+  then applyPage(root, {page: 'plain'}), applyPage(root, null) and applyPage(root, {page: 'Paper'}) each remove it and answer false
+PAPER: every light/dark colour of bg and paper lies within the luminance of LIGHT_BACKGROUND..LIGHT_PAPER (light) or at most DARK_PAPER's (dark);
+  contrast(text, bg), contrast(text, paper) &gt;= 4.5 and contrast(muted, bg), contrast(muted, paper) &gt;= 4.5 in both modes</code></pre>
+In look-studio.test.mjs: <code>changedParts</code> of a draft whose only change is Page answers <code>['theme']</code>.</li>
+<li>[ ] Run <code>node --test web/look.test.mjs web/look-studio.test.mjs</code>: fails.</li>
+<li>[ ] Implement: <code>DEFAULT_LOOK.page = 'plain'</code>; <code>draftFromLook</code> (only <code>'paper'</code> is kept, as <code>menu</code> keeps only <code>'mega'</code>); <code>previewEffective</code> sets <code>out.page</code>; <code>lookInput</code> sends <code>page: 'paper'</code> only for Paper; <code>describeLookChange</code> pushes <code>`Page: ${a.page} to ${b.page}`</code> after the theme part; <code>applyPage</code> uses only <code>setAttribute</code>/<code>removeAttribute</code> with the literal <code>'paper'</code>; <code>PAPER</code> exported. <code>PART_FIELDS.theme</code> becomes <code>['from', 'theme', 'page']</code>.</li>
+<li>[ ] Run <code>node --test web/*.test.mjs</code>: pass.</li>
+<li>[ ] Commit: "Look: Page in the draft, preview, history and applyPage".</li>
+</ul>
+</div>
+
+<div class="task">
+<h3>Task 4: Paper on the page and on Change the look</h3>
+<p><b>Files:</b> <code>web/style.css</code>, <code>web/style.test.mjs</code>, <code>web/common.js</code> (1893-1896), <code>web/site-look.html</code> (Theme part), <code>web/site-look.js</code> (near the <code>MENUS</code> cards 395-406 and <code>drawPreview</code> 1037).</p>
+<p><b>Consumes:</b> <code>applyPage</code>, <code>PAPER</code> (Task 3).</p>
+<ul>
+<li>[ ] Test in style.test.mjs, reading style.css as its other tests do: a <code>[data-page=paper]</code> rule sets <code>--bg</code>, <code>--paper</code>, <code>--sheet</code>, <code>--text</code>, <code>--muted</code> and <code>--champagne</code> each to <code>light-dark(&lt;PAPER.light value&gt;,&lt;PAPER.dark value&gt;)</code> (import <code>PAPER</code>, so CSS and JS cannot drift); a grain rule <code>html[data-page=paper] body::before</code> with <code>pointer-events:none</code> and <code>position:fixed</code>; inside <code>@media print</code> the grain has <code>display:none</code>; no <code>url(</code> in any paper rule.</li>
+<li>[ ] Run <code>node --test web/style.test.mjs</code>: fails.</li>
+<li>[ ] CSS (one block, after the root tokens): the token rule above; grain as two <code>repeating-linear-gradient</code>s, 14deg <code>light-dark(rgba(82,69,48,.0065),rgba(82,69,48,.001))</code> 0 1px, transparent 1px 5px; and 101deg <code>light-dark(rgba(255,255,255,.13),rgba(255,255,255,.02))</code> 0 1px, transparent 1px 7px (the proposal's layers at 26% and 4%), <code>inset:0</code>, <code>z-index:-1</code>; the same layer as <code>position:absolute</code> on <code>[data-page=paper]:not(html)::before</code>, with <code>position:relative;isolation:isolate</code> on that element; the current site navigation item (<code>.sitenav a[aria-current]</code>) gets an inset 2px champagne underline under Paper. Tune the light grain by eye in Task 5 only if it is invisible or loud.</li>
+<li>[ ] <code>siteChrome</code>: call <code>applyPage(document.documentElement, shown.look)</code> in the <code>!frame</code> branch only.</li>
+<li>[ ] Change the look: in the Theme part after the colours, a <code>&lt;h3 id="page-label"&gt;Page&lt;/h3&gt;</code> and <code>&lt;div id="page-choice" class="pick-grid two" role="radiogroup" aria-labelledby="page-label"&gt;</code>; cards built like <code>MENUS</code> from <code>[['plain', 'Plain', "ShareCraft's clean page"], ['paper', 'Paper', 'A warm page with a faint paper grain']]</code> with <code>pageArt({'data-page': value})</code> (the Paper art then takes the paper rules), setting <code>draft.page</code> and refreshing; checked from the draft wherever the menu card is. <code>drawPreview</code> calls <code>applyPage(panel, effective)</code> beside <code>applyLook</code>.</li>
+<li>[ ] Run <code>node --test web/*.test.mjs</code>: pass.</li>
+<li>[ ] Commit: "Paper: page colours and grain, chosen on Change the look".</li>
+</ul>
+<p>Placement note (implementer's call per spec section 4): Page goes in the Theme part because it changes the page colours; the spec said "beside Navigation and Menu style", and either place satisfies it.</p>
+</div>
+
+<div class="task">
+<h3>Task 5: records, the real app, and the finish</h3>
+<p><b>Files:</b> <code>BUILDING.html</code>.</p>
+<ul>
+<li>[ ] BUILDING.html: a row <code>builtin:stationery</code> / Fine Stationery / <code>#203c50</code> / <code>#172f40</code> in the theme table (near line 1511), noting its explicit dark colours; in the look section, <code>page</code> (<code>plain</code> default, left out of the file; <code>paper</code>), that it goes with the site and not a hub, and that the editor frame never takes it.</li>
+<li>[ ] Build the server into the target folder, point the <code>sharecraft-server</code> entry of <code>H:\Source\repos\.claude\launch.json</code> at it, start it with preview_start.</li>
+<li>[ ] On a test site: Theme Fine Stationery, Fonts Classic, Page Paper, Apply. Check the library page, a document page and Change the look in light and dark (Appearance menu), at 375 px and 1280 px: no clipped text, no horizontal scroll (<code>document.documentElement.scrollWidth &lt;= innerWidth</code>), grain visible in light and barely in dark, the preview panels and the Paper card show paper, the editor frame has no <code>data-page</code>. Switch back to Plain: the attribute goes. Screenshots to the owner.</li>
+<li>[ ] <code>cargo xtask check</code> (fmt and clippy) and <code>node --test web/*.test.mjs</code>: clean.</li>
+<li>[ ] Commit: "Fine Stationery: records".</li>
+</ul>
+</div>
+</main>
+</body>
+</html>
