@@ -221,3 +221,10 @@ test('a paper page has fixed colours, the same as look.js, and a grain that neve
     for (const [property, value] of rule.declarations) assert.doesNotMatch(value, /url\(/, `${rule.selector} { ${property} }`);
   }
 });
+test('inside a paper page, a plain preview or card picture shows the plain colours', () => {
+  // Change the look sits on the site's own page, which may be paper; a Plain draft must still look plain.
+  const plain = RULES.find((rule) => rule.at.length === 0 && /^\[data-page=paper\] :is\(/.test(rule.selector) && /\.look-preview/.test(rule.selector) && /\.page-art/.test(rule.selector) && /\.tc-mini/.test(rule.selector) && /:not\(\[data-page=paper\]\)/.test(rule.selector));
+  assert.ok(plain, 'a rule giving plain previews and pictures the plain colours');
+  const set = Object.fromEntries(plain.declarations);
+  for (const token of ['--bg', '--paper', '--sheet', '--text', '--muted']) assert.equal(set[token], ROOT[token], token);
+});
