@@ -292,6 +292,7 @@ pub fn template_look_of(look: &Look, org: &OrgBrand) -> (TemplateLook, Vec<Dropp
         fonts,
         icon,
         menu: look.menu,
+        page: look.page,
     };
     tidy(&mut out);
     (out, dropped)
@@ -436,6 +437,7 @@ pub fn look_from_references(look: &TemplateLook, org: &OrgBrand) -> Look {
         fonts,
         icon: image("icon", look.icon),
         menu: look.menu,
+        page: look.page,
     }
 }
 

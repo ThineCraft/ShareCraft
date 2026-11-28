@@ -404,7 +404,7 @@ impl Theme {
     }
 }
 
-/// A built-in theme: a name and light colours; the dark ones are derived.
+/// A built-in theme: a name and light colours; the dark ones are derived unless it gives them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuiltInTheme {
     /// The identifier, `builtin:<name>`.
@@ -415,18 +415,22 @@ pub struct BuiltInTheme {
     pub primary: Colour,
     /// The strong header and footer background.
     pub secondary: Colour,
+    /// The dark accent, when the theme gives its own; `None` to derive it.
+    pub primary_dark: Option<Colour>,
+    /// The dark header and footer background, when the theme gives its own; `None` to derive it.
+    pub secondary_dark: Option<Colour>,
 }
 
 impl BuiltInTheme {
-    /// The theme, with its dark colours left to be derived.
+    /// The theme, with the dark colours it gives (the others are derived).
     #[must_use]
     pub fn theme(&self) -> Theme {
         Theme {
             name: self.name.to_owned(),
             primary: self.primary,
             secondary: self.secondary,
-            primary_dark: None,
-            secondary_dark: None,
+            primary_dark: self.primary_dark,
+            secondary_dark: self.secondary_dark,
         }
     }
 }
@@ -436,40 +440,61 @@ const SHARECRAFT: BuiltInTheme = BuiltInTheme {
     name: "ShareCraft",
     primary: Colour::rgb(0x31, 0x56, 0xc9),
     secondary: Colour::rgb(0x23, 0x32, 0x39),
+    primary_dark: None,
+    secondary_dark: None,
 };
 
 /// The themes every installation has. Each passes every check of [`check_theme`].
-pub const BUILT_IN_THEMES: [BuiltInTheme; 6] = [
+pub const BUILT_IN_THEMES: [BuiltInTheme; 7] = [
     SHARECRAFT,
     BuiltInTheme {
         id: "builtin:harbour",
         name: "Harbour",
         primary: Colour::rgb(0x1f, 0x5f, 0x8b),
         secondary: Colour::rgb(0x16, 0x34, 0x47),
+        primary_dark: None,
+        secondary_dark: None,
     },
     BuiltInTheme {
         id: "builtin:plum",
         name: "Plum",
         primary: Colour::rgb(0x7a, 0x3e, 0x8f),
         secondary: Colour::rgb(0x3b, 0x22, 0x44),
+        primary_dark: None,
+        secondary_dark: None,
     },
     BuiltInTheme {
         id: "builtin:rust",
         name: "Rust",
         primary: Colour::rgb(0xa3, 0x43, 0x1c),
         secondary: Colour::rgb(0x40, 0x26, 0x1b),
+        primary_dark: None,
+        secondary_dark: None,
     },
     BuiltInTheme {
         id: "builtin:forest",
         name: "Forest",
         primary: Colour::rgb(0x2f, 0x6b, 0x3a),
         secondary: Colour::rgb(0x1f, 0x33, 0x24),
+        primary_dark: None,
+        secondary_dark: None,
     },
     BuiltInTheme {
         id: "builtin:graphite",
         name: "Graphite",
         primary: Colour::rgb(0x4a, 0x55, 0x60),
         secondary: Colour::rgb(0x1f, 0x26, 0x2c),
+        primary_dark: None,
+        secondary_dark: None,
+    },
+    // Deep blue on warm paper; its dark colours are its own, a pale blue and a deep navy.
+    BuiltInTheme {
+        id: "builtin:stationery",
+        name: "Fine Stationery",
+        primary: Colour::rgb(0x20, 0x3c, 0x50),
+        secondary: Colour::rgb(0x17, 0x2f, 0x40),
+        primary_dark: Some(Colour::rgb(0xb4, 0xd5, 0xed)),
+        secondary_dark: Some(Colour::rgb(0x18, 0x2b, 0x3a)),
     },
 ];
 
@@ -1295,6 +1320,25 @@ impl MenuStyle {
     }
 }
 
+/// What a site's pages are drawn on. Its colours are fixed in `style.css`; a look only chooses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PageStyle {
+    /// ShareCraft's own page colours (the default).
+    #[default]
+    Plain,
+    /// A warm paper page with a faint grain, in light and dark mode.
+    Paper,
+}
+
+impl PageStyle {
+    /// Whether this is the default, which a record leaves out of its file.
+    #[must_use]
+    pub fn is_plain(&self) -> bool {
+        *self == PageStyle::Plain
+    }
+}
+
 /// How much a footer holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1402,6 +1446,9 @@ pub struct Look {
     /// when it is `cascading`.
     #[serde(default, skip_serializing_if = "MenuStyle::is_cascading")]
     pub menu: MenuStyle,
+    /// What the site's pages are drawn on; left out of the file when it is `plain`.
+    #[serde(default, skip_serializing_if = "PageStyle::is_plain")]
+    pub page: PageStyle,
 }
 
 impl Default for Look {
@@ -1419,6 +1466,7 @@ impl Default for Look {
             fonts: None,
             icon: None,
             menu: MenuStyle::Cascading,
+            page: PageStyle::Plain,
         }
     }
 }
@@ -1691,6 +1739,9 @@ pub struct TemplateLook {
     /// The menu style.
     #[serde(default, skip_serializing_if = "MenuStyle::is_cascading")]
     pub menu: MenuStyle,
+    /// What the pages are drawn on.
+    #[serde(default, skip_serializing_if = "PageStyle::is_plain")]
+    pub page: PageStyle,
 }
 
 impl TemplateLook {
@@ -1764,6 +1815,7 @@ impl TemplateLook {
             }),
             icon: image(&self.icon),
             menu: self.menu,
+            page: self.page,
         }
     }
 }
@@ -2223,6 +2275,9 @@ mod tests {
             assert_eq!(row["name"], built_in.name);
             assert_eq!(row["primary"], built_in.primary.to_string());
             assert_eq!(row["secondary"], built_in.secondary.to_string());
+            let dark = |c: Option<Colour>| c.map_or(serde_json::Value::Null, |c| c.to_string().into());
+            assert_eq!(row["primary_dark"], dark(built_in.primary_dark), "{}", built_in.id);
+            assert_eq!(row["secondary_dark"], dark(built_in.secondary_dark), "{}", built_in.id);
             let resolved = check_theme(&built_in.theme()).unwrap();
             assert_eq!(
                 serde_json::to_value(resolved).unwrap(),
@@ -2230,13 +2285,32 @@ mod tests {
                 "{}",
                 built_in.id
             );
+            assert!(built_in.theme().problem().is_none());
+            // A theme with its own dark colours is not derived, so it need not sit at the edge.
+            if built_in.primary_dark.is_some() {
+                continue;
+            }
             let ratio = on_dark(resolved.dark.accent);
             assert!(
                 (4.5..=4.7).contains(&ratio),
                 "{} dark accent {ratio}",
                 built_in.id
             );
-            assert!(built_in.theme().problem().is_none());
+        }
+        // Fine Stationery gives its own dark colours; every other built-in derives them.
+        let stationery = BUILT_IN_THEMES
+            .iter()
+            .find(|t| t.id == "builtin:stationery")
+            .unwrap();
+        assert_eq!(stationery.name, "Fine Stationery");
+        let theme = stationery.theme();
+        assert_eq!(theme.primary_dark, Some(colour("#b4d5ed")));
+        assert_eq!(theme.secondary_dark, Some(colour("#182b3a")));
+        let resolved = check_theme(&theme).unwrap();
+        assert_eq!(resolved.dark.accent, colour("#b4d5ed"));
+        assert_eq!(resolved.dark.header_bg, colour("#182b3a"));
+        for other in BUILT_IN_THEMES.iter().filter(|t| t.id != stationery.id) {
+            assert_eq!((other.primary_dark, other.secondary_dark), (None, None), "{}", other.id);
         }
         // The worked example in the plan.
         let sharecraft = check_theme(&SHARECRAFT.theme()).unwrap();
@@ -3769,6 +3843,17 @@ mod tests {
         assert_eq!(file_bytes(&back).unwrap(), text.as_bytes());
         let wide = text.replace("\"menu\": \"mega\"", "\"menu\": \"wide\"");
         assert!(serde_json::from_str::<Look>(&wide).is_err());
+        // A plain page is left out of the file; a paper one is kept, and nothing else is read.
+        assert!(!text.contains("\"page\""));
+        look.page = PageStyle::Paper;
+        let text = String::from_utf8(file_bytes(&look).unwrap()).unwrap();
+        assert!(text.contains("\"page\": \"paper\""));
+        let back: Look = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, look);
+        assert_eq!(file_bytes(&back).unwrap(), text.as_bytes());
+        let linen = text.replace("\"page\": \"paper\"", "\"page\": \"linen\"");
+        assert!(serde_json::from_str::<Look>(&linen).is_err());
+        assert_eq!(Look::default().page, PageStyle::Plain);
         assert!(serde_json::from_str::<BrandPolicy>(r#"{"extra": true}"#).is_err());
         assert!(serde_json::from_str::<FontRef>(r#"{"extra": true}"#).is_err());
     }
@@ -3808,6 +3893,15 @@ mod tests {
             r#"{"sha256": "ab"}"#,
         );
         assert!(serde_json::from_str::<TemplateLook>(&with_file).is_err());
+        // A template carries a paper page into the look it stands for.
+        assert_eq!(look.stand_in().page, PageStyle::Plain);
+        let paper = text.replace(
+            r#""navigation": "horizontal","#,
+            r#""navigation": "horizontal", "page": "paper","#,
+        );
+        let paper: TemplateLook = serde_json::from_str(&paper).unwrap();
+        assert_eq!(paper.page, PageStyle::Paper);
+        assert_eq!(paper.stand_in().page, PageStyle::Paper);
         // A role cannot name a font the package lacks.
         let mut bad = look.clone();
         bad.fonts.as_mut().unwrap().package.roles.body = FontRole::Content;

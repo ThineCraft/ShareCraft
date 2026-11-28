@@ -639,7 +639,7 @@ async fn site_themes_stay_in_their_site() {
     // Only its own site offers it: not the other site, not the brand centre.
     assert_eq!(settings(&server, &root, &other).await["themes"], json!([]));
     let (_, centre) = call(&server, Some(&root), Method::GET, "/api/brand", None).await;
-    assert_eq!(centre["themes"].as_array().unwrap().len(), 6);
+    assert_eq!(centre["themes"].as_array().unwrap().len(), 7);
     let from = look_with(json!({ "from": format!("site:{id}") }));
     let (status, body) = put_look(&server, &root, &other, from.clone()).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");

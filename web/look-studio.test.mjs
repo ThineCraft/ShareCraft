@@ -140,6 +140,9 @@ test('the tabs know which parts of the draft are not applied yet', () => {
   const other = draftFromLook(null);
   other.logo_alt = 'Our logo';
   assert.deepEqual(changedParts(other, null), ['header']);
+  const paper = draftFromLook(null);
+  paper.page = 'paper';
+  assert.deepEqual(changedParts(paper, null), ['theme']);
 });
 
 test('two panes need a wide window and room beside the site sidebar',() => {

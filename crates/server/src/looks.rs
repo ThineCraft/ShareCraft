@@ -27,7 +27,7 @@ use records::{Db, LookChange, Perms, SiteSettings, SiteState, User, site_pins};
 use revisions::brand::{
     Actor, Align, BUILT_IN_FONT_PACKAGES, BUILT_IN_THEMES, Background, Bleed, BuiltInTheme,
     FontPackage, FontRef, FontRole, FooterGroup, FooterLayout, Header, HeaderLayout, ImageKind,
-    ImageRef, KnownSources, Look, LookFonts, MAX_SITE_FONT_PACKAGES, MAX_SITE_THEMES, MenuStyle,
+    ImageRef, KnownSources, Look, LookFonts, MAX_SITE_FONT_PACKAGES, MAX_SITE_THEMES, MenuStyle, PageStyle,
     Navigation, OrgBrand, OrgTheme, ResolvedTheme, TemplateLook, Theme, check_theme, clean_text,
     family_name, fonts_match_source, icon_problem, image_policy_problems, policy_problems,
 };
@@ -121,6 +121,7 @@ pub(crate) struct LookInput {
     fonts: Option<FontsChoice>,
     icon: Option<ImageSlot>,
     menu: Option<MenuStyle>,
+    page: Option<PageStyle>,
 }
 
 /// The fonts chosen for a look: exactly one of `from`, the font package it names
@@ -674,6 +675,7 @@ async fn built_look(
         fonts,
         icon,
         menu: input.menu.unwrap_or_default(),
+        page: input.page.unwrap_or_default(),
     };
     if let Some(problem) = look.problem(site_name) {
         return Err(BrandError::InvalidLook(problem));
@@ -1199,7 +1201,7 @@ pub(crate) fn lending_hub_in<'a>(
 
 /// The effective look of `site` for `actor`, who can see it (access to it, or somewhere inside
 /// it): `{theme: {light, dark}, fonts: {title, heading, body, interactive}, logo_url?,
-/// thumbnail_url?, icon_url, logo_alt, header, navigation, navigation_menu, footer, theme_from:
+/// thumbnail_url?, icon_url, logo_alt, header, navigation, navigation_menu, page, footer, theme_from:
 /// "site" | "hub", hub?: {id, name, thumbnail_url?}, own?: {theme, fonts}}`. `own`, given only
 /// when the theme and fonts come from a hub, is the site's own theme and fonts, resolved as
 /// `theme` and `fonts` are: what copying the site's look writes. The theme and fonts come from the hub
@@ -1259,6 +1261,8 @@ pub(crate) async fn effective(
         "logo_alt": logo_alt,
         "navigation": look.navigation,
         "navigation_menu": look.menu,
+        // The page goes with the site, as its navigation does, never with a hub's theme.
+        "page": look.page,
         "icon_url": icon_url,
         "theme_from": if hub.is_some() { "hub" } else { "site" },
     });
